@@ -1,0 +1,6 @@
+[submodule "third_party/STORK"]
+	path = third_party/STORK
+	url = https://github.com/ZT220501/STORK.git
+[submodule "third_party/diffusers"]
+	path = third_party/diffusers
+	url = https://github.com/huggingface/diffusers.git
