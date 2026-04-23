@@ -14,5 +14,4 @@ solvers:
 schedules:
   - base
   - LCS-1
-  - LCS-2
 eval_nfes: [7, 11, 19]

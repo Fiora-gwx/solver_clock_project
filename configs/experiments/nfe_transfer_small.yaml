@@ -12,7 +12,5 @@ solvers:
   - stork4_1st
   - stork4_2nd
 schedules:
-  - V_a
   - LCS-1
-  - LCS-2
 eval_nfes: [6, 8, 10, 12, 16, 20, 24, 32]

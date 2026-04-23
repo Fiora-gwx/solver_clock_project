@@ -8,7 +8,7 @@ import torch
 
 from src.clock.va import SharedClockProfile, build_clock_profile_from_alpha
 
-LCS_SCHEDULE_IMPLEMENTATION_VERSION = 6
+LCS_SCHEDULE_IMPLEMENTATION_VERSION = 7
 
 VelocityFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
@@ -90,11 +90,14 @@ def heun2_step(
 
 def build_stepper(velocity_fn: VelocityFn, method: str) -> Callable[[torch.Tensor, float, float], torch.Tensor]:
     normalized = str(method).lower().replace("-", "_")
-    if normalized in {"euler", "flow_euler", "stork4_1st", "stork_4_1st", "stork_4_1st_noise"}:
+    if normalized in {"euler", "flow_euler"}:
         return lambda sample, start, end: euler_step(velocity_fn, sample, start, end)
-    if normalized in {"heun2", "flow_heun", "stork4_2nd", "stork_4_2nd", "stork_4_2nd_noise"}:
+    if normalized in {"heun2", "flow_heun"}:
         return lambda sample, start, end: heun2_step(velocity_fn, sample, start, end)
-    raise ValueError(f"Unsupported LCS pilot solver: {method}")
+    raise ValueError(
+        f"Unsupported generic LCS pilot solver: {method}. "
+        "Native solver pilots such as STORK must be collected through the backend adapter."
+    )
 
 
 def _microbatch_map(
@@ -124,8 +127,8 @@ def collect_lcs_norms(
     grid = np.asarray(physical_grid, dtype=np.float64)
     if grid.ndim != 1 or len(grid) < 2:
         raise ValueError("physical_grid must be a 1D array with at least two points.")
-    if order not in {1, 2}:
-        raise ValueError("LCS only supports order 1 or 2.")
+    if order != 1:
+        raise ValueError("LCS-2 step-doubling profiles are disabled; only LCS-1 is supported.")
 
     stepper = build_stepper(velocity_fn, pilot_solver)
     current = initial_sample.detach()
@@ -149,40 +152,7 @@ def collect_lcs_norms(
                     current = current.detach().clone()
         return np.stack(norms, axis=1)
 
-    if len(grid) < 3:
-        raise ValueError("LCS-2 requires a physical_grid with at least three points.")
-
-    defects: list[np.ndarray] = []
-    for index in range(len(grid) - 2):
-        mid_coordinate = float(grid[index + 1])
-        end_coordinate = float(grid[index + 2])
-        start_coordinate = float(grid[index])
-        with torch.inference_mode():
-            mid = _microbatch_map(
-                current,
-                microbatch_size=observation_microbatch,
-                fn=lambda batch, start=start_coordinate, end=mid_coordinate: stepper(batch, start, end),
-            )
-            small = _microbatch_map(
-                mid,
-                microbatch_size=observation_microbatch,
-                fn=lambda batch, start=mid_coordinate, end=end_coordinate: stepper(batch, start, end),
-            )
-            big = _microbatch_map(
-                current,
-                microbatch_size=observation_microbatch,
-                fn=lambda batch, start=start_coordinate, end=end_coordinate: stepper(batch, start, end),
-            )
-        defect = small - big
-        defects.append(per_sample_l2_norm(defect).cpu().numpy())
-        current = mid.detach().clone()
-
-    # The step-doubling defect lives on the midpoint of each two-subinterval stencil.
-    # Copy the nearest interior value to the domain boundaries so the resulting profile
-    # stays aligned with the node-based physical grid expected by downstream code.
-    first = defects[0].copy()
-    last = defects[-1].copy()
-    return np.stack([first.copy(), *defects, last.copy()], axis=1)
+    raise AssertionError("unreachable")
 
 
 def collect_velocity_norms(
@@ -234,8 +204,8 @@ def build_lcs_profile(
         raise ValueError("physical_grid must be a 1D array with at least two points.")
     if norms.ndim != 2 or norms.shape[1] != len(grid):
         raise ValueError("defect_norms must have shape [num_trajectories, len(physical_grid)].")
-    if order not in {1, 2}:
-        raise ValueError("LCS only supports order 1 or 2.")
+    if order != 1:
+        raise ValueError("LCS-2 step-doubling profiles are disabled; only LCS-1 is supported.")
 
     kappa_profile = np.sqrt(np.mean(np.square(norms), axis=0))
     smoothed_kappa = smooth_profile(kappa_profile, smoothing_window)

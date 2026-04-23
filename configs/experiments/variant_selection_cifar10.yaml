@@ -16,9 +16,7 @@ solvers:
   - stork4_1st
   - stork4_2nd
 variants:
-  - V_a
   - LCS-1
-  - LCS-2
   - V_b
   - A_a
   - A_b

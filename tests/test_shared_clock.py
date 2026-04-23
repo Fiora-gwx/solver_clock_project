@@ -1,11 +1,11 @@
 import numpy as np
 
 from src.clock.va import (
-    VA_SCHEDULE_IMPLEMENTATION_VERSION,
     build_reparameterized_bundle,
     build_shared_clock_profile,
     slice_profile_interval,
 )
+from src.clock.lcs import LCS_SCHEDULE_IMPLEMENTATION_VERSION
 from src.utils.nfe_budget import resolve_effective_nfe_plan
 
 
@@ -43,7 +43,8 @@ def test_materialized_bundle_matches_solver_steps() -> None:
         effective_nfe=5,
         solver_name="heun2",
         representation="timesteps",
-        schedule_family="V_a",
+        schedule_family="LCS-1",
+        meta={"schedule_implementation_version": LCS_SCHEDULE_IMPLEMENTATION_VERSION},
     )
     assert bundle.timesteps is not None
     assert bundle.time_grid is not None
@@ -53,22 +54,21 @@ def test_materialized_bundle_matches_solver_steps() -> None:
     assert len(bundle.time_grid) == 4
     assert len(bundle.tau_grid) == 4
     assert len(bundle.g_grid) == 4
-    assert bundle.meta["schedule_implementation_version"] == VA_SCHEDULE_IMPLEMENTATION_VERSION
+    assert bundle.meta["schedule_implementation_version"] == LCS_SCHEDULE_IMPLEMENTATION_VERSION
 
 
-def test_sigma_bundle_can_materialize_from_lambda_nodes_with_separate_time_grid() -> None:
-    physical_grid = np.linspace(0.0, 2.0, 9, dtype=np.float64)
+def test_sigma_bundle_can_materialize_from_sigma_nodes_with_separate_time_grid() -> None:
+    physical_grid = np.linspace(2.0, 0.0, 9, dtype=np.float64)
     material_derivative_norms = np.tile(np.linspace(3.0, 1.0, 9, dtype=np.float64), (2, 1))
     profile = build_shared_clock_profile(physical_grid, material_derivative_norms, eps=1.0e-6)
-    plan = resolve_effective_nfe_plan("dpm_solver_lu", 6)
+    plan = resolve_effective_nfe_plan("heun2", 5)
     bundle = build_reparameterized_bundle(
         profile,
-        effective_nfe=6,
-        solver_name="dpm_solver_lu",
+        effective_nfe=5,
+        solver_name="heun2",
         representation="sigmas",
-        schedule_family="V_a",
-        representation_transform=lambda values: np.exp(-values),
-        time_transform=lambda values: 999.0 * (1.0 - values / values[-1]),
+        schedule_family="LCS-1",
+        time_transform=lambda values: values * 100.0,
     )
 
     assert bundle.sigmas is not None

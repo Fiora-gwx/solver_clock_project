@@ -4,15 +4,14 @@ from tempfile import TemporaryDirectory
 from scripts.run.run_experiment_config import ExperimentInvocation, PrepareStep, collect_prepare_steps
 from src.clock.baseline import BASELINE_SCHEDULE_IMPLEMENTATION_VERSION
 from src.clock.lcs import LCS_SCHEDULE_IMPLEMENTATION_VERSION
-from src.clock.va import VA_SCHEDULE_IMPLEMENTATION_VERSION
 from src.utils.config import dump_json
 
 
-def _build_invocation(schedule_dir: Path, prepare_root: Path) -> ExperimentInvocation:
+def _build_lcs_invocation(schedule_dir: Path, prepare_root: Path) -> ExperimentInvocation:
     step = PrepareStep(
-        key="V_a:pndm:test_solver",
+        key="LCS-1:pndm:test_solver",
         runtime_backend="pndm",
-        arguments=("scripts/run/export_va_schedule.py",),
+        arguments=("scripts/run/export_lcs_schedule.py",),
         output_path=prepare_root,
     )
     return ExperimentInvocation(
@@ -25,22 +24,6 @@ def _build_invocation(schedule_dir: Path, prepare_root: Path) -> ExperimentInvoc
         materializable=True,
         notes=tuple(),
     )
-
-
-def test_collect_prepare_steps_skips_current_va_bundle() -> None:
-    with TemporaryDirectory() as temp_dir:
-        schedule_dir = Path(temp_dir) / "schedule" / "nfe_006"
-        schedule_dir.mkdir(parents=True)
-        dump_json(
-            {
-                "schedule_family": "V_a",
-                "schedule_implementation_version": VA_SCHEDULE_IMPLEMENTATION_VERSION,
-            },
-            schedule_dir / "meta.json",
-        )
-
-        invocation = _build_invocation(schedule_dir, schedule_dir.parent)
-        assert collect_prepare_steps([invocation]) == []
 
 
 def test_collect_prepare_steps_skips_current_baseline_bundle() -> None:
@@ -72,24 +55,6 @@ def test_collect_prepare_steps_skips_current_baseline_bundle() -> None:
             notes=tuple(),
         )
         assert collect_prepare_steps([invocation]) == []
-
-
-def test_collect_prepare_steps_rebuilds_stale_va_bundle() -> None:
-    with TemporaryDirectory() as temp_dir:
-        schedule_dir = Path(temp_dir) / "schedule" / "nfe_006"
-        schedule_dir.mkdir(parents=True)
-        dump_json(
-            {
-                "schedule_family": "V_a",
-                "schedule_implementation_version": VA_SCHEDULE_IMPLEMENTATION_VERSION - 1,
-            },
-            schedule_dir / "meta.json",
-        )
-
-        invocation = _build_invocation(schedule_dir, schedule_dir.parent)
-        steps = collect_prepare_steps([invocation])
-        assert len(steps) == 1
-        assert steps[0].key == "V_a:pndm:test_solver"
 
 
 def test_collect_prepare_steps_skips_current_lcs_bundle() -> None:
@@ -129,31 +94,16 @@ def test_collect_prepare_steps_rebuilds_stale_lcs_bundle() -> None:
         schedule_dir.mkdir(parents=True)
         dump_json(
             {
-                "schedule_family": "LCS-2",
+                "schedule_family": "LCS-1",
                 "schedule_implementation_version": LCS_SCHEDULE_IMPLEMENTATION_VERSION - 1,
             },
             schedule_dir / "meta.json",
         )
 
-        step = PrepareStep(
-            key="LCS-2:pndm:test_solver",
-            runtime_backend="pndm",
-            arguments=("scripts/run/export_lcs_schedule.py",),
-            output_path=schedule_dir.parent,
-        )
-        invocation = ExperimentInvocation(
-            label="test_lcs_stale",
-            runtime_backend="pndm",
-            run_arguments=tuple(),
-            prepare_steps=(step,),
-            output_dir=None,
-            schedule_dir=schedule_dir,
-            materializable=True,
-            notes=tuple(),
-        )
+        invocation = _build_lcs_invocation(schedule_dir, schedule_dir.parent)
         steps = collect_prepare_steps([invocation])
         assert len(steps) == 1
-        assert steps[0].key == "LCS-2:pndm:test_solver"
+        assert steps[0].key == "LCS-1:pndm:test_solver"
 
 
 def test_collect_prepare_steps_rebuilds_stale_baseline_bundle() -> None:

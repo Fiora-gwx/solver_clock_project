@@ -17,7 +17,5 @@ solvers:
   - flow_stork4_3rd
 schedules:
   - base
-  - V_a
   - LCS-1
-  - LCS-2
 eval_nfes: [8, 12, 20]
