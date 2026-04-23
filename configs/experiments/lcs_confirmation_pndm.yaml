@@ -17,9 +17,8 @@ solvers:
 schedules:
   - base
   - LCS-1
-  - LCS-2
 solver_schedules:
   euler: [base, LCS-1]
-  heun2: [base, LCS-2]
-  dpm_solver_lu: [base, LCS-1, LCS-2]
+  heun2: [base, LCS-1]
+  dpm_solver_lu: [base]
 eval_nfes: [5, 7, 11, 15]

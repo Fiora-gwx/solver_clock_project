@@ -18,11 +18,8 @@ from src.adapters.pndm import (
     _interp_timesteps_for_sigmas,
     build_pndm_native_coordinate_grid,
     build_scheduler,
-    build_lambda_velocity_oracle,
-    build_pndm_lambda_grid,
     build_pndm_sigma_grid,
-    build_sigma_derivative_oracle,
-    build_velocity_oracle,
+    collect_shared_clock_velocity_norms,
     load_model,
     load_native_config,
     preferred_calibration_domain,
@@ -37,7 +34,7 @@ LCS_PROFILE_CACHE_VERSION = 4
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export LCS-1 / LCS-2 schedule bundles.")
+    parser = argparse.ArgumentParser(description="Export LCS-1 schedule bundles.")
     parser.add_argument("--backend", choices=["pndm", "diffusers"], required=True)
     parser.add_argument("--manifest", default="configs/assets_manifest.yaml")
     parser.add_argument("--clock-config", required=True)
@@ -70,12 +67,10 @@ def load_clock_settings(path: str) -> dict[str, Any]:
         raise ValueError("LCS exporter expects `clock.family: LCS`.")
     order = int(clock.get("order", 0))
     estimator = str(clock.get("estimator", "")).lower()
-    if order not in {1, 2}:
-        raise ValueError("LCS exporter only supports clock.order in {1, 2}.")
+    if order != 1:
+        raise ValueError("LCS-2 is disabled; LCS exporter only supports clock.order: 1.")
     if order == 1 and estimator != "material_derivative":
         raise ValueError("LCS-1 expects `clock.estimator: material_derivative`.")
-    if order == 2 and estimator != "step_doubling":
-        raise ValueError("LCS-2 expects `clock.estimator: step_doubling`.")
     model_output_type = str(clock.get("model_output_type", "epsilon")).lower()
     if model_output_type not in {"epsilon", "v_prediction", "flow"}:
         raise ValueError("LCS expects clock.model_output_type to be one of: epsilon, v_prediction, flow.")
@@ -93,6 +88,8 @@ def normalize_diffusers_pilot_solver(name: str) -> str:
 
 
 def schedule_family_label(order: int) -> str:
+    if int(order) != 1:
+        raise ValueError("LCS-2 is disabled; only LCS-1 schedules can be materialized.")
     return f"LCS-{int(order)}"
 
 
@@ -112,8 +109,6 @@ def build_pndm_physical_grid(
         )
     if coordinate_domain == "sigmas":
         return build_pndm_sigma_grid(scheduler, physical_grid_size=physical_grid_size)
-    if coordinate_domain == "lambda":
-        return build_pndm_lambda_grid(scheduler, physical_grid_size=physical_grid_size)
     raise ValueError(f"Unsupported PNDM coordinate domain: {coordinate_domain}")
 
 
@@ -131,15 +126,6 @@ def build_pndm_export_transforms(
         return (
             lambda values: np.asarray(values, dtype=np.float64),
             lambda values: _interp_timesteps_for_sigmas(scheduler, values),
-        )
-    if coordinate_domain == "lambda":
-        return (
-            lambda values: np.exp(-np.asarray(values, dtype=np.float64)),
-            lambda values: _interp_timesteps_for_sigmas(
-                scheduler,
-                np.exp(-np.asarray(values, dtype=np.float64)),
-                force_log_sigma=True,
-            ),
         )
     raise ValueError(f"Unsupported PNDM coordinate domain: {coordinate_domain}")
 
@@ -340,54 +326,25 @@ def build_or_load_pndm_profile(
         diffusion_step=int(schedule_cfg["diffusion_step"]),
         physical_grid_size=physical_grid_size,
     )
-    if coordinate_domain == "timesteps":
-        velocity_fn = build_velocity_oracle(
-            model,
-            scheduler,
-            model_output_type=str(clock_config["model_output_type"]),
-            sigma_floor=epsilon,
-        )
-        sigma_max = float(getattr(scheduler, "init_noise_sigma", 1.0))
-    elif coordinate_domain == "sigmas":
-        velocity_fn = build_sigma_derivative_oracle(
-            model,
-            scheduler,
-            model_output_type=str(clock_config["model_output_type"]),
-        )
-        sigma_max = float(physical_grid[0])
-    else:
-        velocity_fn = build_lambda_velocity_oracle(
-            model,
-            scheduler,
-            model_output_type=str(clock_config["model_output_type"]),
-        )
-        sigma_max = float(np.exp(-float(physical_grid[0])))
-    device = next(model.parameters()).device
-    norms_batches: list[np.ndarray] = []
-    with torch.inference_mode(False):
-        for batch_index in range(pilot_num_batches):
-            generator = torch.Generator(device=device).manual_seed(args.seed + batch_index)
-            initial_sample = torch.randn(
-                (pilot_batch_size, model.in_channels, int(dataset_config["image_size"]), int(dataset_config["image_size"])),
-                generator=generator,
-                device=device,
-            ) * sigma_max
-            norms_batches.append(
-                collect_lcs_norms(
-                    initial_sample=initial_sample,
-                    physical_grid=physical_grid,
-                    velocity_fn=velocity_fn,
-                    pilot_solver=pilot_solver,
-                    order=int(clock_config["order"]),
-                    observation_microbatch=pilot_observation_microbatch,
-                )
-            )
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+    material_derivative_norms = collect_shared_clock_velocity_norms(
+        model=model,
+        scheduler=scheduler,
+        physical_grid=physical_grid,
+        pilot_solver=pilot_solver,
+        image_size=int(dataset_config["image_size"]),
+        batch_size=pilot_batch_size,
+        num_batches=pilot_num_batches,
+        seed=args.seed,
+        observation_microbatch=pilot_observation_microbatch,
+        model_output_type=str(clock_config["model_output_type"]),
+        sigma_floor=epsilon,
+        coordinate_domain=coordinate_domain,
+        quantity="material_derivative",
+    )
 
     artifacts = build_lcs_profile(
         physical_grid,
-        np.concatenate(norms_batches, axis=0),
+        material_derivative_norms,
         order=int(clock_config["order"]),
         smoothing_window=smoothing_window,
         eps=epsilon,
@@ -564,7 +521,7 @@ def export_pndm(args: argparse.Namespace) -> None:
         output_root = Path(args.output_root)
         for effective_nfe in target_nfes:
             active_profile = profile
-            if coordinate_domain in {"sigmas", "lambda"}:
+            if coordinate_domain == "sigmas":
                 native_coordinate_grid = build_pndm_native_coordinate_grid(
                     target_scheduler,
                     solver_name=target_solver,

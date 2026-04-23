@@ -9,8 +9,6 @@ import numpy as np
 from src.utils.nfe_budget import EffectiveNfePlan, resolve_effective_nfe_plan
 from src.utils.schedule_bundle import ScheduleBundle
 
-VA_SCHEDULE_IMPLEMENTATION_VERSION = 8
-
 
 @dataclass(frozen=True)
 class SharedClockProfile:
@@ -199,9 +197,6 @@ def build_reparameterized_bundle(
     payload.setdefault("representation", representation)
     payload.setdefault("schedule_family", schedule_family)
     payload.setdefault("dtau", float(1.0 / plan.solver_steps))
-    if schedule_family == "V_a":
-        payload.setdefault("schedule_implementation_version", VA_SCHEDULE_IMPLEMENTATION_VERSION)
-
     # For scheduler compatibility, we export the current-step anchors and keep the full node grid alongside them.
     anchor_grid = representation_grid[:-1].copy()
     bundle_kwargs: dict[str, object] = {

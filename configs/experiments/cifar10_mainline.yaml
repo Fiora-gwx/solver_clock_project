@@ -21,12 +21,11 @@ solvers:
 schedules:
   - base
   - LCS-1
-  - LCS-2
 solver_schedules:
-  euler: [base, LCS-1, LCS-2]
-  deis: [base, LCS-1, LCS-2]
-  dpm_solver_lu: [base, LCS-1, LCS-2]
+  euler: [base, LCS-1]
+  deis: [base, LCS-1]
+  dpm_solver_lu: [base]
   dpm_solver_default: [base]
-  stork4_1st: [base, LCS-1, LCS-2]
-  stork4_2nd: [base, LCS-1, LCS-2]
+  stork4_1st: [base, LCS-1]
+  stork4_2nd: [base, LCS-1]
 eval_nfes: [6, 8, 10, 12, 16, 20, 24, 32]

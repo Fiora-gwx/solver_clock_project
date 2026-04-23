@@ -23,21 +23,7 @@ def test_material_derivative_matches_affine_vector_field() -> None:
     assert torch.allclose(derivative, expected, atol=1.0e-5)
 
 
-def test_lcs2_step_doubling_defect_grows_with_step_size_for_nonlinear_field() -> None:
-    def velocity_fn(sample: torch.Tensor, coordinate: torch.Tensor) -> torch.Tensor:
-        return sample.square() + coordinate
-
-    sample = torch.tensor([[0.2]], dtype=torch.float32)
-    fine_big = heun2_step(velocity_fn, sample, 0.0, 0.25)
-    fine_small = heun2_step(velocity_fn, heun2_step(velocity_fn, sample, 0.0, 0.125), 0.125, 0.25)
-    coarse_big = heun2_step(velocity_fn, sample, 0.0, 0.5)
-    coarse_small = heun2_step(velocity_fn, heun2_step(velocity_fn, sample, 0.0, 0.25), 0.25, 0.5)
-    fine_defect = torch.norm(fine_small - fine_big).item()
-    coarse_defect = torch.norm(coarse_small - coarse_big).item()
-    assert coarse_defect > fine_defect > 0.0
-
-
-def test_lcs2_step_doubling_is_zero_for_constant_velocity_field() -> None:
+def test_heun2_step_is_exact_for_constant_velocity_field() -> None:
     def velocity_fn(sample: torch.Tensor, coordinate: torch.Tensor) -> torch.Tensor:
         del coordinate
         return torch.ones_like(sample) * 2.0
@@ -48,7 +34,7 @@ def test_lcs2_step_doubling_is_zero_for_constant_velocity_field() -> None:
     assert torch.allclose(big, small, atol=1.0e-6)
 
 
-def test_collect_lcs_norms_and_profile_build_for_order_two() -> None:
+def test_collect_lcs_norms_and_profile_build_for_order_one() -> None:
     def velocity_fn(sample: torch.Tensor, coordinate: torch.Tensor) -> torch.Tensor:
         return sample.square() + coordinate
 
@@ -58,11 +44,11 @@ def test_collect_lcs_norms_and_profile_build_for_order_two() -> None:
         initial_sample=initial_sample,
         physical_grid=grid,
         velocity_fn=velocity_fn,
-        pilot_solver="heun2",
-        order=2,
+        pilot_solver="euler",
+        order=1,
         observation_microbatch=1,
     )
-    artifacts = build_lcs_profile(grid, norms, order=2, smoothing_window=3, eps=1.0e-6)
+    artifacts = build_lcs_profile(grid, norms, order=1, smoothing_window=3, eps=1.0e-6)
     assert norms.shape == (2, 5)
     assert artifacts.profile.alpha_profile.shape == (5,)
     assert np.all(artifacts.profile.density >= 0.0)
@@ -70,40 +56,42 @@ def test_collect_lcs_norms_and_profile_build_for_order_two() -> None:
     assert np.isclose(artifacts.profile.tau_profile[-1], 1.0)
 
 
-def test_collect_lcs_norms_order_two_centers_defects_on_midpoints() -> None:
+def test_collect_lcs_norms_rejects_deleted_order_two() -> None:
     def velocity_fn(sample: torch.Tensor, coordinate: torch.Tensor) -> torch.Tensor:
         return sample.square() + 3.0 * coordinate
 
     grid = np.linspace(1.0, 0.0, 5, dtype=np.float64)
     initial_sample = torch.tensor([[0.15]], dtype=torch.float32)
-    norms = collect_lcs_norms(
-        initial_sample=initial_sample,
-        physical_grid=grid,
-        velocity_fn=velocity_fn,
-        pilot_solver="heun2",
-        order=2,
-    )
+    try:
+        collect_lcs_norms(
+            initial_sample=initial_sample,
+            physical_grid=grid,
+            velocity_fn=velocity_fn,
+            pilot_solver="heun2",
+            order=2,
+        )
+    except ValueError as error:
+        assert "LCS-2" in str(error)
+    else:
+        raise AssertionError("LCS-2 collection should be disabled.")
 
-    assert norms.shape == (1, 5)
-    assert np.allclose(norms[:, 0], norms[:, 1])
-    assert np.allclose(norms[:, -1], norms[:, -2])
-    assert not np.allclose(norms[:, 1], norms[:, 2])
 
-
-def test_collect_lcs_norms_accepts_stork_alias_as_second_order_pilot() -> None:
+def test_generic_lcs_stepper_rejects_stork_alias() -> None:
     def velocity_fn(sample: torch.Tensor, coordinate: torch.Tensor) -> torch.Tensor:
         return sample.square() + coordinate
 
     grid = np.linspace(1.0, 0.0, 5, dtype=np.float64)
     initial_sample = torch.tensor([[0.1], [0.2]], dtype=torch.float32)
-    norms = collect_lcs_norms(
-        initial_sample=initial_sample,
-        physical_grid=grid,
-        velocity_fn=velocity_fn,
-        pilot_solver="stork4_2nd",
-        order=2,
-        observation_microbatch=1,
-    )
-
-    assert norms.shape == (2, 5)
-    assert np.all(np.isfinite(norms))
+    try:
+        collect_lcs_norms(
+            initial_sample=initial_sample,
+            physical_grid=grid,
+            velocity_fn=velocity_fn,
+            pilot_solver="stork4_2nd",
+            order=1,
+            observation_microbatch=1,
+        )
+    except ValueError as error:
+        assert "backend adapter" in str(error)
+    else:
+        raise AssertionError("Generic LCS stepper should not alias STORK to Heun2.")

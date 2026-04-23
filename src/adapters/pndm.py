@@ -106,10 +106,6 @@ SIGMA_NATIVE_PNDM_SOLVERS = {
     "stork_4_3rd",
     "stork_4_3rd_noise",
 }
-LAMBDA_NATIVE_PNDM_SOLVERS = {
-    "dpm_solver_lu",
-    "dpm_solver_default",
-}
 STORK_PNDM_SOLVERS = {
     "stork4_1st",
     "stork_4_1st",
@@ -198,20 +194,19 @@ def solver_uses_sigma_schedule(solver_name: str) -> bool:
 
 
 def solver_uses_lambda_schedule(solver_name: str) -> bool:
-    return normalize_solver_name(solver_name) in LAMBDA_NATIVE_PNDM_SOLVERS
+    del solver_name
+    return False
 
 
 def preferred_schedule_representation(solver_name: str) -> str:
     normalized = normalize_solver_name(solver_name)
-    if normalized in SIGMA_NATIVE_PNDM_SOLVERS or normalized in LAMBDA_NATIVE_PNDM_SOLVERS:
+    if normalized in SIGMA_NATIVE_PNDM_SOLVERS:
         return "sigmas"
     return "timesteps"
 
 
 def preferred_calibration_domain(solver_name: str) -> str:
     normalized = normalize_solver_name(solver_name)
-    if normalized in LAMBDA_NATIVE_PNDM_SOLVERS:
-        return "lambda"
     if normalized in SIGMA_NATIVE_PNDM_SOLVERS:
         return "sigmas"
     return "timesteps"
@@ -435,7 +430,8 @@ def _scheduler_prefers_sigma_schedule(scheduler) -> bool:
 
 
 def _scheduler_uses_manual_sigma_state(scheduler) -> bool:
-    return isinstance(scheduler, DPMSolverMultistepScheduler)
+    del scheduler
+    return False
 
 
 def _bundle_anchor_timesteps(
@@ -517,6 +513,12 @@ def _configure_scheduler_timesteps(
     if schedule_bundle is None:
         scheduler.set_timesteps(num_inference_steps, device=device)
         return
+
+    if isinstance(scheduler, DPMSolverMultistepScheduler):
+        raise ValueError(
+            "Custom offline schedules for DPMSolver are disabled. "
+            "The deleted lambda-domain calibration path was not compatible with the clock construction."
+        )
 
     if _scheduler_uses_manual_sigma_state(scheduler):
         sigma_grid = None if schedule_bundle.sigma_grid is None else np.asarray(schedule_bundle.sigma_grid, dtype=np.float64)
@@ -629,23 +631,6 @@ def build_pndm_sigma_grid(
     return np.linspace(sigma_max, 0.0, physical_grid_size, dtype=np.float64)
 
 
-def build_pndm_lambda_grid(
-    scheduler,
-    *,
-    physical_grid_size: int,
-) -> np.ndarray:
-    if physical_grid_size < 2:
-        raise ValueError("physical_grid_size must be at least 2.")
-    base_sigmas = _base_sigmas_from_scheduler(scheduler)
-    sigma_max = float(base_sigmas[-1])
-    sigma_min = float(max(base_sigmas[0], 1.0e-10))
-    return np.linspace(-np.log(sigma_max), -np.log(sigma_min), physical_grid_size, dtype=np.float64)
-
-
-def _sigmas_from_lambda_grid(lambdas: np.ndarray) -> np.ndarray:
-    return np.exp(-np.asarray(lambdas, dtype=np.float64))
-
-
 def _collapse_repeated_values(values: np.ndarray, *, expected_length: int | None = None) -> np.ndarray:
     collapsed: list[float] = []
     for value in np.asarray(values, dtype=np.float64).tolist():
@@ -694,8 +679,6 @@ def build_pndm_native_coordinate_grid(
 
     if normalized_domain == "sigmas":
         return sigma_grid
-    if normalized_domain == "lambda":
-        return -np.log(np.clip(sigma_grid, 1.0e-10, None))
     raise ValueError(f"Unsupported PNDM coordinate domain: {coordinate_domain}")
 
 
@@ -962,34 +945,6 @@ def _evaluate_sigma_derivative(
     )
 
 
-def _evaluate_lambda_derivative(
-    model: torch.nn.Module,
-    scheduler,
-    sample: torch.Tensor,
-    lambda_value: float,
-    *,
-    model_output_type: str = "epsilon",
-) -> torch.Tensor:
-    device = sample.device
-    lambda_tensor = torch.as_tensor(float(lambda_value), device=device, dtype=sample.dtype)
-    sigma_tensor = torch.exp(-lambda_tensor)
-    timestep_tensor = _timestep_at_sigma_torch(
-        scheduler,
-        sigma_tensor,
-        device=device,
-        dtype=sample.dtype,
-        force_log_sigma=True,
-    )
-    sigma_derivative = _evaluate_sigma_derivative_with_tensors(
-        model,
-        sample,
-        timestep_tensor,
-        sigma_tensor,
-        model_output_type=model_output_type,
-    )
-    return -sigma_tensor * sigma_derivative
-
-
 def _evaluate_sigma_derivative_microbatched(
     model: torch.nn.Module,
     sample: torch.Tensor,
@@ -1017,39 +972,6 @@ def _evaluate_sigma_derivative_microbatched(
                 sample[start:stop],
                 timestep_value,
                 sigma_value,
-                model_output_type=model_output_type,
-            )
-        )
-    return torch.cat(chunks, dim=0)
-
-
-def _evaluate_lambda_derivative_microbatched(
-    model: torch.nn.Module,
-    scheduler,
-    sample: torch.Tensor,
-    lambda_value: float,
-    *,
-    microbatch_size: int | None,
-    model_output_type: str = "epsilon",
-) -> torch.Tensor:
-    if microbatch_size is None or microbatch_size <= 0 or microbatch_size >= sample.shape[0]:
-        return _evaluate_lambda_derivative(
-            model,
-            scheduler,
-            sample,
-            lambda_value,
-            model_output_type=model_output_type,
-        )
-
-    chunks: list[torch.Tensor] = []
-    for start in range(0, sample.shape[0], microbatch_size):
-        stop = min(start + microbatch_size, sample.shape[0])
-        chunks.append(
-            _evaluate_lambda_derivative(
-                model,
-                scheduler,
-                sample[start:stop],
-                lambda_value,
                 model_output_type=model_output_type,
             )
         )
@@ -1147,34 +1069,6 @@ def build_sigma_derivative_oracle(
     return oracle
 
 
-def build_lambda_velocity_oracle(
-    model: torch.nn.Module,
-    scheduler,
-    *,
-    model_output_type: str = "epsilon",
-):
-    def oracle(sample: torch.Tensor, lambda_tensor: torch.Tensor) -> torch.Tensor:
-        lambda_value = lambda_tensor.to(device=sample.device, dtype=sample.dtype)
-        sigma_tensor = torch.exp(-lambda_value)
-        timestep_tensor = _timestep_at_sigma_torch(
-            scheduler,
-            sigma_tensor,
-            device=sample.device,
-            dtype=sample.dtype,
-            force_log_sigma=True,
-        )
-        sigma_derivative = _evaluate_sigma_derivative_with_tensors(
-            model,
-            sample,
-            timestep_tensor,
-            sigma_tensor,
-            model_output_type=model_output_type,
-        )
-        return -sigma_tensor * sigma_derivative
-
-    return oracle
-
-
 def collect_shared_clock_velocity_norms(
     *,
     model: torch.nn.Module,
@@ -1206,22 +1100,16 @@ def collect_shared_clock_velocity_norms(
         raise ValueError("physical_grid must contain at least two points.")
 
     normalized_domain = str(coordinate_domain).lower().strip()
-    if normalized_domain not in {"timesteps", "sigmas", "lambda"}:
+    if normalized_domain not in {"timesteps", "sigmas"}:
         raise ValueError(f"Unsupported PNDM coordinate domain: {coordinate_domain}")
 
     if normalized_domain == "timesteps":
         time_grid = grid
         sigma_grid = _interp_sigmas_for_timesteps(scheduler, grid)
         sigma_grid[-1] = 0.0
-        lambda_grid = None
-    elif normalized_domain == "sigmas":
+    else:
         sigma_grid = grid
         time_grid = _interp_timesteps_for_sigmas(scheduler, sigma_grid)
-        lambda_grid = None
-    else:
-        lambda_grid = grid
-        sigma_grid = _sigmas_from_lambda_grid(lambda_grid)
-        time_grid = _interp_timesteps_for_sigmas(scheduler, sigma_grid, force_log_sigma=True)
 
     device = next(model.parameters()).device
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -1237,12 +1125,6 @@ def collect_shared_clock_velocity_norms(
                 scheduler,
                 model_output_type=model_output_type,
                 sigma_floor=sigma_floor,
-            )
-        elif normalized_domain == "lambda":
-            velocity_fn = build_lambda_velocity_oracle(
-                model,
-                scheduler,
-                model_output_type=model_output_type,
             )
         else:
             velocity_fn = build_sigma_derivative_oracle(
@@ -1286,8 +1168,6 @@ def collect_shared_clock_velocity_norms(
                 if use_material_derivative:
                     if normalized_domain == "timesteps":
                         coordinate_value = timestep_value
-                    elif normalized_domain == "lambda":
-                        coordinate_value = float(lambda_grid[index])
                     else:
                         coordinate_value = sigma_value
                     material_derivative = evaluate_material_derivative(sample, coordinate_value)
@@ -1303,15 +1183,6 @@ def collect_shared_clock_velocity_norms(
                             microbatch_size=observation_microbatch,
                             model_output_type=model_output_type,
                             sigma_floor=sigma_floor,
-                        )
-                    elif normalized_domain == "lambda":
-                        velocity = _evaluate_lambda_derivative_microbatched(
-                            model,
-                            scheduler,
-                            sample,
-                            float(lambda_grid[index]),
-                            microbatch_size=observation_microbatch,
-                            model_output_type=model_output_type,
                         )
                     else:
                         velocity = _evaluate_sigma_derivative_microbatched(
@@ -1354,15 +1225,6 @@ def collect_shared_clock_velocity_norms(
                                 model_output_type=model_output_type,
                                 sigma_floor=sigma_floor,
                             )
-                        elif normalized_domain == "lambda":
-                            velocity = _evaluate_lambda_derivative_microbatched(
-                                model,
-                                scheduler,
-                                sample,
-                                float(lambda_grid[index]),
-                                microbatch_size=observation_microbatch,
-                                model_output_type=model_output_type,
-                            )
                         else:
                             velocity = _evaluate_sigma_derivative_microbatched(
                                 model,
@@ -1374,8 +1236,6 @@ def collect_shared_clock_velocity_norms(
                             )
                     if normalized_domain == "timesteps":
                         dt = float(time_grid[index + 1] - timestep_value)
-                    elif normalized_domain == "lambda":
-                        dt = float(lambda_grid[index + 1] - float(lambda_grid[index]))
                     else:
                         dt = float(sigma_grid[index + 1] - sigma_value)
                     if normalized_pilot == "euler" or normalized_pilot in STORK_FIRST_ORDER_PNDM_SOLVERS:
@@ -1394,15 +1254,6 @@ def collect_shared_clock_velocity_norms(
                             microbatch_size=observation_microbatch,
                             model_output_type=model_output_type,
                             sigma_floor=sigma_floor,
-                        )
-                    elif normalized_domain == "lambda":
-                        next_velocity = _evaluate_lambda_derivative_microbatched(
-                            model,
-                            scheduler,
-                            predicted,
-                            float(lambda_grid[index + 1]),
-                            microbatch_size=observation_microbatch,
-                            model_output_type=model_output_type,
                         )
                     else:
                         next_velocity = _evaluate_sigma_derivative_microbatched(

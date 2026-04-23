@@ -18,15 +18,13 @@ solvers:
   - stork4_2nd
 schedules:
   - base
-  - V_a
   - LCS-1
-  - LCS-2
 solver_schedules:
-  euler: [base, V_a, LCS-1, LCS-2]
-  heun2: [base, V_a, LCS-1, LCS-2]
-  deis: [base, V_a, LCS-1, LCS-2]
-  dpm_solver_lu: [base, V_a, LCS-1, LCS-2]
+  euler: [base, LCS-1]
+  heun2: [base, LCS-1]
+  deis: [base, LCS-1]
+  dpm_solver_lu: [base]
   dpm_solver_default: [base]
-  stork4_1st: [base, V_a, LCS-1, LCS-2]
-  stork4_2nd: [base, V_a, LCS-1, LCS-2]
+  stork4_1st: [base, LCS-1]
+  stork4_2nd: [base, LCS-1]
 eval_nfes: [5, 7, 9, 11, 15, 19, 23, 31]
