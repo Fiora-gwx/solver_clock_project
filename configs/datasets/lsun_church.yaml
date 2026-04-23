@@ -1,0 +1,12 @@
+name: lsun_church
+backend: pndm
+native_config: third_party/STORK/external/PNDM/config/ddim_church.yml
+default_model_asset: pndm_model_ddim_lsun_church
+default_fid_asset: pndm_fid_church_train
+image_size: 256
+channels: 3
+calibration_num_samples: 16
+smoke_num_samples: 100
+smoke_batch_size: 8
+default_batch_size: 16
+full_num_samples: 50000

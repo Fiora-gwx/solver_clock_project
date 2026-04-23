@@ -1,0 +1,7 @@
+interface:
+  display_name: "Workflow Fix"
+  short_description: "Apply only explicitly approved review fixes"
+  default_prompt: "Use $workflow-fix to apply only approved review issues in this repository's main working tree, update fix logs, and keep unresolved items explicit."
+
+policy:
+  allow_implicit_invocation: false

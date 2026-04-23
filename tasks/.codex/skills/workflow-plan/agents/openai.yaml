@@ -1,0 +1,7 @@
+interface:
+  display_name: "Workflow Plan"
+  short_description: "Draft pending task plans before main-only execution"
+  default_prompt: "Use $workflow-plan to produce a complete pending-stage task plan for this main-only repository before any implementation."
+
+policy:
+  allow_implicit_invocation: false

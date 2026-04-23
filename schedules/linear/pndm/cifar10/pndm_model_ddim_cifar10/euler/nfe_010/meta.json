@@ -1,0 +1,9 @@
+{
+  "backend": "pndm",
+  "dataset": "cifar10",
+  "has_sigmas": false,
+  "has_timesteps": true,
+  "nfe": 10,
+  "schedule_family": "linear",
+  "solver": "euler"
+}

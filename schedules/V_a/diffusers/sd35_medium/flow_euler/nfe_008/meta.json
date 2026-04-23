@@ -1,0 +1,12 @@
+{
+  "backend": "diffusers",
+  "calibration_nfe": 32,
+  "clock_family": "V",
+  "clock_variant": "a",
+  "has_sigmas": true,
+  "has_timesteps": false,
+  "model_asset": "hf_sd35_medium",
+  "nfe": 8,
+  "schedule_family": "V_a",
+  "solver": "flow_euler"
+}

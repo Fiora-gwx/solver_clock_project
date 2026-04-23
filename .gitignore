@@ -2,6 +2,43 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# Local editor / agent state
+/.claude/
+/.codex/
+/.vscode/
+
+# Python / test caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+
+# Large local assets and generated experiment outputs
 checkpoints/
 data/
 outputs/
+temp/
+
+# Logs and transient runtime files
+logs/
+*.log
+*.out
+*.err
+
+# Model/checkpoint artifacts
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.onnx

@@ -1,0 +1,13 @@
+{
+  "backend": "pndm",
+  "calibration_nfe": 32,
+  "clock_family": "V",
+  "clock_variant": "a",
+  "dataset": "cifar10",
+  "has_sigmas": false,
+  "has_timesteps": true,
+  "model_asset": "pndm_model_ddim_cifar10",
+  "nfe": 16,
+  "schedule_family": "V_a",
+  "solver": "euler"
+}

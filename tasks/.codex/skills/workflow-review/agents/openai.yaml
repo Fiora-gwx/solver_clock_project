@@ -1,0 +1,7 @@
+interface:
+  display_name: "Workflow Review"
+  short_description: "Review implementation on main and output issue table"
+  default_prompt: "Use $workflow-review to perform review-only analysis for a main-only task, produce the required issue table, and wait for explicit fix approval."
+
+policy:
+  allow_implicit_invocation: false

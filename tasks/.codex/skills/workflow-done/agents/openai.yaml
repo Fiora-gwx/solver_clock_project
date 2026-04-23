@@ -1,0 +1,7 @@
+interface:
+  display_name: "Workflow Done"
+  short_description: "Finalize, archive, and close main-only tasks"
+  default_prompt: "Use $workflow-done to finalize task metadata, archive completed tasks, and complete the tasks/PROGRESS.md and tasks/LESSONS.md handoff."
+
+policy:
+  allow_implicit_invocation: false

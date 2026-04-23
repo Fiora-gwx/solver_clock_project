@@ -1,0 +1,13 @@
+envs:
+  pndm:
+    name: sc-pndm
+    python: /home/gwx/miniconda3/envs/sc-pndm/bin/python
+    purpose: PNDM small-model experiments and schedule export
+  diffusers:
+    name: sc-diff
+    python: /home/gwx/miniconda3/envs/sc-diff/bin/python
+    purpose: Modern diffusers pipeline experiments and V-a export
+  sana:
+    name: sc-sana
+    python: /home/gwx/miniconda3/envs/sc-sana/bin/python
+    purpose: Sana experiments and metric scripts
