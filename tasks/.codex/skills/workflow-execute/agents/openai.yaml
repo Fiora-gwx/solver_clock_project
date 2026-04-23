@@ -1,0 +1,7 @@
+interface:
+  display_name: "Workflow Execute"
+  short_description: "Execute approved scope on main with strict logs"
+  default_prompt: "Use $workflow-execute to implement only approved scope on this repository's main working tree, keep timestamped progress logs, and stop safely when blockers occur."
+
+policy:
+  allow_implicit_invocation: false

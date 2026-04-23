@@ -1,0 +1,57 @@
+project_root: /home/gwx/solver_clock_project
+
+assets:
+  ays_published_inventory:
+    type: metadata
+    path: configs/reference_schedules/ays_published_10step.yaml
+  ays_published_stable_diffusion_15_10step:
+    type: schedule_bundle
+    path: schedules/ays_like/published/stable_diffusion_15/nfe_010
+  ays_published_sdxl_10step:
+    type: schedule_bundle
+    path: schedules/ays_like/published/sdxl/nfe_010
+  ays_published_deepfloyd_if_stage1_10step:
+    type: schedule_bundle
+    path: schedules/ays_like/published/deepfloyd_if_stage1/nfe_010
+  ays_published_stable_video_diffusion_10step:
+    type: schedule_bundle
+    path: schedules/ays_like/published/stable_video_diffusion/nfe_010
+  pndm_model_ddim_cifar10:
+    type: checkpoint
+    path: checkpoints/pndm/models/ddim_cifar10.ckpt
+  pndm_model_pf_cifar10:
+    type: checkpoint
+    path: checkpoints/pndm/models/pf_cifar10.ckpt
+  pndm_model_pf_deep_cifar10:
+    type: checkpoint
+    path: checkpoints/pndm/models/pf_deep_cifar10.ckpt
+  pndm_model_ddim_lsun_bedroom:
+    type: checkpoint
+    path: checkpoints/pndm/models/ddim_lsun_bedroom.ckpt
+  pndm_model_ddim_lsun_church:
+    type: checkpoint
+    path: checkpoints/pndm/models/ddim_lsun_church.ckpt
+  pndm_fid_cifar10_train:
+    type: fid_stats
+    path: checkpoints/pndm/fids/fid_cifar10_train.npz
+  pndm_fid_bedroom_train:
+    type: fid_stats
+    path: checkpoints/pndm/fids/fid_bedroom_train.npz
+  pndm_fid_church_train:
+    type: fid_stats
+    path: checkpoints/pndm/fids/fid_church_train.npz
+  hf_sd35_medium:
+    type: diffusers_model
+    path: checkpoints/hf/stabilityai--stable-diffusion-3.5-medium
+  hf_flux_dev:
+    type: diffusers_model
+    path: checkpoints/hf/black-forest-labs--FLUX.1-dev
+  hf_lumina_image_2:
+    type: diffusers_model
+    path: checkpoints/hf/Alpha-VLLM--Lumina-Image-2.0
+  diffusers_smoke_prompts:
+    type: prompts
+    path: data/pndm/prompts/modern_diffusers_smoke_prompts.json
+  diffusers_practical_prompts:
+    type: prompts
+    path: data/pndm/prompts/modern_diffusers_practical_prompts.json

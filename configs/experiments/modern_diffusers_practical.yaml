@@ -1,0 +1,23 @@
+name: modern_diffusers_practical
+backend: diffusers
+base_config:
+  prompt_asset: diffusers_practical_prompts
+  seed: 0
+  num_gpus: 4
+  prepare_schedules_first: true
+models:
+  - sd35_medium
+  - flux_dev
+  - lumina_image_2
+solvers:
+  - flow_euler
+  - flow_dpm_solver
+  - flow_stork4_1st
+  - flow_stork4_2nd
+  - flow_stork4_3rd
+schedules:
+  - base
+  - V_a
+  - LCS-1
+  - LCS-2
+eval_nfes: [8, 12, 20]

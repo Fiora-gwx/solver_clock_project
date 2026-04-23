@@ -1,0 +1,25 @@
+name: variant_selection_cifar10
+backend: pndm
+base_config:
+  dataset: cifar10
+  metrics: [fid]
+  num_gpus: 4
+  prepare_schedules_first: true
+model_assets:
+  - pndm_model_pf_cifar10
+  - pndm_model_pf_deep_cifar10
+  - pndm_model_ddim_cifar10
+solvers:
+  - euler
+  - heun2
+  - deis
+  - stork4_1st
+  - stork4_2nd
+variants:
+  - V_a
+  - LCS-1
+  - LCS-2
+  - V_b
+  - A_a
+  - A_b
+eval_nfes: [5, 7, 9, 11, 15, 19]

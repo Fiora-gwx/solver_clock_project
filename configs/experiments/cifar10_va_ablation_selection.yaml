@@ -1,0 +1,71 @@
+name: cifar10_va_ablation_selection
+backend: pndm
+base_config:
+  dataset: cifar10
+  metrics: [fid]
+  num_gpus: 4
+  prepare_schedules_first: true
+  save_samples: false
+  num_samples: 10000
+  batch_size: 1024
+model_assets:
+  - pndm_model_ddim_cifar10
+solvers:
+  - euler
+schedules:
+  - V_a
+eval_nfes: [8, 12, 16]
+clock_variants:
+  - label: baseline
+    path: configs/clocks/V_a_ablation_baseline.yaml
+    baseline: true
+  - label: norm_l1
+    path: configs/clocks/V_a_norm_l1.yaml
+    factor_group: norm_type
+    factor_key: norm_type
+    factor_value: l1
+  - label: norm_l2_sq
+    path: configs/clocks/V_a_norm_l2_sq.yaml
+    factor_group: norm_type
+    factor_key: norm_type
+    factor_value: l2_sq
+  - label: norm_linf
+    path: configs/clocks/V_a_norm_linf.yaml
+    factor_group: norm_type
+    factor_key: norm_type
+    factor_value: linf
+  - label: sample_median
+    path: configs/clocks/V_a_sample_median.yaml
+    factor_group: sample_reduce
+    factor_key: sample_reduce
+    factor_value: median
+  - label: sample_trimmed
+    path: configs/clocks/V_a_sample_trimmed.yaml
+    factor_group: sample_reduce
+    factor_key: sample_reduce
+    factor_value: trimmed_mean
+  - label: cycle_median
+    path: configs/clocks/V_a_cycle_median.yaml
+    factor_group: cycle_reduce
+    factor_key: cycle_reduce
+    factor_value: median
+  - label: power_0p5
+    path: configs/clocks/V_a_power_0p5.yaml
+    factor_group: proxy_power
+    factor_key: proxy_power
+    factor_value: 0.5
+  - label: power_2
+    path: configs/clocks/V_a_power_2.yaml
+    factor_group: proxy_power
+    factor_key: proxy_power
+    factor_value: 2.0
+  - label: smooth_3
+    path: configs/clocks/V_a_smooth_3.yaml
+    factor_group: smoothing_window
+    factor_key: smoothing_window
+    factor_value: 3
+  - label: smooth_5
+    path: configs/clocks/V_a_smooth_5.yaml
+    factor_group: smoothing_window
+    factor_key: smoothing_window
+    factor_value: 5

@@ -1,0 +1,19 @@
+models:
+  sd35_medium:
+    asset_key: hf_sd35_medium
+    default_solver: flow_euler
+    image_size: 512
+    guidance_scale: 3.5
+    calibration_num_samples: 4
+  flux_dev:
+    asset_key: hf_flux_dev
+    default_solver: flow_euler
+    image_size: 1024
+    guidance_scale: 3.5
+    calibration_num_samples: 2
+  lumina_image_2:
+    asset_key: hf_lumina_image_2
+    default_solver: flow_euler
+    image_size: 1024
+    guidance_scale: 3.5
+    calibration_num_samples: 2

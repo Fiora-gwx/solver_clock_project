@@ -1,0 +1,9 @@
+solvers:
+  flow_euler:
+    scheduler: FlowMatchEulerDiscreteScheduler
+  flow_heun:
+    scheduler: FlowMatchHeunDiscreteScheduler
+  flow_dpm_solver:
+    scheduler: DPMSolverMultistepScheduler
+  flow_unipc:
+    scheduler: UniPCMultistepScheduler

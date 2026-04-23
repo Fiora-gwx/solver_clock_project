@@ -1,0 +1,19 @@
+{
+  "backend": "pndm",
+  "batch_size": 4,
+  "candidate_count": 5,
+  "converged": false,
+  "data_samples": 16,
+  "dataset": "cifar10",
+  "has_sigmas": false,
+  "has_timesteps": true,
+  "initialization": "time_uniform",
+  "iterations_ran": 1,
+  "max_iterations": 1,
+  "model_asset": "pndm_model_ddim_cifar10",
+  "nfe": 8,
+  "optimization_method": "coordinate_search",
+  "schedule_family": "ays",
+  "sigma_data": 0.5,
+  "solver": "euler"
+}

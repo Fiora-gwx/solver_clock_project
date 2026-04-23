@@ -1,0 +1,19 @@
+solvers:
+  euler:
+    scheduler: EulerDiscreteScheduler
+  heun2:
+    scheduler: HeunDiscreteScheduler
+  ddim:
+    scheduler: DDIMScheduler
+  pndm:
+    scheduler: PNDMScheduler
+  deis:
+    scheduler: DEISMultistepScheduler
+  dpm_solver_lu:
+    scheduler: DPMSolverMultistepScheduler
+  dpm_solver_default:
+    scheduler: DPMSolverMultistepScheduler
+  dpm_solver_pp:
+    scheduler: DPMSolverMultistepScheduler
+  unipc:
+    scheduler: UniPCMultistepScheduler

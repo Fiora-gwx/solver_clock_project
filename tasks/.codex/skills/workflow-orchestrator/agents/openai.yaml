@@ -1,0 +1,7 @@
+interface:
+  display_name: "Workflow Orchestrator"
+  short_description: "Route main-only tasks to the right lifecycle stage"
+  default_prompt: "Use $workflow-orchestrator to route main-only task files by status and intent, enforce repo-wide single-writer safety, and return next actions."
+
+policy:
+  allow_implicit_invocation: false

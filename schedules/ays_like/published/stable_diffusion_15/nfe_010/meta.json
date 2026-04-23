@@ -1,0 +1,30 @@
+{
+  "effective_nfe": 10,
+  "execution_backend": "external_asset",
+  "has_g_grid": false,
+  "has_sigma_grid": true,
+  "has_sigmas": true,
+  "has_tau_grid": false,
+  "has_time_grid": true,
+  "has_timesteps": true,
+  "model_name": "Stable Diffusion 1.5",
+  "nfe": 10,
+  "published_asset": true,
+  "schedule_family": "ays_published",
+  "solver_steps": 10,
+  "source": "published_10step_table",
+  "step_methods": [
+    "published_ays",
+    "published_ays",
+    "published_ays",
+    "published_ays",
+    "published_ays",
+    "published_ays",
+    "published_ays",
+    "published_ays",
+    "published_ays",
+    "published_ays"
+  ],
+  "terminal_sigma": 0.029,
+  "terminal_timestep": 0.0
+}

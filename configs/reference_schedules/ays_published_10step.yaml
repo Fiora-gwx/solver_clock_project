@@ -1,0 +1,21 @@
+published_ays_assets:
+  stable_diffusion_15:
+    model_name: Stable Diffusion 1.5
+    nfe: 10
+    noise_levels: [14.615, 6.475, 3.861, 2.697, 1.886, 1.396, 0.963, 0.652, 0.399, 0.152, 0.029]
+    timestep_indices: [999, 850, 736, 645, 545, 455, 343, 233, 124, 24, 0]
+  sdxl:
+    model_name: SDXL
+    nfe: 10
+    noise_levels: [14.615, 6.315, 3.771, 2.181, 1.342, 0.862, 0.555, 0.380, 0.234, 0.113, 0.029]
+    timestep_indices: [999, 845, 730, 587, 443, 310, 193, 116, 53, 13, 0]
+  deepfloyd_if_stage1:
+    model_name: DeepFloyd-IF / Stage-1
+    nfe: 10
+    noise_levels: [160.41, 8.081, 3.315, 1.885, 1.207, 0.785, 0.553, 0.293, 0.186, 0.030, 0.006]
+    timestep_indices: [995, 920, 811, 686, 555, 418, 315, 174, 109, 12, 0]
+  stable_video_diffusion:
+    model_name: Stable Video Diffusion
+    nfe: 10
+    noise_levels: [700.00, 54.5, 15.886, 7.977, 4.248, 1.789, 0.981, 0.403, 0.173, 0.034, 0.002]
+    timestep_indices: null

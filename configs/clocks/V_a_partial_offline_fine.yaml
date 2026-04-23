@@ -1,0 +1,15 @@
+clock:
+  family: V
+  variant: a
+  primary: true
+  proxy_type: material_derivative_norm
+  model_output_type: epsilon
+  physical_grid_size: 129
+  pilot_solver: stork4_2nd
+  pilot_batch_size: 8
+  pilot_num_batches: 32
+  pilot_observation_microbatch: 4
+  pilot_prompt_asset: diffusers_smoke_prompts
+  epsilon: 1.0e-6
+  cache_path: outputs/cache/shared_clock_profiles
+  target_nfes: [5, 7, 11, 15]

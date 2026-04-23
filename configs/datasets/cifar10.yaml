@@ -1,0 +1,13 @@
+name: cifar10
+backend: pndm
+native_config: third_party/STORK/external/PNDM/config/ddim_cifar10.yml
+dataset_root: /home/gwx/flow_matching/data/cifar10/cifar-10-batches-py
+default_model_asset: pndm_model_ddim_cifar10
+default_fid_asset: pndm_fid_cifar10_train
+image_size: 32
+channels: 3
+calibration_num_samples: 32
+smoke_num_samples: 100
+smoke_batch_size: 1024
+default_batch_size: 1024
+full_num_samples: 50000

@@ -1,0 +1,32 @@
+name: cifar10_mainline
+backend: pndm
+base_config:
+  dataset: cifar10
+  metrics: [fid]
+  num_gpus: 4
+  prepare_schedules_first: true
+  save_samples: false
+  preview_samples: 8
+model_assets:
+  - pndm_model_ddim_cifar10
+  - pndm_model_pf_cifar10
+  - pndm_model_pf_deep_cifar10
+solvers:
+  - euler
+  - deis
+  - dpm_solver_lu
+  - dpm_solver_default
+  - stork4_1st
+  - stork4_2nd
+schedules:
+  - base
+  - LCS-1
+  - LCS-2
+solver_schedules:
+  euler: [base, LCS-1, LCS-2]
+  deis: [base, LCS-1, LCS-2]
+  dpm_solver_lu: [base, LCS-1, LCS-2]
+  dpm_solver_default: [base]
+  stork4_1st: [base, LCS-1, LCS-2]
+  stork4_2nd: [base, LCS-1, LCS-2]
+eval_nfes: [6, 8, 10, 12, 16, 20, 24, 32]
