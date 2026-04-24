@@ -13,9 +13,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.clock.lcs import LCS_SCHEDULE_IMPLEMENTATION_VERSION
 from src.clock.baseline import BASELINE_SCHEDULE_IMPLEMENTATION_VERSION
-from src.clock.va import VA_SCHEDULE_IMPLEMENTATION_VERSION
+from src.clock.defect_balanced import DEFECT_BALANCED_CLOCK_VERSION
 from src.utils.config import dump_json, load_json, load_yaml, repo_root, resolve_repo_path
 from src.utils.nfe_budget import normalize_solver_name, resolve_effective_nfe_plan
 from src.utils.runtime_env import build_subprocess_env, command_preview, get_runtime_env, run_in_runtime_env
@@ -66,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", default="configs/assets_manifest.yaml")
     parser.add_argument("--runtime-config", default="configs/runtime_envs.yaml")
     parser.add_argument("--models-config", default="configs/models/modern_diffusers.yaml")
-    parser.add_argument("--clock-config", default="configs/clocks/V_a.yaml")
+    parser.add_argument("--clock-config", default="configs/clocks/SADB.yaml")
     parser.add_argument("--ays-config", default="configs/clocks/AYS.yaml")
     parser.add_argument("--outputs-root", default="outputs/samples")
     parser.add_argument("--metrics-root", default="outputs/metrics")
@@ -139,9 +138,7 @@ def canonical_schedule_name(name: str) -> tuple[str, str]:
         "base": ("base", "base"),
         "linear": ("linear", "linear"),
         "ays": ("ays", "ays_like"),
-        "v_a": ("V_a", "V_a"),
-        "lcs_1": ("LCS-1", "LCS_1"),
-        "lcs_2": ("LCS-2", "LCS_2"),
+        "sadb": ("SADB", "SADB"),
         "v_b": ("V_b", "V_b"),
         "a_a": ("A_a", "A_a"),
         "a_b": ("A_b", "A_b"),
@@ -177,74 +174,32 @@ def resolve_solver_schedule_overrides(
     return overrides
 
 
-def validate_pndm_custom_dpm_schedule_semantics(
+def validate_pndm_dpm_schedules_are_base_only(
     solver_schedule_overrides: Mapping[str, tuple[str, ...]],
 ) -> None:
-    lu_key = "dpm_solver_lu"
-    default_key = "dpm_solver_default"
-    if lu_key not in solver_schedule_overrides or default_key not in solver_schedule_overrides:
-        return
-
-    def active_custom_schedules(items: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(
+    dpm_solvers = {"dpm_solver_lu", "dpm_solver_default", "dpm_solver_pp", "dpm_solverpp"}
+    for solver, schedules in solver_schedule_overrides.items():
+        if normalize_solver_name(solver) not in dpm_solvers:
+            continue
+        custom_schedules = [
             canonical_schedule_name(schedule_name)[0]
-            for schedule_name in items
+            for schedule_name in schedules
             if canonical_schedule_name(schedule_name)[0] != "base"
-        )
-
-    lu_custom = active_custom_schedules(solver_schedule_overrides[lu_key])
-    default_custom = active_custom_schedules(solver_schedule_overrides[default_key])
-    if not lu_custom or not default_custom:
-        return
-
-    raise ValueError(
-        "Custom PNDM schedule injection collapses `dpm_solver_lu` and `dpm_solver_default` onto the same "
-        "explicit sigma-grid execution path, so they should not both run with non-base schedules in the same "
-        "experiment. Keep one variant `base`-only or remove it."
-    )
-
-
-def resolve_clock_variants(
-    experiment_config: Mapping[str, Any],
-    *,
-    default_clock_config_path: str,
-) -> tuple[ClockVariant, ...]:
-    raw_variants = experiment_config.get("clock_variants")
-    if raw_variants is None:
-        return (ClockVariant(label=None, config_path=default_clock_config_path, config=load_yaml(default_clock_config_path)),)
-
-    if not isinstance(raw_variants, (list, tuple)) or not raw_variants:
-        raise TypeError("`clock_variants` must be a non-empty list when provided.")
-
-    variants: list[ClockVariant] = []
-    seen_labels: set[str] = set()
-    for item in raw_variants:
-        if isinstance(item, str):
-            config_path = item
-            label = Path(config_path).stem
-        elif isinstance(item, Mapping):
-            config_path = str(item.get("path") or item.get("clock_config") or "")
-            if not config_path:
-                raise ValueError("Each `clock_variants` entry must include `path` or `clock_config`.")
-            label = str(item.get("label") or Path(config_path).stem)
-        else:
-            raise TypeError("Each `clock_variants` entry must be a string path or a mapping.")
-        if label in seen_labels:
-            raise ValueError(f"Duplicate clock variant label: {label}")
-        seen_labels.add(label)
-        variants.append(ClockVariant(label=label, config_path=config_path, config=load_yaml(config_path)))
-    return tuple(variants)
+        ]
+        if custom_schedules:
+            raise ValueError(
+                "Custom offline schedules for PNDM DPMSolver are disabled. "
+                f"{solver} must be base-only, got: {custom_schedules}."
+            )
 
 
 def resolve_schedule_clock_configs(
     experiment_config: Mapping[str, Any],
     *,
-    default_va_clock_config_path: str,
+    default_clock_config_path: str,
 ) -> dict[str, str]:
     configs = {
-        "V_a": default_va_clock_config_path,
-        "LCS-1": "configs/clocks/LCS_1.yaml",
-        "LCS-2": "configs/clocks/LCS_2.yaml",
+        "SADB": default_clock_config_path,
     }
     raw_mapping = experiment_config.get("schedule_clock_configs")
     if raw_mapping is None:
@@ -273,11 +228,8 @@ def resolve_schedule_clock_configs(
 def active_clock_variants_for_schedule(
     schedule_name: str,
     *,
-    va_clock_variants: tuple[ClockVariant, ...],
     schedule_clock_configs: Mapping[str, str],
 ) -> tuple[ClockVariant, ...]:
-    if schedule_name == "V_a":
-        return va_clock_variants
     if schedule_name in schedule_clock_configs:
         config_path = str(schedule_clock_configs[schedule_name])
         return (ClockVariant(label=None, config_path=config_path, config=load_yaml(config_path)),)
@@ -320,8 +272,8 @@ def cached_schedule_root(cache_root: Path, schedule_folder: str, backend: str, *
 
 def is_materializable_schedule(backend: str, schedule_name: str) -> bool:
     materializable = {
-        "pndm": {"linear", "V_a", "LCS-1", "LCS-2"},
-        "diffusers": {"linear", "V_a", "LCS-1", "LCS-2"},
+        "pndm": {"linear", "SADB"},
+        "diffusers": {"linear", "SADB"},
     }
     return schedule_name in materializable.get(backend, set())
 
@@ -445,46 +397,7 @@ def build_pndm_prepare_steps(
             for nfe in target_nfes
         )
 
-    if schedule_name == "V_a":
-        variant_parts = pndm_schedule_parts(
-            dataset_name=dataset_name,
-            model_asset=model_asset,
-            solver=solver,
-            schedule_name=schedule_name,
-            clock_label=clock_label,
-            share_ays_across_solvers=share_ays_across_solvers,
-        )
-        root = cached_schedule_root(schedule_cache_root, schedule_folder, "pndm", *variant_parts)
-        return (
-            PrepareStep(
-                key=f"V_a:pndm:{':'.join(variant_parts)}",
-                runtime_backend="pndm",
-                output_path=root,
-                arguments=(
-                    "scripts/run/export_va_schedule.py",
-                    "--backend",
-                    "pndm",
-                    "--manifest",
-                    manifest_path,
-                    "--clock-config",
-                    clock_config_path,
-                    "--dataset-config",
-                    dataset_config_path,
-                    "--model-asset",
-                    model_asset,
-                    "--solver",
-                    solver,
-                    "--seed",
-                    str(seed),
-                    "--target-nfes",
-                    ",".join(str(nfe) for nfe in target_nfes),
-                    "--output-root",
-                    str(root),
-                ),
-            ),
-        )
-
-    if schedule_name in {"LCS-1", "LCS-2"}:
+    if schedule_name == "SADB":
         variant_parts = pndm_schedule_parts(
             dataset_name=dataset_name,
             model_asset=model_asset,
@@ -500,7 +413,7 @@ def build_pndm_prepare_steps(
                 runtime_backend="pndm",
                 output_path=root,
                 arguments=(
-                    "scripts/run/export_lcs_schedule.py",
+                    "scripts/run/export_defect_clock_schedule.py",
                     "--backend",
                     "pndm",
                     "--manifest",
@@ -584,47 +497,7 @@ def build_diffusers_prepare_steps(
             for nfe in target_nfes
         )
 
-    if schedule_name == "V_a":
-        variant_parts = extend_schedule_parts((model_key, solver), clock_label)
-        root = cached_schedule_root(schedule_cache_root, schedule_folder, "diffusers", *variant_parts)
-        return (
-            PrepareStep(
-                key=f"V_a:diffusers:{':'.join(variant_parts)}",
-                runtime_backend="diffusers",
-                output_path=root,
-                arguments=(
-                    "scripts/run/export_va_schedule.py",
-                    "--backend",
-                    "diffusers",
-                    "--manifest",
-                    manifest_path,
-                    "--clock-config",
-                    clock_config_path,
-                    "--model-asset",
-                    model_asset,
-                    "--prompt-asset",
-                    prompt_asset,
-                    "--solver",
-                    solver,
-                    "--seed",
-                    str(seed),
-                    "--dtype",
-                    dtype_name,
-                    "--height",
-                    str(image_size),
-                    "--width",
-                    str(image_size),
-                    "--guidance-scale",
-                    str(guidance_scale),
-                    "--target-nfes",
-                    ",".join(str(nfe) for nfe in target_nfes),
-                    "--output-root",
-                    str(root),
-                ),
-            ),
-        )
-
-    if schedule_name in {"LCS-1", "LCS-2"}:
+    if schedule_name == "SADB":
         variant_parts = extend_schedule_parts((model_key, solver), clock_label)
         root = cached_schedule_root(schedule_cache_root, schedule_folder, "diffusers", *variant_parts)
         return (
@@ -633,7 +506,7 @@ def build_diffusers_prepare_steps(
                 runtime_backend="diffusers",
                 output_path=root,
                 arguments=(
-                    "scripts/run/export_lcs_schedule.py",
+                    "scripts/run/export_defect_clock_schedule.py",
                     "--backend",
                     "diffusers",
                     "--manifest",
@@ -672,7 +545,6 @@ def build_pndm_invocations(
     *,
     manifest_path: str,
     ays_config_path: str,
-    va_clock_variants: tuple[ClockVariant, ...],
     schedule_clock_configs: Mapping[str, str],
     schedule_cache_root: Path,
     outputs_root: str,
@@ -688,7 +560,7 @@ def build_pndm_invocations(
         solvers=solvers,
         default_schedules=list(schedules),
     )
-    validate_pndm_custom_dpm_schedule_semantics(solver_schedule_overrides)
+    validate_pndm_dpm_schedules_are_base_only(solver_schedule_overrides)
     summary_csv = Path(metrics_root) / f"{experiment_config['name']}.csv"
     seed = int(experiment_config.get("seed", 0))
     save_samples = bool(experiment_config.get("save_samples", True))
@@ -717,7 +589,6 @@ def build_pndm_invocations(
                     schedule_name, schedule_folder = canonical_schedule_name(str(raw_schedule))
                     active_clock_variants = active_clock_variants_for_schedule(
                         schedule_name,
-                        va_clock_variants=va_clock_variants,
                         schedule_clock_configs=schedule_clock_configs,
                     )
 
@@ -843,7 +714,6 @@ def build_diffusers_invocations(
     experiment_config: Mapping[str, Any],
     *,
     manifest_path: str,
-    va_clock_variants: tuple[ClockVariant, ...],
     schedule_clock_configs: Mapping[str, str],
     models_config_path: str,
     schedule_cache_root: Path,
@@ -879,7 +749,6 @@ def build_diffusers_invocations(
                 schedule_name, schedule_folder = canonical_schedule_name(str(raw_schedule))
                 active_clock_variants = active_clock_variants_for_schedule(
                     schedule_name,
-                    va_clock_variants=va_clock_variants,
                     schedule_clock_configs=schedule_clock_configs,
                 )
 
@@ -977,10 +846,9 @@ def build_invocations(
     execution_config: ExecutionConfig,
 ) -> list[ExperimentInvocation]:
     clock_config_path = str(experiment_config.get("clock_config", args.clock_config))
-    va_clock_variants = resolve_clock_variants(experiment_config, default_clock_config_path=clock_config_path)
     schedule_clock_configs = resolve_schedule_clock_configs(
         experiment_config,
-        default_va_clock_config_path=clock_config_path,
+        default_clock_config_path=clock_config_path,
     )
     ays_config_path = str(experiment_config.get("ays_config", args.ays_config))
     models_config_path = str(experiment_config.get("models_config", args.models_config))
@@ -990,7 +858,6 @@ def build_invocations(
             experiment_config,
             manifest_path=args.manifest,
             ays_config_path=ays_config_path,
-            va_clock_variants=va_clock_variants,
             schedule_clock_configs=schedule_clock_configs,
             schedule_cache_root=execution_config.schedule_cache_root,
             outputs_root=args.outputs_root,
@@ -1000,7 +867,6 @@ def build_invocations(
         return build_diffusers_invocations(
             experiment_config,
             manifest_path=args.manifest,
-            va_clock_variants=va_clock_variants,
             schedule_clock_configs=schedule_clock_configs,
             models_config_path=models_config_path,
             schedule_cache_root=execution_config.schedule_cache_root,
@@ -1141,9 +1007,7 @@ def _expected_schedule_implementation_version(schedule_family: str) -> int | Non
     versions = {
         "base": BASELINE_SCHEDULE_IMPLEMENTATION_VERSION,
         "linear": BASELINE_SCHEDULE_IMPLEMENTATION_VERSION,
-        "V_a": VA_SCHEDULE_IMPLEMENTATION_VERSION,
-        "LCS-1": LCS_SCHEDULE_IMPLEMENTATION_VERSION,
-        "LCS-2": LCS_SCHEDULE_IMPLEMENTATION_VERSION,
+        "SADB": DEFECT_BALANCED_CLOCK_VERSION,
     }
     return versions.get(schedule_family)
 

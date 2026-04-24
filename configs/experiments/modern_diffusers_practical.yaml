@@ -17,7 +17,11 @@ solvers:
   - flow_stork4_3rd
 schedules:
   - base
-  - V_a
-  - LCS-1
-  - LCS-2
+  - SADB
+solver_schedules:
+  flow_euler: [base, SADB]
+  flow_dpm_solver: [base]
+  flow_stork4_1st: [base]
+  flow_stork4_2nd: [base]
+  flow_stork4_3rd: [base]
 eval_nfes: [8, 12, 20]

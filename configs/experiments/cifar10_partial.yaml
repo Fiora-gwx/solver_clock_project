@@ -9,32 +9,22 @@ base_config:
   preview_samples: 8
   num_samples: 20000
   batch_size: 1024
-  clock_config: configs/clocks/V_a_partial_offline_fine.yaml
-  schedule_clock_configs:
-    V_a: configs/clocks/V_a_partial_offline_fine.yaml
-    LCS-1: configs/clocks/LCS_1_partial_offline_fine.yaml
-    LCS-2: configs/clocks/LCS_2_partial_offline_fine.yaml
+  clock_config: configs/clocks/SADB_partial_offline_fine.yaml
 model_assets:
   - pndm_model_ddim_cifar10
 solvers:
   - euler
   - heun2
   - deis
-  - dpm_solver_lu
-  - dpm_solver_default
   - stork4_1st
   - stork4_2nd
 schedules:
   - base
-  - V_a
-  - LCS-1
-  - LCS-2
+  - SADB
 solver_schedules:
-  euler: [base, V_a, LCS-1, LCS-2]
-  heun2: [base, V_a, LCS-1, LCS-2]
-  deis: [base, V_a, LCS-1, LCS-2]
-  dpm_solver_lu: [base, V_a, LCS-1, LCS-2]
-  dpm_solver_default: [base]
-  stork4_1st: [base, V_a, LCS-1, LCS-2]
-  stork4_2nd: [base, V_a, LCS-1, LCS-2]
-eval_nfes: [5, 7, 11, 15]
+  euler: [base, SADB]
+  heun2: [base, SADB]
+  deis: [base]
+  stork4_1st: [base, SADB]
+  stork4_2nd: [base, SADB]
+eval_nfes: [5, 7, 11, 15, 31, 63]

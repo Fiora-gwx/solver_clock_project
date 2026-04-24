@@ -29,16 +29,6 @@ run_config cifar10_mainline \
   --execute \
   --materialize-schedules
 
-run_config schedule_vs_clock_small \
-  --experiment-config "$ROOT_DIR/configs/experiments/schedule_vs_clock_small.yaml" \
-  --execute \
-  --materialize-schedules
-
-run_config nfe_transfer_small \
-  --experiment-config "$ROOT_DIR/configs/experiments/nfe_transfer_small.yaml" \
-  --execute \
-  --materialize-schedules
-
 run_config modern_diffusers_practical \
   --experiment-config "$ROOT_DIR/configs/experiments/modern_diffusers_practical.yaml" \
   --execute \

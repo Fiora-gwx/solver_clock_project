@@ -1,0 +1,15 @@
+clock:
+  family: SADB
+  calibration_solver: target
+  model_output_type: epsilon
+  physical_grid_size: 65
+  pilot_batch_size: 8
+  pilot_num_batches: 4
+  pilot_observation_microbatch: 4
+  pilot_prompt_asset: diffusers_smoke_prompts
+  smoothing_window: 3
+  epsilon: 1.0e-12
+  q_min: 0.25
+  q_max: 6.0
+  cache_path: outputs/cache/sadb_profiles
+  target_nfes: [6, 8, 10, 12, 16, 20, 24, 32]

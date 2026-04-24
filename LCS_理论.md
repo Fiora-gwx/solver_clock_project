@@ -1,484 +1,2003 @@
+# 自校准缺陷均衡时间重参数化：第三方代码库复现指南
+
+下面给出一个完整的复现流程。目标是把任意第三方 diffusion / flow sampler 改造成：
+
+[
+\textbf{training-free} + \textbf{solver-aware} + \textbf{order-free} + \textbf{parameterization-agnostic}
+]
+
+的时间重参数方法。
+
+核心思想是：**不要手动判断 solver 是几阶，也不要手动决定应该看 (D_t v)、(D_\sigma v)、还是 (D_\lambda D_\theta)。直接通过 solver 自身的 step-refinement 行为估计它的局部误差缩放和缺陷强度，然后用这个缺陷强度生成新的时间表。**
+
 ---
-title: "面向流生成模型的 Solver-Aware 采样时间步设计"
-subtitle: "以 Lagrangian Curvature Scheduling 为核心的理论、实践与实验框架初稿"
-author: ""
-date: "2026年4月"
-lang: zh-CN
+
+# 0. 方法总览
+
+给定一个第三方采样器，它通常包含：
+
+1. 模型 `model(x, cond)`；
+2. 时间变量，例如 `t`、`sigma`、`lambda`；
+3. 一组采样节点，例如 `timesteps` 或 `sigmas`；
+4. 一个 solver，例如 Euler、Heun、DPM-Solver、UniPC、STORK、EDM Euler、EDM Heun 等。
+
+我们的目标不是改模型，也不是训练新网络，而是替换原始时间表：
+
+[
+u_0,u_1,\dots,u_N
+]
+
+为新的时间表：
+
+[
+\tilde u_0,\tilde u_1,\dots,\tilde u_N,
+]
+
+其中 (u) 是第三方代码库原生使用的采样变量，可以是：
+
+[
+u=t,\qquad u=\sigma,\qquad u=\lambda,\qquad u=\log\sigma,\qquad u=\log\mathrm{SNR}.
+]
+
+核心流程如下：
+
+```text
+第三方 sampler
+    ↓
+识别 native domain：t / sigma / lambda / logSNR
+    ↓
+封装 solver step operator ΨS(x, u_start, u_end)
+    ↓
+用少量 calibration samples 做 step-refinement
+    ↓
+估计局部有效阶数 q(u) 和缺陷强度 C(u)
+    ↓
+构造 defect-balanced density m(u)
+    ↓
+反解 CDF 得到新 schedule
+    ↓
+用新 schedule 运行原始 sampler
+```
+
 ---
 
-# 摘要
+# 1. 第一步：识别第三方代码库的基本结构
 
-连续时间流生成模型的采样本质上是对生成 ODE 的数值积分。在固定 NFE 与固定 solver 的前提下，现有工作更多关注设计更高阶的 solver，而对时间节点 schedule 的讨论往往停留在经验层面。本文围绕一个更直接的问题展开：给定一个 $p$ 阶 solver，什么样的时间步密度能够在相同计算预算下最小化采样误差？
+进入一个第三方代码库时，先不要急着改 schedule。先回答下面几个问题。
 
-本文提出一套 solver-aware 的时间重参数化框架，并将其具体化为 **Lagrangian Curvature Scheduling (LCS)**。核心观点是：对一个 $p$ 阶一阶常微分方程求解器，其局部截断误差主导项由向量场沿轨迹的 $p$ 阶 Lagrangian 导数控制；在连续极限下，最优时间步密度应与对应误差强度函数的 $1/(p+1)$ 次幂成正比。由此可以得到统一的最优 schedule 形式
+---
 
-$$
-m_p^*(t) \propto \kappa_p(t)^{\frac{1}{p+1}},
- \qquad
- \kappa_p(t) := \|\mathcal K_p(\cdot,t)\|_{L^2(\mu_t)}.
-$$
+## 1.1 模型输出是什么？
 
-与 Align Your Steps 一类通过 KL 上界做 solver-specific schedule search 的方法不同，本文从 ODE 局部截断误差与 Wasserstein 误差传播出发，给出更直接的解析密度结构，并明确区分“严格定理层”“可证命题层”和“经验迁移层”。
+常见模型输出包括：
 
-# 1. 引言
+| 输出类型                | 代码里常见名字                          | 含义                                |
+| ------------------- | -------------------------------- | --------------------------------- |
+| noise prediction    | `eps`, `epsilon`, `noise_pred`   | 预测噪声 (\epsilon_\theta(x,u))       |
+| data prediction     | `x0`, `pred_x0`, `denoised`, `D` | 预测干净样本 (x_{0,\theta}(x,u))        |
+| score prediction    | `score`                          | 预测 (\nabla_x \log p_u(x))         |
+| velocity prediction | `v`, `v_pred`, `velocity`        | 预测 DDPM / Imagen 风格 velocity      |
+| flow velocity       | `u`, `dxdt`, `velocity`          | 直接预测 ODE velocity (\frac{dx}{dt}) |
+| EDM denoiser        | `denoised`, `D(x, sigma)`        | 通常等价于 (x_0) 预测                    |
 
-设生成模型对应的连续时间动力系统为
+你需要先确认模型输出，否则很容易把 sampler 的 native derivative 搞错。
 
-$$
-\frac{dX_t}{dt} = v_\theta(X_t,t), \qquad t\in[0,1], \qquad X_0\sim\mu_0,
-$$
+---
 
-其中 $\mu_0$ 为先验分布，$v_\theta$ 为训练完成后的速度场，终点分布记为 $\mu_1$。采样时我们选取离散节点
+## 1.2 采样器在哪个 domain 里积分？
 
-$$
-0=t_0<t_1<\cdots<t_N=1,
-$$
+常见情况：
 
-并用某个数值 solver 从 $t_0$ 推进至 $t_N$。如果把 solver 固定、NFE 固定，那么决定误差的只剩两类因素：一是 solver 本身的局部近似结构，二是这些有限步长如何在时间轴上分配。
+| 采样 domain       | 代码里常见变量               | 典型代码                           |
+| --------------- | --------------------- | ------------------------------ |
+| time domain     | `t`, `timesteps`      | DDPM / DDIM / VP sampler       |
+| sigma domain    | `sigma`, `sigmas`     | EDM / k-diffusion              |
+| log-SNR domain  | `lambda`, `logsnr`    | DPM-Solver 系列                  |
+| normalized time | `t in [0,1]`          | Rectified Flow / Flow Matching |
+| discrete index  | `i`, `timestep index` | 一些 diffusers scheduler         |
 
-后一件事，就是本文讨论的 schedule 问题。
+我们的建议：
 
-现有扩散/流模型采样文献里，schedule 经常由经验给出，例如线性时间、余弦、EDM 多项式、log-SNR 均匀化等。这些方法常常有效，但它们大多不是从“给定 solver 以后如何最优地分配离散误差预算”这一原始问题直接推出来的。相反，近年来围绕 solver 的研究更丰富：一阶 DDIM/Euler、二阶 Heun 与 DPM-Solver family、各类 predictor-corrector、以及高阶/稳定化多项式方法不断发展，但 schedule 仍常被视为辅助超参数，而不是与 solver 同等重要的设计对象。
+[
+\boxed{
+\text{优先在第三方代码库的 native domain 里做 calibration。}
+}
+]
 
-本文的基本立场是：**schedule 本身应该是 solver-aware 的。** 不同阶数的 solver 对局部曲率的敏感程度不同，因此最优 clock 的定义对象也应不同。顺着这一思路，本文提出以下论文主线：
+也就是说：
 
-1. 对固定的 $p$ 阶 solver，局部误差主导项由某个 $p$ 阶 Lagrangian 误差核 $\mathcal K_p$ 决定。
-2. 全局误差传播后，在连续极限下，schedule 优化转化为一个一维泛函最优化问题。
-3. 该问题的最优解具有闭式密度结构 $m_p^*(t)\propto \kappa_p(t)^{1/(p+1)}$。
-4. 实践上，只做 $p=1,2$ 的离线 clock 已足以覆盖绝大多数实用 solver；更高阶 solver 更适合作为 transfer 评测对象。
-5. LCS-1 对高阶 solver 的效果，应该被理解为“误差常数上的稳健迁移”，而不是“严格意义上仍然最优”。
+* 如果原代码用 `sigmas`，就把 (u) 设为 (\sigma)；
+* 如果原代码用 `timesteps`，就把 (u) 设为 (t)；
+* 如果原代码用 `lambda`，就把 (u) 设为 (\lambda)；
+* 如果原代码用 `logSNR`，就把 (u) 设为 log-SNR。
 
-这条主线比直接把所有经验现象都包装成统一定理更稳妥，也更适合投稿写作。特别地，本文会把以下三层结论明确区分开来：
+这样做最稳，因为 solver 的阶数和误差结构是相对于它自己的积分变量定义的。
 
-- **严格定理层**：给定 solver 阶数 $p$ 后，最优连续密度 $m_p^*$ 的形式。
-- **条件命题层**：若 $\kappa_1$ 与 $\kappa_p$ 的时间分布相关，则 LCS-1 对高阶 solver 近似有效。
-- **经验层**：跨 solver 的迁移强度究竟多大，必须由实验给出，而不能在正文里写成无条件定理。
+---
 
+## 1.3 采样方向是什么？
 
+很多 diffusion sampler 是反向积分：
 
-# 3. 问题设定与基本符号
+[
+\sigma_{\max}\to \sigma_{\min},
+]
 
-设精确流映射记为
+或者
 
-$$
-\Phi_{s,t}:\mathbb R^d\to\mathbb R^d,
-\qquad
-X_t=\Phi_{s,t}(X_s).
-$$
+[
+t_{\max}\to t_{\min}.
+]
 
-对应分布流为
+因此 step size 可能是负的：
 
-$$
-\mu_t=(\Phi_{0,t})_\#\mu_0.
-$$
+[
+h = u_{\mathrm{end}} - u_{\mathrm{start}} < 0.
+]
 
-给定一个 $p$ 阶单步 solver，其一步映射写为
+在估计阶数时，只使用
 
-$$
-\Psi_{t,h}^{(p)}: \mathbb R^d\to\mathbb R^d,
-\qquad
-Y_{t+h}=\Psi_{t,h}^{(p)}(Y_t).
-$$
+[
+|h|.
+]
 
-对离散节点 $\{t_i\}_{i=0}^N$ 记步长为 $h_i=t_{i+1}-t_i$，数值分布递推为
+在调用 solver 时，必须保留原始方向：
 
-$$
-\nu_{i+1}=\bigl(\Psi_{t_i,h_i}^{(p)}\bigr)_\#\nu_i.
-$$
+[
+\Psi_S(x,u,u+h).
+]
 
-我们关心的是终点误差 $W_2(\mu_1,\nu_N)$，以及在固定 $N$ 与固定 solver 时，如何选择最优的时间节点序列。
+---
 
-为此，定义沿精确轨迹的 material derivative
+# 2. 第二步：统一模型输出为 native derivative
 
-$$
-D_t v(x,t)=\partial_t v(x,t)+(v(x,t)\cdot\nabla_x)v(x,t).
-$$
+严格来说，我们的方法可以完全黑箱地使用 solver step，不一定需要显式写出 velocity。但是为了在第三方代码库中定位 sampler，你需要知道它内部到底在算什么。
 
-递归定义高阶导数 $D_t^k v$。当 $v_\theta$ 足够光滑时，精确轨迹的 Taylor 展开可以写成
+---
 
-$$
-\Phi_{t,h}(x)
-= x + h v + \frac{h^2}{2}D_t v + \cdots + \frac{h^{p+1}}{(p+1)!}D_t^p v + O(h^{p+2}).
-$$
+## 2.1 通用线性噪声路径
 
-这为下一节的局部误差分析提供了统一起点。
+很多 diffusion / flow 可以写成：
 
-# 4. 局部截断误差与最优密度
-
-## 4.1 一阶与二阶的显式局部误差
-
-对 Euler 方法，局部截断误差满足
-
-$$
-\Phi_{t,h}(x)-\Psi_{t,h}^{(1)}(x)
-= \frac{h^2}{2}D_t v(x,t)+O(h^3).
-$$
-
-你在现有 LCS 草稿中已经把这一点严格写了出来。
-
-对 Heun 二阶方法，则有
-
-$$
-\Phi_{t,h}(x)-\Psi_{t,h}^{(2)}(x)
-= h^3\mathcal K_2(x,t)+O(h^4),
-$$
-
-其中 $\mathcal K_2$ 是由 $\partial_{tt}v$、$J_xv\cdot\partial_t v$、$J_x(\partial_t v)\cdot v$ 以及 $(v\cdot\nabla_x)^2v$ 组合成的二阶误差核。你目前的草稿已给出显式展开式。
-
-因此，一阶与二阶都已经具备可写进正文的显式误差对象，这也是本文主张“实验上只做 $p=1,2$ 就够了”的第一层理由：不仅因为它们覆盖面广，更因为它们是最容易把理论与实现真正闭合起来的两个阶数。
-
-## 4.2 一般 $p$ 阶形式
-
-对一般满足 Butcher 阶条件的 $p$ 阶 Runge–Kutta 方法，可以把局部截断误差写成
-
-$$
-\Phi_{t,h}(x)-\Psi_{t,h}^{(p)}(x)
-= h^{p+1}\mathcal K_p(x,t)+O(h^{p+2}),
-$$
-
-其中 $\mathcal K_p$ 是由所有阶数为 $p+1$ 的 elementary differentials 组成的线性组合。这个结论属于数值分析中的标准 B-series 结构结果。对本文而言，关键不是把所有 $\mathcal K_p$ 都显式写到高阶，而是承认：**对不同 solver 阶数，真正该匹配的是不同的误差核。**
-
-## 4.3 从局部到全局
-
-同步耦合与 Grönwall 型传播给出
-
-$$
-W_2(\mu_1,\nu_N)
-\le C_S e^{\bar L}
-\sum_{i=0}^{N-1} h_i^{p+1}\kappa_p(t_i)
-+ O(N^{-(p+1)}),
-$$
+[
+x_u = \alpha(u)x_0 + \sigma(u)\epsilon,
+]
 
 其中
 
-$$
-\kappa_p(t)=\|\mathcal K_p(\cdot,t)\|_{L^2(\mu_t)}.
-$$
+[
+\epsilon\sim \mathcal N(0,I).
+]
 
-这正是你当前 LCS 版本的核心主定理。
+如果代码里有 (\alpha(u))、(\sigma(u))，那么不同输出之间可以互相转换。
 
-## 4.4 连续极限下的最优 schedule
+---
 
-将离散 schedule 用连续密度 $m(t)$ 参数化，在 $[t,t+dt]$ 内放置约 $Nm(t)dt$ 个节点，则局部步长近似为
+## 2.2 noise prediction
 
-$$
-h(t)\approx \frac{1}{Nm(t)}.
-$$
+模型输出：
 
-于是上式对应的连续极限目标泛函为
+[
+\epsilon_\theta(x,u).
+]
 
-$$
-\mathcal F_p(m)
-= \int_0^1 m(t)^{-p}\kappa_p(t)\,dt,
+则
+
+[
+\hat x_0(x,u)
+=============
+
+\frac{x-\sigma(u)\epsilon_\theta(x,u)}{\alpha(u)}.
+]
+
+score 近似为：
+
+[
+s_\theta(x,u)
+\approx
+-\frac{\epsilon_\theta(x,u)}{\sigma(u)}.
+]
+
+---
+
+## 2.3 data prediction / denoiser
+
+模型输出：
+
+[
+D_\theta(x,u)\approx x_0.
+]
+
+则
+
+[
+\epsilon_\theta(x,u)
+====================
+
+\frac{x-\alpha(u)D_\theta(x,u)}{\sigma(u)}.
+]
+
+score 近似为：
+
+[
+s_\theta(x,u)
+\approx
+\frac{\alpha(u)D_\theta(x,u)-x}{\sigma(u)^2}.
+]
+
+在 EDM / k-diffusion 代码中，经常使用：
+
+[
+d(x,\sigma)
+===========
+
+\frac{x-D_\theta(x,\sigma)}{\sigma}.
+]
+
+这个 (d) 就是 sigma-domain ODE 的 native derivative：
+
+[
+\frac{dx}{d\sigma}
+==================
+
+\frac{x-D_\theta(x,\sigma)}{\sigma}.
+]
+
+---
+
+## 2.4 velocity prediction
+
+如果使用 DDPM / Imagen 风格的 velocity：
+
+[
+v_\theta = \alpha\epsilon - \sigma x_0,
+]
+
+并且
+
+[
+\alpha^2+\sigma^2=1,
+]
+
+那么有：
+
+[
+\hat x_0
+========
+
+\alpha x-\sigma v_\theta,
+]
+
+[
+\hat\epsilon
+============
+
+\sigma x+\alpha v_\theta.
+]
+
+如果代码里的 (v)-prediction 定义不同，必须先查该代码库的 conversion 函数，例如：
+
+```python
+pred_original_sample
+prediction_type == "v_prediction"
+convert_model_output(...)
+```
+
+不要假设所有库的 `v` 都完全相同。
+
+---
+
+## 2.5 score prediction
+
+模型输出：
+
+[
+s_\theta(x,u)\approx \nabla_x\log p_u(x).
+]
+
+则
+
+[
+\epsilon_\theta(x,u)
+\approx
+-\sigma(u)s_\theta(x,u),
+]
+
+[
+\hat x_0(x,u)
+\approx
+\frac{x+\sigma(u)^2 s_\theta(x,u)}{\alpha(u)}.
+]
+
+对于 VP SDE：
+
+[
+dx = -\frac12\beta(t)x,dt+\sqrt{\beta(t)},dw,
+]
+
+对应 probability flow ODE 通常写成：
+
+[
+\frac{dx}{dt}
+=============
+
+## -\frac12\beta(t)x
+
+\frac12\beta(t)s_\theta(x,t).
+]
+
+代码中如果是 reverse-time 积分，符号由 step direction 自动处理。不要额外手动翻转符号，除非你完全确认原始实现的约定。
+
+---
+
+## 2.6 flow matching / rectified flow
+
+如果模型直接输出：
+
+[
+v_\theta(x,t)\approx \frac{dx}{dt},
+]
+
+那么直接使用：
+
+[
+f(x,t)=v_\theta(x,t).
+]
+
+这种情况最简单。Euler / Heun / RK solver 通常直接作用在这个 velocity 上。
+
+---
+
+# 3. 第三步：选择 native coordinate (u)
+
+我们的算法把所有 sampler 都抽象成：
+
+[
+\frac{dx}{du}=f_u(x,u).
+]
+
+如果第三方代码原来在 (t)-domain 采样：
+
+[
+\frac{dx}{dt}=f_t(x,t),
+]
+
+而你想改成 (\sigma)-domain，则需要：
+
+[
+\frac{dx}{d\sigma}
+==================
+
+\frac{dt}{d\sigma}
+f_t(x,t(\sigma)).
+]
+
+如果从 (t) 改成 (\lambda)-domain：
+
+[
+\frac{dx}{d\lambda}
+===================
+
+\frac{dt}{d\lambda}
+f_t(x,t(\lambda)).
+]
+
+一般地，
+
+[
+\boxed{
+f_v(x,v)
+========
+
+\frac{du}{dv}
+f_u(x,u(v)).
+}
+]
+
+但是复现阶段建议：
+
+[
+\boxed{
+\text{不要主动换 domain。先在原代码的 native domain 里做。}
+}
+]
+
+原因是第三方 solver 的 order、stability、interpolation 都是相对于 native domain 写的。强行换 domain 会引入额外误差。
+
+---
+
+# 4. 第四步：封装 solver step operator
+
+这是最关键的工程步骤。
+
+你需要把第三方 sampler 的单步更新封装成：
+
+```python
+y = solver_step(x, u_start, u_end, extra_state=None)
+```
+
+数学上记作：
+
+[
+y
+=
+
+\Psi_S(x,u_{\mathrm{start}},u_{\mathrm{end}}).
+]
+
+---
+
+## 4.1 一步法 solver
+
+对于 Euler、Heun、RK、EDM Euler、EDM Heun、DPM-Solver 单步版本，可以直接封装。
+
+### Euler example
+
+如果 native ODE 是：
+
+[
+\frac{dx}{du}=f(x,u),
+]
+
+Euler step 是：
+
+[
+\Psi_S(x,u,u+h)
+===============
+
+x+h f(x,u).
+]
+
+代码形式：
+
+```python
+def solver_step_euler(x, u0, u1):
+    h = u1 - u0
+    f0 = model_to_derivative(x, u0)
+    return x + h * f0
+```
+
+---
+
+### Heun example
+
+[
+k_1=f(x,u),
+]
+
+[
+x_{\mathrm{pred}}=x+h k_1,
+]
+
+[
+k_2=f(x_{\mathrm{pred}},u+h),
+]
+
+[
+\Psi_S(x,u,u+h)
+===============
+
+x+\frac{h}{2}(k_1+k_2).
+]
+
+代码形式：
+
+```python
+def solver_step_heun(x, u0, u1):
+    h = u1 - u0
+    k1 = model_to_derivative(x, u0)
+    x_pred = x + h * k1
+    k2 = model_to_derivative(x_pred, u1)
+    return x + 0.5 * h * (k1 + k2)
+```
+
+---
+
+### EDM Euler example
+
+EDM / k-diffusion 中常见：
+
+[
+d(x,\sigma)
+===========
+
+\frac{x-D_\theta(x,\sigma)}{\sigma}.
+]
+
+Euler update：
+
+[
+x_{\mathrm{next}}
+=================
+
+x+(\sigma_{\mathrm{next}}-\sigma)d(x,\sigma).
+]
+
+代码形式：
+
+```python
+def solver_step_edm_euler(x, sigma0, sigma1):
+    denoised = model(x, sigma0)
+    d = (x - denoised) / sigma0
+    return x + (sigma1 - sigma0) * d
+```
+
+---
+
+## 4.2 多步法 solver
+
+如果 solver 是 multistep，例如：
+
+[
+x_{n+1}
+=======
+
+\Psi_S(x_n,x_{n-1},\dots,x_{n-k+1};u_n,u_{n-1},\dots),
+]
+
+那么不能直接只传一个 (x_n)。
+
+此时有两种选择。
+
+### 选择 A：把 multistep solver 当成短区间 solver
+
+封装：
+
+```python
+y = solve_segment(x_start, u_start, u_end, num_internal_steps)
+```
+
+也就是从 (u_{\mathrm{start}}) 积分到 (u_{\mathrm{end}})，内部使用原始 multistep solver。
+
+然后用不同 internal step 数比较收敛阶。
+
+这是最稳的 multistep 方案。
+
+---
+
+### 选择 B：构造一致历史
+
+如果你想估计真正的 local defect，需要准备：
+
+[
+x_{n-k+1},\dots,x_n.
+]
+
+这些历史状态应该来自同一条高精度或原始轨迹。然后比较：
+
+1. 一个大步 multistep update；
+2. 两个半步 multistep update。
+
+这更复杂，不建议第一版实现。
+
+---
+
+# 5. 第五步：采集 calibration states
+
+我们需要估计：
+
+[
+x\sim \mu_u
+]
+
+处的 solver 缺陷。
+
+实际做法：用原始 sampler 跑少量 pilot trajectories，保存若干时间点的中间状态。
+
+---
+
+## 5.1 选择 calibration grid
+
+选择 (M) 个 native domain 点：
+
+[
+u_1,u_2,\dots,u_M.
+]
+
+建议：
+
+```text
+M = 32 或 64
+```
+
+如果原始 schedule 在 (\sigma)-domain 很不均匀，可以在 (\log\sigma) 上均匀选点，再映射回 (\sigma)。
+
+如果原始 schedule 在 (t)-domain，可以直接在 (t) 上选点。
+
+---
+
+## 5.2 选择 calibration samples
+
+选择 (K) 个随机种子：
+
+```text
+K = 4, 8, 16
+```
+
+对每个 seed，运行原始 sampler，并保存：
+
+[
+x_k(u_i),\qquad i=1,\dots,M.
+]
+
+得到：
+
+[
+{x_k(u_i)}_{k=1}^K.
+]
+
+这些样本近似来自：
+
+[
+x_k(u_i)\sim\mu_{u_i}.
+]
+
+---
+
+## 5.3 注意事项
+
+保存 calibration states 时，必须使用和最终采样一致的设置：
+
+| 设置                      | 是否必须一致 |
+| ----------------------- | ------ |
+| CFG scale               | 必须一致   |
+| prompt conditioning     | 最好一致   |
+| model precision         | 必须一致   |
+| thresholding / clipping | 必须一致   |
+| solver type             | 必须一致   |
+| prediction type         | 必须一致   |
+| stochasticity           | 建议关闭   |
+
+如果最终使用 classifier-free guidance，那么 calibration 时也必须用同样的 CFG scale，因为 guidance 会改变向量场的曲率和 Lipschitz 常数。
+
+---
+
+# 6. 第六步：用 step-refinement 估计局部有效阶数
+
+这是我们方法的核心。
+
+对于某个 solver (S)，假设它的局部误差满足：
+
+[
+\Phi_{u+h,u}(x)-\Psi_S(x,u,u+h)
+===============================
+
+h^{q(u)}\mathcal E_S(x,u)
++
+O(h^{q(u)+1}).
+]
+
+这里：
+
+[
+q(u)=p(u)+1.
+]
+
+其中 (p(u)) 是有效全局阶数，(q(u)) 是有效局部阶数。
+
+我们不假设 (p) 是多少，而是从数值缩放中估计 (q(u))。
+
+---
+
+## 6.1 coarse step 与 refined step
+
+给定 refinement factor：
+
+[
+r=2.
+]
+
+计算 coarse step：
+
+[
+y_{\mathrm{coarse}}
+===================
+
+\Psi_S(x,u,u+h).
+]
+
+计算 refined step：
+
+[
+y_{\mathrm{fine}}
+=================
+
+\Psi_S(\cdot,u+h/2,u+h)
+\circ
+\Psi_S(x,u,u+h/2).
+]
+
+一般形式：
+
+[
+y_{\mathrm{fine}}
+=================
+
+\underbrace{
+\Psi_S(\cdot,u+(r-1)h/r,u+h)
+\circ\cdots\circ
+\Psi_S(x,u,u+h/r)
+}_{r\text{ 个小步}}.
+]
+
+然后定义：
+
+[
+\Delta_S(x,u,h)
+===============
+
+d(y_{\mathrm{fine}},y_{\mathrm{coarse}}).
+]
+
+推荐距离：
+
+[
+d(y,z)
+======
+
+\sqrt{
+\frac{1}{D}
+|y-z|_2^2
+},
+]
+
+其中 (D) 是数据维度，例如图像的 (C\times H\times W)。
+
+---
+
+## 6.2 RMS 聚合
+
+对 calibration samples 取 RMS：
+
+[
+A_S(u_i,h_j)
+============
+
+\left(
+\frac1K
+\sum_{k=1}^K
+\Delta_S(x_k(u_i),u_i,h_j)^2
+\right)^{1/2}.
+]
+
+理论上：
+
+[
+A_S(u,h)
+\approx
+B_S(u)|h|^{q(u)}.
+]
+
+其中
+
+[
+B_S(u)
+\approx
+\left|1-r^{1-q(u)}\right|
+C_S(u).
+]
+
+所以
+
+[
+C_S(u)
+\approx
+\frac{B_S(u)}
+{\left|1-r^{1-q(u)}\right|}.
+]
+
+在实际 schedule 构造中，直接用 (B_S(u)) 也可以，因为我们主要关心相对大小。
+
+---
+
+## 6.3 多个测试步长
+
+对每个 (u_i)，选择几个小步长：
+
+[
+h_j\in{h_0,\ h_0/2,\ h_0/4,\ h_0/8}.
+]
+
+注意：
+
+1. (u_i+h_j) 不能超出合法采样区间；
+2. (h_j) 要沿采样方向；
+3. 拟合时使用 (|h_j|)；
+4. (h_j) 不能太大，否则不在渐近区；
+5. (h_j) 不能太小，否则数值误差和神经网络不连续性会主导。
+
+---
+
+## 6.4 log-log 拟合
+
+对每个 (u_i)，拟合：
+
+[
+\log A_S(u_i,h_j)
+=================
+
+\beta_i
++
+q_i\log |h_j|.
+]
+
+得到：
+
+[
+\widehat q_i=q_i,
+]
+
+[
+\widehat B_i=\exp(\beta_i).
+]
+
+修正后的 local defect coefficient：
+
+[
+\widehat C_i
+============
+
+\frac{
+\widehat B_i
+}{
+\left|1-r^{1-\widehat q_i}\right|+\varepsilon
+}.
+]
+
+其中 (\varepsilon) 是很小的常数，避免除零，例如：
+
+[
+\varepsilon=10^{-12}.
+]
+
+---
+
+# 7. 第七步：构造 defect-balanced density
+
+我们的目标是生成一个时间密度：
+
+[
+m(u)\ge 0,
+]
+
+满足：
+
+[
+\int_{u_{\min}}^{u_{\max}}m(u),du=1.
+]
+
+如果局部缺陷为：
+
+[
+C_S(u)|h|^{q(u)},
+]
+
+那么最优 density 近似满足：
+
+[
+\boxed{
+m^*(u)
+\propto
+\left(
+(q(u)-1)C_S(u)
+\right)^{1/q(u)}
+}
+]
+
+如果 (q(u)) 基本稳定，可以取：
+
+[
+\bar q
+======
+
+\mathrm{median}_i\widehat q_i,
+]
+
+然后使用：
+
+[
+\boxed{
+m^*(u_i)
+\propto
+\widehat C_i^{1/\bar q}.
+}
+]
+
+如果 (q(u)) 明显变化，则使用：
+
+[
+\boxed{
+m^*(u_i)
+\propto
+\left(
+(\widehat q_i-1)\widehat C_i
+\right)^{1/\widehat q_i}.
+}
+]
+
+---
+
+## 7.1 稳定化处理
+
+直接使用 (\widehat C_i) 可能会很 noisy，所以建议对 log-density 做平滑。
+
+先定义 raw weight：
+
+[
+w_i
+===
+
+\left(
+(\widehat q_i-1)\widehat C_i+\varepsilon
+\right)^{1/\widehat q_i}.
+]
+
+然后取 log：
+
+[
+\ell_i=\log(w_i+\varepsilon).
+]
+
+对 (\ell_i) 做平滑，例如：
+
+```python
+ell_smooth = gaussian_filter1d(ell, sigma=1.0)
+```
+
+然后：
+
+[
+w_i^{\mathrm{smooth}}=\exp(\ell_i^{\mathrm{smooth}}).
+]
+
+---
+
+## 7.2 clipping
+
+为了避免某些点权重过大或过小，建议做 quantile clipping：
+
+[
+w_i
+\leftarrow
+\mathrm{clip}
+\left(
+w_i,
+Q_{0.05}(w),
+Q_{0.95}(w)
+\right).
+]
+
+也可以加 density floor：
+
+[
+w_i
+\leftarrow
+(1-\rho)w_i+\rho \bar w,
+]
+
+其中：
+
+[
+\rho\in[0.02,0.1].
+]
+
+---
+
+## 7.3 和原始 schedule 混合
+
+第一版复现时，建议不要完全替换原 schedule，而是混合：
+
+[
+m_{\mathrm{final}}(u)
+=====================
+
+(1-\eta)m_{\mathrm{base}}(u)
++
+\eta m_{\mathrm{defect}}(u).
+]
+
+其中：
+
+[
+\eta\in[0.5,1.0].
+]
+
+如果第三方代码的原 schedule 已经很强，例如 Karras schedule、DPM-Solver 默认 logSNR schedule，可以先用：
+
+[
+\eta=0.5.
+]
+
+如果希望测试我们方法的纯效果，可以用：
+
+[
+\eta=1.0.
+]
+
+---
+
+# 8. 第八步：从 density 生成新的 schedule
+
+假设 native domain 区间为：
+
+[
+u_{\mathrm{start}}\to u_{\mathrm{end}}.
+]
+
+注意这可能是降序，例如：
+
+[
+\sigma_{\max}\to\sigma_{\min}.
+]
+
+定义 oriented coordinate：
+
+[
+s\in[0,1].
+]
+
+可以令：
+
+[
+s(u)
+====
+
+\frac{
+|u-u_{\mathrm{start}}|
+}{
+|u_{\mathrm{end}}-u_{\mathrm{start}}|
+}.
+]
+
+在 calibration grid 上有 density values：
+
+[
+m_i=m(u_i).
+]
+
+构造 CDF：
+
+[
+F(u)
+====
+
+\frac{
+\int_{u_{\mathrm{start}}}^{u}
+m(v),|dv|
+}{
+\int_{u_{\mathrm{start}}}^{u_{\mathrm{end}}}
+m(v),|dv|
+}.
+]
+
+然后给定总步数 (N)，新的节点满足：
+
+[
+F(\tilde u_n)=\frac{n}{N},
 \qquad
-\text{s.t. } m(t)>0,\ \int_0^1 m(t)dt=1.
-$$
+n=0,\dots,N.
+]
 
-对该变分问题做 Lagrange 乘子或 Hölder 不等式分析，都得到唯一最优解
+数值上可以用插值反函数：
 
-$$
- m_p^*(t)=
- \frac{\kappa_p(t)^{1/(p+1)}}{\int_0^1 \kappa_p(s)^{1/(p+1)}ds}.
-$$
+```python
+new_u = inverse_cdf(np.linspace(0, 1, N + 1))
+```
 
-这也是你现有稿件中最重要的主结论。
+最后把：
 
-# 5. 只做一阶与二阶实验是否足够
+```python
+scheduler.timesteps = new_u
+```
 
-这个问题在投稿层面比看起来更重要，因为它直接决定论文是“理论完整但实现松散”，还是“理论与实验真正闭环”。本文的判断是：**只做 $p=1$ 与 $p=2$ 的 LCS 实验完全合理，而且是推荐方案。**
+或者：
 
-原因有三层。
+```python
+scheduler.sigmas = new_u
+```
 
-第一，从 solver 覆盖面看，一阶与二阶已经覆盖了最主要的实用采样器。一阶对应 Euler/DDIM；二阶对应 Heun、RK2、若干单步 DPM-Solver-2 变体，也覆盖了多数中低 NFE 下真正常用的方法。高于二阶的显式 Runge–Kutta 在扩散/流模型里并不普遍，一方面因为每步 NFE 开销更高，另一方面因为大步长场景下 order reduction 与 stiffness 会削弱名义阶数收益。
+替换进原始 sampler。
+
+---
+
+# 9. 伪代码：完整算法
+
+## 9.1 一步法版本
+
+```python
+def calibrate_defect_schedule(
+    solver_step,
+    pilot_states,       # dict: u_i -> tensor [K, C, H, W]
+    u_grid,             # shape [M]
+    h_list_fn,          # function: u_i -> list of h_j
+    refinement=2,
+    eps=1e-12,
+):
+    """
+    Estimate q(u), C(u), and defect-balanced weights.
 
-第二，从理论闭环看，一阶与二阶是最容易显式写出误差核、最容易直接估计 $\kappa_p(t)$、也最容易构造离线 clock 的两个阶数。你在当前草稿里对 $p=1$ 和 $p=2$ 已经做到了这点，而对更高阶则更多要依赖 B-series 结构描述。作为投稿版本，这样的“前两阶精确、一般阶数结构化”反而比把所有阶数都写得似是而非更稳。
+    solver_step(x, u0, u1) should implement the original sampler's one-step update.
+    """
 
-第三，从实验设计看，高阶 solver 更适合作为 **transfer target**，而不是必须拥有专属 $\mathcal K_p$ 的离线校准源。也就是说，正文的主实验完全可以围绕两条离线 clock 展开：
+    M = len(u_grid)
+    q_hat = np.zeros(M)
+    C_hat = np.zeros(M)
 
-- LCS-1：由 $\kappa_1$ 构造；
-- LCS-2：由 $\kappa_2$ 构造；
+    for i, u in enumerate(u_grid):
+        xs = pilot_states[u]  # [K, ...]
+        h_list = h_list_fn(u)
 
-然后在线分别测试到一阶、二阶、以及一个代表性的更高阶 solver 上。这样实验逻辑会非常清楚：
+        log_h = []
+        log_A = []
 
-1. 自一致测试：LCS-1 对 Euler 最优，LCS-2 对 Heun 最优或接近最优；
-2. 迁移测试：LCS-1 与 LCS-2 对更高阶 solver 各有多少收益；
-3. 成本测试：是否值得为 $p=2$ 比 $p=1$ 多付一次离线校准成本。
+        for h in h_list:
+            deltas = []
 
-所以，若论文以“完整、可信、可复现”为目标，而不是追求在每个高阶 solver 上都形式上覆盖，那么只做一阶与二阶作为校准源，是非常合理的主实验设置。
+            for x in xs:
+                # coarse step
+                y_coarse = solver_step(x, u, u + h)
 
-# 6. 为什么 LCS-1 往往也能提升高阶 solver
+                # refined step
+                y_fine = x
+                for r in range(refinement):
+                    u_a = u + r * h / refinement
+                    u_b = u + (r + 1) * h / refinement
+                    y_fine = solver_step(y_fine, u_a, u_b)
 
-这一节必须写得谨慎，因为它最容易被过度承诺。最稳妥的写法是：**LCS-1 对高阶 solver 的有效性可以被理论解释，但这个解释在本文中应被表述为条件命题与局部敏感性分析，而不是无条件定理。**
+                # per-dimension RMS displacement
+                delta = rms(y_fine - y_coarse)
+                deltas.append(delta)
 
-## 6.1 收敛率没有被改变，改变的是常数
+            A = sqrt(mean([d ** 2 for d in deltas]))
 
-对一个固定的 $p$ 阶 solver，连续极限下误差泛函写成
+            log_h.append(log(abs(h) + eps))
+            log_A.append(log(A + eps))
 
-$$
-E_p(m)
-= N^{-p}\int_0^1 m(t)^{-p}\kappa_p(t)dt.
-$$
+        # robust linear regression:
+        # log A = beta + q log |h|
+        beta, q = linear_fit(log_h, log_A)
 
-其中 $N^{-p}$ 由 solver 阶数决定，与 schedule 无关。也就是说，在比较两个 schedule 时，被改变的不是收敛率本身，而是误差常数
+        q_hat[i] = q
+        B = exp(beta)
 
-$$
-C_p(m)=\int_0^1 m(t)^{-p}\kappa_p(t)dt.
-$$
+        correction = abs(1.0 - refinement ** (1.0 - q))
+        C_hat[i] = B / (correction + eps)
 
-因此，当我们说 LCS-1 对高阶 solver 也有效时，真正的意思不是“一阶 clock 让高阶 solver 的阶数更高了”，而是“一阶 clock 可能仍然把高阶 solver 的误差常数压得足够低”。这点很重要，正文一定要写清楚。
+    return q_hat, C_hat
+```
 
-## 6.2 相关性假设：$\kappa_p$ 与 $\kappa_1$ 的时间形状近似一致
+---
 
-严格最优的 $p$ 阶密度应为
+## 9.2 构造 density
 
-$$
- m_p^*(t)\propto \kappa_p(t)^{1/(p+1)}.
-$$
+```python
+def build_defect_density(
+    u_grid,
+    q_hat,
+    C_hat,
+    use_local_q=True,
+    smooth=True,
+    clip=True,
+    floor=0.05,
+    eps=1e-12,
+):
+    if use_local_q:
+        q_eff = np.maximum(q_hat, 1.05)
+        weights = ((q_eff - 1.0) * C_hat + eps) ** (1.0 / q_eff)
+    else:
+        q_bar = np.median(q_hat)
+        q_bar = max(q_bar, 1.05)
+        weights = (C_hat + eps) ** (1.0 / q_bar)
 
-而 LCS-1 使用的是
+    # smooth in log-space
+    if smooth:
+        log_w = np.log(weights + eps)
+        log_w = gaussian_smooth(log_w, sigma=1.0)
+        weights = np.exp(log_w)
 
-$$
- m_1^*(t)\propto \kappa_1(t)^{1/2}.
-$$
+    # quantile clipping
+    if clip:
+        lo = np.quantile(weights, 0.05)
+        hi = np.quantile(weights, 0.95)
+        weights = np.clip(weights, lo, hi)
 
-若要解释前者为什么会被后者近似，最自然的条件是存在某种形状相关关系，例如
+    # density floor
+    weights = (1.0 - floor) * weights + floor * np.mean(weights)
 
-$$
-\kappa_p(t) \approx C_p\,\kappa_1(t)^p g_p(t),
-$$
+    # normalize as a density over u_grid
+    density = normalize_density(u_grid, weights)
 
-其中 $g_p(t)$ 随时间缓慢变化，或至少相对于 $\kappa_1(t)^p$ 来说没有剧烈峰值重排。此时
+    return density
+```
 
-$$
- m_p^*(t)
-\propto \kappa_p(t)^{1/(p+1)}
-\approx \kappa_1(t)^{p/(p+1)} g_p(t)^{1/(p+1)}.
-$$
+---
 
-因此，LCS-1 与真正的 $m_p^*$ 的差别主要来自指数
+## 9.3 生成新 schedule
 
-$$
-\frac12 \quad \text{vs.} \quad \frac{p}{p+1}.
-$$
+```python
+def make_new_schedule(u_grid, density, num_steps):
+    """
+    u_grid may be increasing or decreasing.
+    density is defined on u_grid.
+    """
 
-对几个最相关的阶数，这个差值并不大：
+    # Work in oriented coordinate along sampling direction
+    arc = np.zeros_like(u_grid)
+    arc[1:] = np.cumsum(np.abs(np.diff(u_grid)))
 
-- $p=1$：$1/2$ 与 $1/2$ 完全一致；
-- $p=2$：$1/2$ 与 $2/3$ 差 $1/6$；
-- $p=3$：$1/2$ 与 $3/4$ 差 $1/4$。
+    # cumulative integral of density along arc
+    cdf = cumulative_trapezoid(density, arc)
+    cdf = cdf / cdf[-1]
 
-这解释了为什么在很多实际模型上，LCS-1 会成为一个 surprisingly strong baseline：因为它抓住了“高曲率区需要更密采样”这一最主要形状信息。
+    target = np.linspace(0.0, 1.0, num_steps + 1)
 
-## 6.3 局部敏感性：偏离最优指数时，损失通常是二阶小量
+    # inverse CDF interpolation
+    new_arc = interp1d(cdf, arc)(target)
+    new_u = interp1d(arc, u_grid)(new_arc)
 
-进一步地，可考虑一个单参数族
+    return new_u
+```
 
-$$
- m_\beta(t)
-= \frac{\kappa_1(t)^\beta}{\int_0^1\kappa_1(s)^\beta ds}.
-$$
+---
 
-若真实最优族附近可以用该参数族近似，且 $\beta^*=p/(p+1)$ 为最优指数，则在足够光滑的条件下，对目标函数在 $\beta^*$ 附近做 Taylor 展开可得
+# 10. 多步 solver 的版本
 
-$$
-E_p(m_\beta)-E_p(m_{\beta^*})
-= O\bigl((\beta-\beta^*)^2\bigr).
-$$
+对于 multistep solver，不建议直接用单步 step-refinement，因为它依赖历史。
 
-这说明：当 $\beta=1/2$ 与 $\beta^*$ 距离不大时，schedule 常数损失往往是二阶小量。这一论证适合在正文里作为“局部敏感性启发式”来写，但不宜包装成完全一般性的主定理。最稳妥的写法是：**在参数化族假设下成立**，并在实验里用 $p=1$ 与 $p=2$ 的曲线对比去支撑。
+可以改成短区间自收敛。
 
-## 6.4 正文应如何表述
+---
 
-因此，正文建议写成下面这种强度：
+## 10.1 短区间误差估计
 
-> LCS-1 对高阶 solver 的有效性，可以从两方面理解：其一，schedule 只改变误差常数而不改变 $N^{-p}$ 收敛率；其二，在许多流生成模型中，不同阶误差核沿时间轴的峰谷结构具有明显相关性，因此由 $\kappa_1$ 导出的时钟常常仍能较好地近似高阶最优密度。该结论在本文中被视为一个条件解释与经验命题，而非无条件定理。
+选择一个短区间：
 
-这样写是稳的，也更像真正会过审稿的一版。
+[
+[u_i,u_i+H_i].
+]
 
-# 7. 新 schedule 部署时是否只需替换 base schedule
+分别用 (n)、(2n)、(4n) 个内部步积分：
 
-这个问题可以回答“基本是”，但必须把边界写清楚。
+[
+y_n,\qquad y_{2n},\qquad y_{4n}.
+]
 
-## 7.1 对单步方法：是，直接替换节点即可
+定义：
 
-对 Euler、Heun、单步 RK2/3/4 以及多数单步 DPM-Solver 变体，如果 solver 形式本身不变，那么部署新的 LCS schedule 时，只需要把原来 base schedule 给出的节点 $\{t_i\}$ 替换成新节点即可。solver 内部的斜率估计、加权求和、预测-校正等公式都不需要修改。
+[
+A(u_i,\Delta u)
+===============
 
-这也是你当前 LCS 草稿在线采样算法的基本设定：离线估计 $\kappa_p$，构造 cumulative clock，再在在线阶段按新的节点推进，而不改 solver 本体。
+d(y_n,y_{2n}),
+]
 
-## 7.2 对多步方法：替换节点，但保留标准启动与历史管理
+其中：
 
-对 Adams 类、PLMS 类、或 DPM-Solver 多步版，原则上仍然是“替换节点序列”，但要注意两点。
+[
+\Delta u=\frac{|H_i|}{n}.
+]
 
-第一，第一步或前几步仍需用单步法启动，这不是 LCS 特有问题，而是多步法本来就需要历史点。
+如果 solver 的全局阶数是 (p)，则：
 
-第二，若新 schedule 非均匀，多步法的局部误差会额外依赖相邻步长差。你现有稿件已经指出，对多步法需要额外关注 $|h_i-h_{i-1}|$ 所引入的不一致误差，并认为在 $m(t)$ 连续时这类误差是更高阶修正。这个判断是合理的，但正文里最好表述为“在平滑 clock 与足够小步长下成立的渐近结论”。
+[
+A(u_i,\Delta u)
+\approx
+\widetilde C(u_i)(\Delta u)^{p(u_i)}.
+]
 
-## 7.3 对指数积分器：替换的是原生积分变量上的节点
+拟合：
 
-对以 $\lambda=\log(\alpha_t/\sigma_t)$ 或其他重参数化变量为主积分坐标的 solver，更精确的说法不是“替换物理时间 $t$ 上的 schedule”，而是：
+[
+\log A
+======
 
-> 在 solver 的原生积分变量上替换节点，并通过该 solver 自带的变量映射把节点还原回实现所需形式。
+\beta_i+p_i\log \Delta u.
+]
 
-这句话一定要写进去。否则审稿人会指出：很多高效 solver 实际上并不是直接在物理时间 $t$ 上做数值积分。
+得到：
 
-## 7.4 与 AYS 的关系
+[
+\widehat p_i.
+]
 
-从使用方式上看，LCS 与 AYS 的确有一个相似点：都可以在不改 solver 内部公式的前提下，只通过替换节点序列来使用。但两者的理论来源不同。AYS 侧重 solver-specific schedule search，并在实践中展示了优化 schedule 向其他 solver 的经验迁移；而你的 LCS 框架侧重从误差核本身导出解析密度。因此最安全的写法是：
+然后：
 
-- **使用方式上**，它们都表现为“替换节点”；
-- **理论上**，LCS 不是对 AYS 的复述，而是另一条更解析化、也更面向 ODE/Wasserstein 误差的路线。
+[
+\widehat q_i=\widehat p_i+1.
+]
 
-# 8. 方法：离线校准与在线采样
+density 使用：
 
-## 8.1 离线估计 $\kappa_1$ 与 $\kappa_2$
+[
+m(u_i)
+\propto
+\left(
+\widetilde C(u_i)
+\right)^{1/(\widehat p_i+1)}.
+]
 
-你现有草稿已经给出一个可直接落地的版本。对 $p=1$，有
+---
 
-$$
-\mathcal K_1(x,t)=\frac12 D_t v(x,t),
-$$
+## 10.2 multistep 伪代码
 
-因此可沿校准轨迹估计
+```python
+def calibrate_multistep_segment(
+    solve_segment,
+    pilot_states,
+    u_grid,
+    H_fn,
+    n_list=(2, 4, 8),
+    eps=1e-12,
+):
+    M = len(u_grid)
+    p_hat = np.zeros(M)
+    C_hat = np.zeros(M)
 
-$$
-\hat\kappa_1(t)=
-\left(\frac1K\sum_{k=1}^K \|D_t v_\theta(X_t^{(k)},t)\|^2\right)^{1/2}.
-$$
+    for i, u in enumerate(u_grid):
+        xs = pilot_states[u]
+        H = H_fn(u)
 
-对 $p=2$，则估计对应的二阶误差核 $\mathcal K_2$。如果显式自动微分代价太高，提出 step-doubling 近似器，这一点非常好，因为它给出了一种 solver-agnostic 的可计算替代：通过一步 $h$ 与两步 $h/2$ 的差异来近似局部误差强度。
+        log_du = []
+        log_A = []
 
-## 8.2 构造 clock
+        for n in n_list:
+            deltas = []
 
-估计出 $\hat\kappa_p$ 后，定义
+            for x in xs:
+                y_n = solve_segment(x, u, u + H, num_steps=n)
+                y_2n = solve_segment(x, u, u + H, num_steps=2 * n)
 
-$$
-\hat m_p(t) \propto \hat\kappa_p(t)^{1/(p+1)}.
-$$
+                delta = rms(y_2n - y_n)
+                deltas.append(delta)
 
-再构造累积映射
+            A = sqrt(mean([d ** 2 for d in deltas]))
+            du = abs(H) / n
 
-$$
-\tau(t)=\int_0^t \hat m_p(s)ds,
-$$
+            log_du.append(log(du + eps))
+            log_A.append(log(A + eps))
 
-通过反函数得到 $t(\tau)$。在线采样时，只需在 $\tau$ 空间均匀取点
+        beta, p = linear_fit(log_du, log_A)
 
-$$
-\tau_i=\frac{i}{N},\qquad i=0,\dots,N,
-$$
+        p_hat[i] = p
+        C_hat[i] = exp(beta)
 
-再映回物理时间节点
+    q_hat = p_hat + 1.0
+    return q_hat, C_hat
+```
 
-$$
- t_i=t(\tau_i).
-$$
+---
 
-这正是你草稿中 Algorithm 1 与 Algorithm 2 的主流程。
+# 11. 针对不同代码库类型的接入方式
 
-## 8.3 数值稳定性建议
+## 11.1 EDM / k-diffusion / sigma-domain sampler
 
-为了让实验更稳，建议把下列实现细节写成论文中的“practical recipe”：
+常见形式：
 
-1. 对 $\hat\kappa_p$ 做一维平滑，避免噪声导致节点扎堆；
-2. 在很小曲率区域加 floor，防止步长无限放大；
-3. 对不同 NFE 直接复用同一条离线 clock，只改变 $\tau$ 上的均匀网格；
-4. 优先把 $p=1,2$ 作为离线校准源，不为每个高阶 solver 都重新估计 $\kappa_p$。
+```python
+sigmas = get_sigmas(...)
+for i in range(len(sigmas) - 1):
+    sigma = sigmas[i]
+    sigma_next = sigmas[i + 1]
+    denoised = model(x, sigma)
+    d = (x - denoised) / sigma
+    x = x + (sigma_next - sigma) * d
+```
 
-这些点都已经在你的现有稿件中有雏形。
+对应数学形式：
 
-# 9. 实验设计建议
+[
+\frac{dx}{d\sigma}
+==================
 
-为了让论文主张尽可能干净，本文建议把实验目的分成三组，而不是一上来铺很多 solver。
+\frac{x-D_\theta(x,\sigma)}{\sigma}.
+]
 
-## 9.1 组一：自一致最优性
+接入步骤：
 
-目标：验证当离线校准阶数与在线 solver 阶数一致时，LCS 是否优于常见 baseline schedule。
+1. native domain 设为：
 
-建议设置：
+[
+u=\sigma.
+]
 
-- LCS-1 + Euler/DDIM；
-- LCS-2 + Heun2；
-- baseline：linear time、EDM、log-SNR；
-- 指标：FID、NFE–FID 曲线、以及 step-wise defect 曲线。
+2. 封装：
 
-这组实验对应的是最干净的理论闭环。
+```python
+solver_step(x, sigma0, sigma1)
+```
 
-## 9.2 组二：跨阶迁移
+3. 用原始 `sigmas` 跑 pilot trajectories，保存 (x(\sigma_i))。
 
-目标：验证只做 $p=1,2$ 的离线 clock 是否足以覆盖更高阶 solver。
+4. 估计：
 
-建议设置：
+[
+q(\sigma),\quad C(\sigma).
+]
 
-- LCS-1 + Heun2；
-- LCS-1 + 一个代表性的高阶 solver；
-- LCS-2 + 同一个高阶 solver；
-- 对比：对应 solver 的 base schedule。
+5. 构造：
 
-这里不要求证明 “LCS-1 仍然最优”，只需要验证“它是否已经足够强、是否接近 LCS-2、以及 LCS-2 的增益是否值得额外离线成本”。
+[
+m(\sigma)\propto C(\sigma)^{1/q(\sigma)}.
+]
 
-## 9.3 组三：部署方式验证
+6. 反解 CDF 得到：
 
-目标：验证新的收益确实来自 schedule，而不是改动了 solver 其他部分。
+```python
+new_sigmas
+```
 
-建议设置：
+7. 替换：
 
-- 保持在线 solver 内部公式、参数、阈值、历史管理完全不变；
-- 仅替换节点序列；
-- 报告 wall-clock、NFE、FID 同时变化。
+```python
+sigmas = new_sigmas
+```
 
-这样可以把“像 AYS 一样只替换节点就够了”这件事，变成一个被实验支持的命题，而不是只写在方法说明里的口头声明。
+---
 
-# 10. 本文建议的投稿表述强度
+## 11.2 DDIM / DDPM / VP time-domain sampler
 
-这一节很重要，因为它决定整篇论文会不会显得“理论野心过大”。
+常见形式：
 
-## 10.1 可以写成定理的部分
+```python
+timesteps = scheduler.timesteps
+for t in timesteps:
+    noise_pred = model(x, t)
+    x = scheduler.step(noise_pred, t, x)
+```
 
-1. 给定 $p$ 阶 solver 后，局部误差核 $\mathcal K_p$ 的存在性与主导阶形式；
-2. 基于 $\kappa_p$ 的全局 $W_2$ 上界；
-3. 连续密度最优化问题的唯一最优解 $m_p^*(t)\propto\kappa_p(t)^{1/(p+1)}$。
+接入步骤：
 
-这些都是你当前稿件里最硬的部分。
+1. native domain 设为：
 
-## 10.2 适合写成命题或假设的部分
+[
+u=t.
+]
 
-1. $\kappa_p$ 与 $\kappa_1$ 的形状相关性；
-2. LCS-1 对高阶 solver 的稳定迁移；
-3. 多步法在平滑非均匀步长下的“最优形式不变”。
+2. 如果 `scheduler.step` 只能接受 discrete timestep，需要确认是否允许 continuous timestep。
 
-这些结论很有道理，但不宜写成无条件定理。
+3. 如果只允许 discrete index，则新 schedule 必须投影回合法 index：
 
-## 10.3 更适合写成实验观察的部分
+[
+\tilde t_i \mapsto \mathrm{round}(\tilde t_i).
+]
 
-1. LCS-1 在中低 NFE 上是否已经足够好；
-2. LCS-2 的增益是否显著高于其额外离线成本；
-3. 高阶 solver 到底更偏好 LCS-1 还是 LCS-2；
-4. 不同数据集上最优 clock 的峰值是否落在高噪声端或数据端。
+4. 封装：
 
-把这三层区分清楚，论文会非常稳。
+```python
+solver_step(x, t0, t1)
+```
 
-# 11. 结论
+如果 scheduler 的 step 函数强依赖当前 index 和 next index，需要传入两者：
 
-本文把流生成模型中的 schedule 设计问题重新表述为一个严格的 solver-aware 误差分配问题。对一个固定的 $p$ 阶 solver，最优连续时间步密度并非经验曲线，而是由对应误差核的 $L^2$ 强度直接决定。由此得到的 LCS 公式
+```python
+solver_step(x, t0, t1):
+    model_out = model(x, t0)
+    return scheduler.step_from_to(model_out, t0, t1, x)
+```
 
-$$
- m_p^*(t)\propto \kappa_p(t)^{1/(p+1)}
-$$
+5. 估计 (q(t))、(C(t))。
 
-给出了一个简洁而统一的解析结论。
+6. 生成新的 `timesteps`。
 
-在这一框架下，本文进一步给出三个对实际研究最重要的判断。
+---
 
-第一，实验上完全可以只做 $p=1$ 与 $p=2$ 两条离线 clock，因为它们既覆盖主流采样器，又是理论与实现最容易闭合的两个阶数。第二，LCS-1 对高阶 solver 的有效性应被理解为误差常数层面的稳健迁移，而不是收敛阶数层面的改变；这一点可以在 $\kappa_1$ 与 $\kappa_p$ 形状相关的条件下得到合理解释。第三，部署新的 schedule 时，对绝大多数 solver 的确只需要替换节点序列，但更准确的说法应是“替换 solver 原生积分变量上的节点”，并保留 solver 本体与多步历史管理不变。
+## 11.3 DPM-Solver / log-SNR-domain sampler
 
-因此，若把论文写作目标定为“理论主线清楚、实验闭环紧、主张强度稳”，那么最优策略不是追求对所有高阶 solver 都构造专属 clock，而是以 $p=1,2$ 为理论与实现核心，再把高阶 solver 作为 transfer 场景纳入实验。这会比把所有经验现象都包装成一般性定理更优雅，也更有机会说服审稿人。
+DPM-Solver 通常在 (\lambda)-domain 或与 (\lambda) 强相关的变量中构造。
 
-# 参考文献（草稿版，待按投稿模板补全）
+其中：
 
-1. Sabour, Fidler, Kreis. *Align Your Steps: Optimizing Sampling Schedules in Diffusion Models*.
-2. 你当前上传的 LCS 草稿：*拉格朗日曲率调度：流生成模型的最优采样时间步设计*。
-3. 其余与 solver、STORK family、flow matching、rectified flow 相关参考文献，建议在正式投稿版中统一补全 BibTeX。
+[
+\lambda
+=======
 
-# 附：一句话论文卖点
+\log\frac{\alpha}{\sigma}
+]
 
-本文不是再提出一个经验时钟，而是给出一个**对固定 solver 最优的解析密度公式**，并说明为什么只做一阶、二阶的离线校准，已经足够支撑大部分实际采样器的提升与迁移。
+或者有些代码使用：
+
+[
+\lambda
+=======
+
+\log\frac{\alpha^2}{\sigma^2}.
+]
+
+两者差一个 factor 2，必须检查代码约定。
+
+接入步骤：
+
+1. 找到代码里的 native variable：
+
+```python
+lambda_t
+marginal_lambda(t)
+inverse_lambda(lambda)
+```
+
+2. native domain 设为：
+
+[
+u=\lambda.
+]
+
+3. 封装 DPM-Solver 的一步更新：
+
+```python
+solver_step(x, lambda0, lambda1)
+```
+
+如果原始实现只接受 `t_start, t_end`，则内部做：
+
+[
+t_0=\lambda^{-1}(\lambda_0),
+\qquad
+t_1=\lambda^{-1}(\lambda_1).
+]
+
+4. 不要手动把 DPM-Solver 改成普通 RK。我们的 calibration 直接作用在 DPM-Solver step operator 上。
+
+5. 估计：
+
+[
+q(\lambda),\quad C(\lambda).
+]
+
+6. 生成新的：
+
+```python
+new_lambdas
+```
+
+7. 再映射回模型需要的 conditioning：
+
+```python
+new_timesteps = inverse_lambda(new_lambdas)
+```
+
+---
+
+## 11.4 Rectified Flow / Flow Matching
+
+常见形式：
+
+```python
+for i in range(N):
+    t0 = timesteps[i]
+    t1 = timesteps[i + 1]
+    v = model(x, t0)
+    x = x + (t1 - t0) * v
+```
+
+对应：
+
+[
+\frac{dx}{dt}=v_\theta(x,t).
+]
+
+接入步骤：
+
+1. native domain 设为：
+
+[
+u=t.
+]
+
+2. 封装 `solver_step`。
+
+3. 估计 (q(t))、(C(t))。
+
+4. 生成新的 `timesteps`。
+
+对 rectified flow，如果原始 flow 已经比较直，(C(t)) 可能较平，此时新 schedule 会接近均匀时间表。这是正常现象。
+
+---
+
+# 12. 质量控制：如何判断 calibration 是否有效？
+
+估计完成后，你应该检查以下指标。
+
+---
+
+## 12.1 log-log 线性关系
+
+对每个 (u_i)，检查：
+
+[
+\log A(u_i,h)
+\quad\text{vs.}\quad
+\log |h|.
+]
+
+如果大致线性，说明处于有效渐近区。
+
+如果曲线明显弯曲，说明 (h) 选择不合适。
+
+---
+
+## 12.2 有效阶数是否合理
+
+常见参考：
+
+| Solver       | 理想局部阶数 (q) | 理想全局阶数 (p=q-1) |
+| ------------ | ---------: | -------------: |
+| Euler        |          2 |              1 |
+| Heun         |          3 |              2 |
+| RK4          |          5 |              4 |
+| DPM-Solver-1 |          2 |              1 |
+| DPM-Solver-2 |          3 |              2 |
+| DPM-Solver-3 |          4 |              3 |
+
+注意：实际估计到的 (q) 可能低于理论值，原因包括：
+
+1. 模型不够光滑；
+2. CFG scale 太大；
+3. thresholding / clipping 破坏光滑性；
+4. (\sigma\to0) 附近奇异；
+5. discrete timestep embedding 不支持连续时间；
+6. solver startup 阶数低；
+7. multistep 历史不一致；
+8. mixed precision 误差。
+
+所以我们关心的是：
+
+[
+\boxed{
+q_{\mathrm{eff}}(u)
+}
+]
+
+而不是论文里标称的阶数。
+
+---
+
+## 12.3 缺陷强度是否集中在合理区域
+
+一般 diffusion sampler 的误差可能集中在：
+
+* high-noise 到 mid-noise 的 transition 区域；
+* low-noise 细节生成区域；
+* guidance 强烈改变方向的区域；
+* (\sigma) 很小导致 derivative 变大的区域；
+* logSNR 变化剧烈的区域。
+
+如果 (C(u)) 完全随机跳动，通常说明 calibration 不稳定。
+
+可以增加：
+
+```text
+K：calibration sample 数
+M：calibration time grid 数
+h_list：测试步长数量
+```
+
+或者增强平滑。
+
+---
+
+# 13. 最终采样流程
+
+最终 sampling 不需要再做 step-refinement。
+
+只需要：
+
+1. 加载模型；
+2. 加载或计算好的新 schedule；
+3. 用原始 solver；
+4. 替换原始 `timesteps` 或 `sigmas`；
+5. 正常采样。
+
+伪代码：
+
+```python
+# 1. original scheduler
+base_schedule = scheduler.get_schedule(num_steps=N)
+
+# 2. calibration
+pilot_states = collect_pilot_states(
+    model=model,
+    scheduler=scheduler,
+    base_schedule=base_schedule,
+    u_grid=u_grid,
+    num_calib_samples=K,
+)
+
+q_hat, C_hat = calibrate_defect_schedule(
+    solver_step=solver_step,
+    pilot_states=pilot_states,
+    u_grid=u_grid,
+    h_list_fn=h_list_fn,
+)
+
+# 3. build new schedule
+density = build_defect_density(
+    u_grid=u_grid,
+    q_hat=q_hat,
+    C_hat=C_hat,
+)
+
+new_schedule = make_new_schedule(
+    u_grid=u_grid,
+    density=density,
+    num_steps=N,
+)
+
+# 4. final sampling
+scheduler.set_schedule(new_schedule)
+
+samples = sample(
+    model=model,
+    scheduler=scheduler,
+    num_steps=N,
+    prompts=prompts,
+)
+```
+
+---
+
+# 14. 推荐的默认超参数
+
+| 超参数                     |                推荐值 |
+| ----------------------- | -----------------: |
+| calibration grid (M)    |            32 或 64 |
+| calibration samples (K) |             4 到 16 |
+| refinement factor (r)   |                  2 |
+| 测试步长数量                  |              3 或 4 |
+| log-density smoothing   | Gaussian sigma = 1 |
+| clipping quantile       |           5% 到 95% |
+| density floor           |         0.02 到 0.1 |
+| schedule mixing (\eta)  |          0.5 到 1.0 |
+| (q) 下界                  |               1.05 |
+| (q) 上界                  |              6 或 8 |
+
+---
+
+# 15. 实验对照设计
+
+为了证明方法有效，建议做以下对照。
+
+---
+
+## 15.1 同 NFE 对照
+
+固定采样步数 (N)，比较：
+
+1. 原始 schedule；
+2. Karras schedule；
+3. uniform in (t)；
+4. uniform in (\sigma)；
+5. uniform in (\lambda)；
+6. 我们的 defect-balanced schedule。
+
+要求：
+
+[
+\text{NFE 完全一致。}
+]
+
+---
+
+## 15.2 同 solver 对照
+
+固定 solver，只换 schedule：
+
+```text
+Euler + base schedule
+Euler + our schedule
+
+Heun + base schedule
+Heun + our schedule
+
+DPM-Solver + base schedule
+DPM-Solver + our schedule
+```
+
+这样可以证明我们的改进来自时间重参数，而不是 solver 改动。
+
+---
+
+## 15.3 跨 parameterization 对照
+
+同一个模型或等价模型，分别测试：
+
+| 模型输出                 | 是否能接入 |
+| -------------------- | ----- |
+| noise prediction     | 是     |
+| data prediction      | 是     |
+| velocity prediction  | 是     |
+| score prediction     | 是     |
+| direct flow velocity | 是     |
+
+重点展示：
+
+[
+\boxed{
+\text{我们的方法不依赖模型输出形式，只依赖 solver step 的自收敛缺陷。}
+}
+]
+
+---
+
+# 16. 常见失败情况和处理方式
+
+## 16.1 (q(u)) 估计非常低
+
+例如：
+
+[
+q(u)<1.
+]
+
+可能原因：
+
+1. step size 太大；
+2. step size 太小，被数值误差主导；
+3. 模型 timestep embedding 是离散的；
+4. solver 内部有 clipping；
+5. dynamic thresholding 造成非光滑；
+6. stochastic sampler 没有关掉随机性。
+
+处理：
+
+```text
+扩大 h_list 的中间范围；
+关闭 stochasticity；
+关闭或固定 thresholding；
+使用 median q；
+对 q 做 clipping。
+```
+
+---
+
+## 16.2 (\Delta(h)) 不随 (h) 下降
+
+如果：
+
+[
+A(h/2)\not< A(h),
+]
+
+说明 step-refinement 没有进入渐近区。
+
+处理：
+
+1. 增大 calibration batch；
+2. 改变 (h) 范围；
+3. 检查 solver step 是否真的支持任意 (u_0\to u_1)；
+4. 检查模型是否能接受 continuous timestep；
+5. 检查是否有 stochastic noise。
+
+---
+
+## 16.3 新 schedule 在端点过密
+
+低噪声端经常出现：
+
+[
+C(u)\to\infty.
+]
+
+处理：
+
+1. density clipping；
+2. density floor；
+3. 保留原始最后一步 denoise；
+4. 限制最小 step size；
+5. 和原 schedule 混合。
+
+---
+
+## 16.4 第三方 scheduler 不允许任意 timestep
+
+有些代码只允许整数 timestep index。
+
+处理：
+
+1. 先生成 continuous schedule；
+2. 投影到最近合法 index；
+3. 去重；
+4. 如果去重后步数减少，重新插值补点；
+5. 确保 schedule 单调。
+
+---
+
+# 17. 最终方法可以在论文中这样定义
+
+我们的方法不假设 solver 阶数，而是定义：
+
+[
+\Delta_S(u,h)
+=============
+
+\left(
+\mathbb E_{x\sim\mu_u}
+\left[
+d\left(
+\Psi_S(x,u,u+h),
+\Psi_S^{(r)}(x,u,u+h)
+\right)^2
+\right]
+\right)^{1/2},
+]
+
+其中 (\Psi_S^{(r)}) 表示使用 (r) 个小步完成同一区间。
+
+若：
+
+[
+\Delta_S(u,h)
+\asymp
+B_S(u)|h|^{q_S(u)},
+]
+
+则：
+
+[
+q_S(u)
+======
+
+\frac{
+\partial\log \Delta_S(u,h)
+}{
+\partial\log |h|
+},
+]
+
+[
+C_S(u)
+======
+
+\frac{
+B_S(u)
+}{
+|1-r^{1-q_S(u)}|
+}.
+]
+
+最终 schedule density 为：
+
+[
+\boxed{
+m_S^*(u)
+\propto
+\left(
+(q_S(u)-1)C_S(u)
+\right)^{1/q_S(u)}.
+}
+]
+
+当 (q_S(u)) 近似常数时：
+
+[
+\boxed{
+m_S^*(u)
+\propto
+C_S(u)^{1/q_S}.
+}
+]
+
+这就是完整的：
+
+[
+\boxed{
+\textbf{Order-Free Solver-Aware Defect-Balanced Time Reparameterization}
+}
+]
+
+或者中文：
+
+[
+\boxed{
+\textbf{免阶数假设的求解器感知缺陷均衡时间重参数化}
+}
+]
+
+核心卖点是：
+
+1. 不需要训练；
+2. 不需要知道 solver 名称；
+3. 不需要人工输入 solver 阶数；
+4. 不依赖模型输出类型；
+5. 不依赖 (t)、(\sigma)、(\lambda) 的具体选择；
+6. 直接在第三方代码库的 native sampler 上估计有效局部误差；
+7. 生成的新 schedule 可以直接替换原始 schedule。

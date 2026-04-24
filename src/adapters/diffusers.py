@@ -35,7 +35,7 @@ from STORKScheduler import STORKScheduler  # type: ignore  # noqa: E402
 
 
 @dataclass(frozen=True)
-class DiffusersLcsBatch:
+class DiffusersDefectBatch:
     initial_latents: torch.Tensor
     sigma_max: float
     velocity_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
@@ -117,7 +117,7 @@ def _pipeline_kind(pipeline) -> str:
         return "sd3"
     if "lumina2" in name:
         return "lumina2"
-    raise ValueError(f"Unsupported diffusers pipeline for LCS calibration: {pipeline.__class__.__name__}")
+    raise ValueError(f"Unsupported diffusers pipeline for defect calibration: {pipeline.__class__.__name__}")
 
 
 def _default_max_sequence_length(pipeline) -> int:
@@ -147,7 +147,7 @@ def _slice_batch_tensor(tensor: torch.Tensor | None, batch_size: int) -> torch.T
     raise ValueError(f"Cannot adapt tensor with leading dimension {tensor.shape[0]} to batch size {batch_size}.")
 
 
-def build_lcs_sigma_grid(
+def build_defect_sigma_grid(
     pipeline,
     *,
     physical_grid_size: int,
@@ -161,13 +161,13 @@ def build_lcs_sigma_grid(
     pipeline.scheduler.set_timesteps(physical_grid_size - 1, device=device, **scheduler_kwargs)
     raw_sigmas = getattr(pipeline.scheduler, "sigmas", None)
     if raw_sigmas is None:
-        raise RuntimeError("The selected diffusers scheduler does not expose a sigma sequence for LCS calibration.")
+        raise RuntimeError("The selected diffusers scheduler does not expose a sigma sequence for defect calibration.")
     sigma_tensor = raw_sigmas.detach().float() if isinstance(raw_sigmas, torch.Tensor) else torch.tensor(raw_sigmas, dtype=torch.float32)
     sigma_max = float(sigma_tensor[0].item())
     return np.linspace(sigma_max, 0.0, physical_grid_size, dtype=np.float64)
 
 
-def _prepare_flux_lcs_batch(
+def _prepare_flux_defect_batch(
     pipeline,
     *,
     prompt: str | list[str],
@@ -176,7 +176,7 @@ def _prepare_flux_lcs_batch(
     height: int,
     width: int,
     guidance_scale: float,
-) -> DiffusersLcsBatch:
+) -> DiffusersDefectBatch:
     device = get_pipeline_device(pipeline)
     max_sequence_length = _default_max_sequence_length(pipeline)
     prompt_embeds, pooled_prompt_embeds, text_ids = pipeline.encode_prompt(
@@ -200,7 +200,7 @@ def _prepare_flux_lcs_batch(
         None,
     )
     scheduler_kwargs = _scheduler_mu_kwargs(pipeline, height=height, width=width)
-    sigma_grid = build_lcs_sigma_grid(pipeline, physical_grid_size=3, height=height, width=width)
+    sigma_grid = build_defect_sigma_grid(pipeline, physical_grid_size=3, height=height, width=width)
     sigma_max = float(sigma_grid[0])
     guidance = None
     if getattr(pipeline.transformer.config, "guidance_embeds", False):
@@ -223,10 +223,10 @@ def _prepare_flux_lcs_batch(
             return_dict=False,
         )[0]
 
-    return DiffusersLcsBatch(initial_latents=latents.detach(), sigma_max=sigma_max, velocity_fn=velocity_fn)
+    return DiffusersDefectBatch(initial_latents=latents.detach(), sigma_max=sigma_max, velocity_fn=velocity_fn)
 
 
-def _prepare_sd3_lcs_batch(
+def _prepare_sd3_defect_batch(
     pipeline,
     *,
     prompt: str | list[str],
@@ -235,7 +235,7 @@ def _prepare_sd3_lcs_batch(
     height: int,
     width: int,
     guidance_scale: float,
-) -> DiffusersLcsBatch:
+) -> DiffusersDefectBatch:
     device = get_pipeline_device(pipeline)
     max_sequence_length = _default_max_sequence_length(pipeline)
     do_cfg = guidance_scale > 1.0
@@ -272,7 +272,7 @@ def _prepare_sd3_lcs_batch(
         generator,
         None,
     )
-    sigma_max = float(build_lcs_sigma_grid(pipeline, physical_grid_size=3, height=height, width=width)[0])
+    sigma_max = float(build_defect_sigma_grid(pipeline, physical_grid_size=3, height=height, width=width)[0])
 
     def velocity_fn(current_latents: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         batch = current_latents.shape[0]
@@ -311,10 +311,10 @@ def _prepare_sd3_lcs_batch(
             return_dict=False,
         )[0]
 
-    return DiffusersLcsBatch(initial_latents=latents.detach(), sigma_max=sigma_max, velocity_fn=velocity_fn)
+    return DiffusersDefectBatch(initial_latents=latents.detach(), sigma_max=sigma_max, velocity_fn=velocity_fn)
 
 
-def _prepare_lumina2_lcs_batch(
+def _prepare_lumina2_defect_batch(
     pipeline,
     *,
     prompt: str | list[str],
@@ -323,7 +323,7 @@ def _prepare_lumina2_lcs_batch(
     height: int,
     width: int,
     guidance_scale: float,
-) -> DiffusersLcsBatch:
+) -> DiffusersDefectBatch:
     device = get_pipeline_device(pipeline)
     max_sequence_length = _default_max_sequence_length(pipeline)
     do_cfg = guidance_scale > 1.0
@@ -355,7 +355,7 @@ def _prepare_lumina2_lcs_batch(
         generator,
         None,
     )
-    sigma_max = float(build_lcs_sigma_grid(pipeline, physical_grid_size=3, height=height, width=width)[0])
+    sigma_max = float(build_defect_sigma_grid(pipeline, physical_grid_size=3, height=height, width=width)[0])
 
     def velocity_fn(current_latents: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         batch = current_latents.shape[0]
@@ -386,10 +386,10 @@ def _prepare_lumina2_lcs_batch(
         noise_pred = noise_pred * (cond_norm / torch.clamp(noise_norm, min=1.0e-12))
         return -noise_pred
 
-    return DiffusersLcsBatch(initial_latents=latents.detach(), sigma_max=sigma_max, velocity_fn=velocity_fn)
+    return DiffusersDefectBatch(initial_latents=latents.detach(), sigma_max=sigma_max, velocity_fn=velocity_fn)
 
 
-def prepare_lcs_batch(
+def prepare_defect_batch(
     pipeline,
     *,
     prompt: str | list[str],
@@ -398,12 +398,12 @@ def prepare_lcs_batch(
     height: int,
     width: int,
     guidance_scale: float,
-) -> DiffusersLcsBatch:
+) -> DiffusersDefectBatch:
     device = get_pipeline_device(pipeline)
     generator = torch.Generator(device=device).manual_seed(seed)
     kind = _pipeline_kind(pipeline)
     if kind == "flux":
-        return _prepare_flux_lcs_batch(
+        return _prepare_flux_defect_batch(
             pipeline,
             prompt=prompt,
             batch_size=batch_size,
@@ -413,7 +413,7 @@ def prepare_lcs_batch(
             guidance_scale=guidance_scale,
         )
     if kind == "sd3":
-        return _prepare_sd3_lcs_batch(
+        return _prepare_sd3_defect_batch(
             pipeline,
             prompt=prompt,
             batch_size=batch_size,
@@ -423,7 +423,7 @@ def prepare_lcs_batch(
             guidance_scale=guidance_scale,
         )
     if kind == "lumina2":
-        return _prepare_lumina2_lcs_batch(
+        return _prepare_lumina2_defect_batch(
             pipeline,
             prompt=prompt,
             batch_size=batch_size,
@@ -432,7 +432,7 @@ def prepare_lcs_batch(
             width=width,
             guidance_scale=guidance_scale,
         )
-    raise ValueError(f"Unsupported diffusers pipeline for LCS calibration: {pipeline.__class__.__name__}")
+    raise ValueError(f"Unsupported diffusers pipeline for defect calibration: {pipeline.__class__.__name__}")
 
 
 def replace_scheduler(pipeline, solver_name: str):

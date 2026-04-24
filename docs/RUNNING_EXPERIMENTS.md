@@ -21,8 +21,7 @@ Experiment behavior should live in the YAML, not in ad-hoc shell orchestration. 
 - `prepare_schedules_first`: precompute reusable schedule bundles before sampling
 - `schedule_cache_root` (optional): override the default per-experiment cache location
 - `save_samples`: when `false`, keep only metrics/manifests and discard generated sample images after metric computation
-- `clock_variants`: expand one experiment YAML across multiple `V_a` clock configs
-- `schedule_clock_configs`: override the default materializable clock config per family (`V_a`, `LCS-1`, `LCS-2`)
+- `schedule_clock_configs`: override the default materializable clock config for `SADB`
 
 If `schedule_cache_root` is omitted, materialized bundles are stored under:
 
@@ -75,9 +74,10 @@ Example: run the CIFAR-10 partial sweep and auto-generate missing reusable bundl
 Notes:
 
 - `base` does not require a schedule bundle.
-- `linear`, `V_a`, `LCS-1`, and `LCS-2` are materializable schedules. They are checked in the per-experiment cache first, then generated only if missing.
-- `V_a` remains the historical proxy baseline.
-- `LCS-1` and `LCS-2` are the primary theory-backed schedule families. They only replace schedule nodes and do not modify the online solver itself.
+- `linear` and `SADB` are materializable schedules. They are checked in the per-experiment cache first, then generated only if missing.
+- Old V-a/LCS schedules are removed from the launcher; use `SADB` for solver-aware step-refinement calibration.
+- PNDM DPMSolver runs are base-only; the lambda-domain custom clock path is disabled.
+- Modern diffusers `SADB` is enabled for `flow_euler` in the practical config; flow DPM/STORK entries remain base-only until their native custom-step refinement path is validated.
 - `AYS` is treated as an external asset only. Use the published bundles recorded in
   `configs/reference_schedules/ays_published_10step.yaml` and `schedules/ays_like/published/...`.
 - The `V_b` / `A_a` / `A_b` families are still treated as external assets.
@@ -90,13 +90,6 @@ CIFAR-10 partial sweep:
 /home/gwx/miniconda3/envs/sc-diff/bin/python scripts/run/run_experiment_config.py \
   --experiment-config configs/experiments/cifar10_partial.yaml \
   --limit 3
-```
-
-Small-model schedule study:
-
-```bash
-/home/gwx/miniconda3/envs/sc-diff/bin/python scripts/run/run_experiment_config.py \
-  --experiment-config configs/experiments/schedule_vs_clock_small.yaml
 ```
 
 CIFAR-10 mainline:
@@ -120,49 +113,6 @@ Modern diffusers practical:
 ```bash
 /home/gwx/miniconda3/envs/sc-diff/bin/python scripts/run/run_experiment_config.py \
   --experiment-config configs/experiments/modern_diffusers_practical.yaml
-```
-
-LCS confirmation on PNDM:
-
-```bash
-/home/gwx/miniconda3/envs/sc-diff/bin/python scripts/run/run_experiment_config.py \
-  --experiment-config configs/experiments/lcs_confirmation_pndm.yaml
-```
-
-LCS confirmation on diffusers:
-
-```bash
-/home/gwx/miniconda3/envs/sc-diff/bin/python scripts/run/run_experiment_config.py \
-  --experiment-config configs/experiments/lcs_confirmation_diffusers.yaml
-```
-
-V_a ablation stage A:
-
-```bash
-/home/gwx/miniconda3/envs/sc-diff/bin/python scripts/run/run_experiment_config.py \
-  --experiment-config configs/experiments/cifar10_va_ablation_selection.yaml \
-  --execute \
-  --materialize-schedules \
-  --skip-existing
-```
-
-Compose the phase-B `A-winners-combined` clock config from the stage-A metrics:
-
-```bash
-/home/gwx/miniconda3/envs/sc-diff/bin/python scripts/run/compose_va_winner_config.py \
-  --selection-config configs/experiments/cifar10_va_ablation_selection.yaml \
-  --metrics-csv outputs/metrics/cifar10_va_ablation_selection.csv \
-  --output configs/clocks/V_a_combo_awinners.yaml
-```
-
-V_a ablation stage B:
-
-```bash
-/home/gwx/miniconda3/envs/sc-diff/bin/python scripts/run/run_experiment_config.py \
-  --experiment-config configs/experiments/cifar10_va_ablation_confirmation.yaml \
-  --execute \
-  --materialize-schedules \
-  --skip-existing
 ```
 
 ## Outputs

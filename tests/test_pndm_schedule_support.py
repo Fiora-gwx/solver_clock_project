@@ -6,7 +6,7 @@ from src.adapters.pndm import (
     _resolve_custom_heun_grid,
     build_pndm_native_coordinate_grid,
     build_scheduler,
-    collect_shared_clock_velocity_norms,
+    collect_solver_refinement_stats,
     preferred_calibration_domain,
     preferred_schedule_representation,
 )
@@ -72,31 +72,33 @@ def test_noise_stork_set_timesteps_keeps_custom_sigmas_and_dt_list() -> None:
     )
 
 
-def test_dpm_solver_variants_keep_sigma_min_terminal() -> None:
+def test_dpm_solver_variants_reject_custom_offline_schedules() -> None:
     for solver_name in ("dpm_solver_lu", "dpm_solver_default"):
         scheduler = build_scheduler(solver_name)
         scheduler.set_timesteps(4, device=torch.device("cpu"))
-        default_terminal_sigma = float(scheduler.sigmas[-1].item())
-        assert default_terminal_sigma > 0.0
 
         bundle = ScheduleBundle(timesteps=np.asarray([999.0, 700.0, 200.0], dtype=np.float64))
-        _configure_scheduler_timesteps(
-            scheduler,
-            num_inference_steps=3,
-            device=torch.device("cpu"),
-            schedule_bundle=bundle,
-        )
-        assert np.isclose(float(scheduler.sigmas[-1].item()), default_terminal_sigma)
+        try:
+            _configure_scheduler_timesteps(
+                scheduler,
+                num_inference_steps=3,
+                device=torch.device("cpu"),
+                schedule_bundle=bundle,
+            )
+        except ValueError as error:
+            assert "DPMSolver" in str(error)
+        else:
+            raise AssertionError("DPMSolver custom offline schedules should be disabled.")
 
 
-def test_sigma_native_and_lambda_native_solvers_choose_expected_domains() -> None:
+def test_sigma_native_solvers_choose_expected_domains() -> None:
     assert preferred_schedule_representation("heun2") == "sigmas"
     assert preferred_schedule_representation("stork4_1st") == "sigmas"
-    assert preferred_schedule_representation("dpm_solver_lu") == "sigmas"
+    assert preferred_schedule_representation("dpm_solver_lu") == "timesteps"
     assert preferred_schedule_representation("euler") == "timesteps"
     assert preferred_calibration_domain("heun2") == "sigmas"
-    assert preferred_calibration_domain("dpm_solver_lu") == "lambda"
-    assert preferred_calibration_domain("dpm_solver_default") == "lambda"
+    assert preferred_calibration_domain("dpm_solver_lu") == "timesteps"
+    assert preferred_calibration_domain("dpm_solver_default") == "timesteps"
     assert preferred_calibration_domain("euler") == "timesteps"
 
 
@@ -115,29 +117,22 @@ def test_native_sigma_coordinate_grid_matches_vendor_stork_range() -> None:
     assert np.all(np.diff(sigma_grid) <= 0.0)
 
 
-def test_native_lambda_coordinate_grid_distinguishes_dpm_variants() -> None:
-    lu_scheduler = build_scheduler("dpm_solver_lu")
-    default_scheduler = build_scheduler("dpm_solver_default")
-    lu_lambda_grid = build_pndm_native_coordinate_grid(
-        lu_scheduler,
-        solver_name="dpm_solver_lu",
-        effective_nfe=15,
-        coordinate_domain="lambda",
-    )
-    default_lambda_grid = build_pndm_native_coordinate_grid(
-        default_scheduler,
-        solver_name="dpm_solver_default",
-        effective_nfe=15,
-        coordinate_domain="lambda",
-    )
-
-    assert len(lu_lambda_grid) == len(default_lambda_grid) == 16
-    assert np.isclose(float(lu_lambda_grid[0]), float(default_lambda_grid[0]))
-    assert np.isclose(float(lu_lambda_grid[-1]), float(default_lambda_grid[-1]))
-    assert not np.allclose(lu_lambda_grid[:-1], default_lambda_grid[:-1])
+def test_native_lambda_coordinate_grid_is_disabled() -> None:
+    scheduler = build_scheduler("dpm_solver_lu")
+    try:
+        build_pndm_native_coordinate_grid(
+            scheduler,
+            solver_name="dpm_solver_lu",
+            effective_nfe=15,
+            coordinate_domain="lambda",
+        )
+    except ValueError as error:
+        assert "Unsupported PNDM coordinate domain" in str(error)
+    else:
+        raise AssertionError("lambda-domain coordinate grids should be disabled.")
 
 
-def test_dpm_solver_custom_sigma_grid_is_injected_without_zero_tail() -> None:
+def test_dpm_solver_custom_sigma_grid_is_rejected() -> None:
     scheduler = build_scheduler("dpm_solver_lu")
     scheduler.set_timesteps(3, device=torch.device("cpu"))
     default_sigmas = scheduler.sigmas.detach().cpu().numpy().astype(np.float64)
@@ -149,18 +144,17 @@ def test_dpm_solver_custom_sigma_grid_is_injected_without_zero_tail() -> None:
         sigmas=custom_sigma_grid[:-1],
         sigma_grid=custom_sigma_grid,
     )
-    _configure_scheduler_timesteps(
-        scheduler,
-        num_inference_steps=3,
-        device=torch.device("cpu"),
-        schedule_bundle=bundle,
-    )
-
-    actual_sigmas = scheduler.sigmas.detach().cpu().numpy().astype(np.float64)
-    actual_timesteps = scheduler.timesteps.detach().cpu().numpy().astype(np.float64)
-    assert np.allclose(actual_sigmas, custom_sigma_grid, atol=1.0e-6)
-    assert np.all(np.diff(actual_timesteps) <= 0.0)
-    assert float(actual_sigmas[-1]) > 0.0
+    try:
+        _configure_scheduler_timesteps(
+            scheduler,
+            num_inference_steps=3,
+            device=torch.device("cpu"),
+            schedule_bundle=bundle,
+        )
+    except ValueError as error:
+        assert "DPMSolver" in str(error)
+    else:
+        raise AssertionError("DPMSolver custom sigma-grid injection should be disabled.")
 
 
 def test_heun_resolves_custom_sigma_grid_directly() -> None:
@@ -242,7 +236,7 @@ def test_legacy_dpm_solver_name_raises_migration_error() -> None:
         raise AssertionError("Legacy dpm_solver alias should require explicit migration.")
 
 
-def test_collect_shared_clock_velocity_norms_accepts_stork_pilot_sigma_domain() -> None:
+def test_collect_solver_refinement_stats_accepts_stork_sigma_domain() -> None:
     class DummyModel(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -254,11 +248,11 @@ def test_collect_shared_clock_velocity_norms_accepts_stork_pilot_sigma_domain() 
 
     model = DummyModel().to("cpu")
     scheduler = build_scheduler("stork4_2nd")
-    norms = collect_shared_clock_velocity_norms(
+    stats = collect_solver_refinement_stats(
         model=model,
         scheduler=scheduler,
         physical_grid=np.asarray([10.0, 5.0, 0.0], dtype=np.float64),
-        pilot_solver="stork4_2nd",
+        solver="stork4_2nd",
         image_size=4,
         batch_size=2,
         num_batches=1,
@@ -266,34 +260,8 @@ def test_collect_shared_clock_velocity_norms_accepts_stork_pilot_sigma_domain() 
         coordinate_domain="sigmas",
     )
 
-    assert norms.shape == (2, 3)
-    assert np.all(np.isfinite(norms))
-
-
-def test_collect_shared_clock_material_derivative_norms_accepts_stork_pilot_sigma_domain() -> None:
-    class DummyModel(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.in_channels = 1
-            self.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.float32))
-
-        def forward(self, x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-            return torch.zeros_like(x)
-
-    model = DummyModel().to("cpu")
-    scheduler = build_scheduler("stork4_2nd")
-    norms = collect_shared_clock_velocity_norms(
-        model=model,
-        scheduler=scheduler,
-        physical_grid=np.asarray([10.0, 5.0, 0.0], dtype=np.float64),
-        pilot_solver="stork4_2nd",
-        image_size=4,
-        batch_size=2,
-        num_batches=1,
-        seed=0,
-        coordinate_domain="sigmas",
-        quantity="material_derivative",
-    )
-
-    assert norms.shape == (2, 3)
-    assert np.all(np.isfinite(norms))
+    assert stats.full_step_error.shape == (2, 2)
+    assert stats.half_step_error.shape == (2, 2)
+    assert stats.effective_order.shape == (2, 2)
+    assert stats.defect_strength.shape == (2, 2)
+    assert np.all(np.isfinite(stats.defect_strength))

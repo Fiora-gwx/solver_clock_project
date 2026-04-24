@@ -14,19 +14,16 @@ model_assets:
 solvers:
   - euler
   - deis
-  - dpm_solver_lu
-  - dpm_solver_default
+  - heun2
   - stork4_1st
   - stork4_2nd
 schedules:
   - base
-  - LCS-1
-  - LCS-2
+  - SADB
 solver_schedules:
-  euler: [base, LCS-1, LCS-2]
-  deis: [base, LCS-1, LCS-2]
-  dpm_solver_lu: [base, LCS-1, LCS-2]
-  dpm_solver_default: [base]
-  stork4_1st: [base, LCS-1, LCS-2]
-  stork4_2nd: [base, LCS-1, LCS-2]
-eval_nfes: [6, 8, 10, 12, 16, 20, 24, 32]
+  euler: [base, SADB]
+  heun2: [base, SADB]
+  deis: [base]
+  stork4_1st: [base, SADB]
+  stork4_2nd: [base, SADB]
+eval_nfes: [5, 7, 9, 11, 15, 23, 31]
