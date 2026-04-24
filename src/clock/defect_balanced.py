@@ -10,7 +10,7 @@ from src.clock.profile import ClockProfile, build_clock_profile_from_alpha
 
 StepFn = Callable[[torch.Tensor, float, float], torch.Tensor]
 VelocityFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-DEFECT_BALANCED_CLOCK_VERSION = 1
+DEFECT_BALANCED_CLOCK_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -115,7 +115,7 @@ def estimate_refinement_order_and_defect(
     full_step_error: np.ndarray,
     half_step_error: np.ndarray,
     step_sizes: np.ndarray,
-    q_min: float = 0.25,
+    q_min: float = 1.05,
     q_max: float = 6.0,
     eps: float = 1.0e-12,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -132,13 +132,13 @@ def estimate_refinement_order_and_defect(
         raise ValueError("q_min and q_max must satisfy 0 < q_min <= q_max.")
 
     safe_eps = float(eps)
-    raw_order = np.log2((full + safe_eps) / (half + safe_eps))
-    effective_order = np.clip(raw_order, float(q_min), float(q_max))
+    refinement_order = np.log2((full + safe_eps) / (half + safe_eps))
+    local_order = np.clip(refinement_order + 1.0, float(q_min), float(q_max))
 
-    step_scale = np.power(np.maximum(np.abs(steps), safe_eps)[None, :], effective_order + 1.0)
-    refinement_factor = np.maximum(1.0 - np.power(2.0, -effective_order), safe_eps)
+    step_scale = np.power(np.maximum(np.abs(steps), safe_eps)[None, :], local_order)
+    refinement_factor = np.maximum(np.abs(1.0 - np.power(2.0, 1.0 - local_order)), safe_eps)
     defect = full / np.maximum(step_scale * refinement_factor, safe_eps)
-    return effective_order, np.maximum(defect, safe_eps)
+    return local_order, np.maximum(defect, safe_eps)
 
 
 def collect_step_refinement_stats(
@@ -147,7 +147,7 @@ def collect_step_refinement_stats(
     physical_grid: np.ndarray,
     step_fn: StepFn,
     observation_microbatch: int | None = None,
-    q_min: float = 0.25,
+    q_min: float = 1.05,
     q_max: float = 6.0,
     eps: float = 1.0e-12,
 ) -> StepRefinementStats:
@@ -179,7 +179,7 @@ def collect_step_refinement_stats(
         )
         full_errors.append(per_sample_l2_norm(full - half).cpu().numpy())
         half_errors.append(per_sample_l2_norm(half - quarter).cpu().numpy())
-        current = full.detach().clone()
+        current = quarter.detach().clone()
 
     full_error = np.stack(full_errors, axis=1)
     half_error = np.stack(half_errors, axis=1)
@@ -238,7 +238,9 @@ def build_defect_balanced_profile(
     smoothed_log_defect = smooth_profile(np.log(np.maximum(defect_profile, safe_eps)), smoothing_window)
     smoothed_order = smooth_profile(effective_order_profile, smoothing_window)
     smoothed_defect = np.exp(smoothed_log_defect)
-    interval_alpha = np.exp(smoothed_log_defect / np.maximum(smoothed_order + 1.0, safe_eps))
+    q_profile = np.maximum(smoothed_order, 1.0 + safe_eps)
+    q_minus_one = np.maximum(q_profile - 1.0, safe_eps)
+    interval_alpha = np.exp((np.log(q_minus_one) + smoothed_log_defect) / q_profile)
     node_alpha = _interval_profile_to_nodes(np.maximum(interval_alpha, safe_eps))
     profile = build_clock_profile_from_alpha(grid, node_alpha)
     return DefectBalancedProfileArtifacts(

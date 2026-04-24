@@ -19,13 +19,13 @@ def test_refinement_ratio_estimates_effective_order_and_defect() -> None:
         full_step_error=full_error,
         half_step_error=half_error,
         step_sizes=step_sizes,
-        q_min=0.25,
+        q_min=1.05,
         q_max=6.0,
         eps=1.0e-12,
     )
 
     expected_defect = full_error / (np.abs(step_sizes)[None, :] ** 3.0 * 0.75)
-    assert np.allclose(q_eff, 2.0)
+    assert np.allclose(q_eff, 3.0)
     assert np.allclose(defect, expected_defect)
 
 
@@ -41,7 +41,7 @@ def test_collect_step_refinement_stats_uses_solver_step_behavior() -> None:
         physical_grid=grid,
         step_fn=build_velocity_stepper(velocity_fn, "euler"),
         observation_microbatch=1,
-        q_min=0.25,
+        q_min=1.05,
         q_max=6.0,
         eps=1.0e-12,
     )
@@ -59,7 +59,7 @@ def test_defect_balanced_profile_is_normalized_and_monotone() -> None:
     stats = StepRefinementStats(
         full_step_error=np.ones((2, 4), dtype=np.float64),
         half_step_error=0.5 * np.ones((2, 4), dtype=np.float64),
-        effective_order=np.tile(np.linspace(1.0, 2.0, 4, dtype=np.float64), (2, 1)),
+        effective_order=np.tile(np.linspace(1.05, 2.0, 4, dtype=np.float64), (2, 1)),
         defect_strength=np.tile(np.linspace(4.0, 1.0, 4, dtype=np.float64), (2, 1)),
     )
 
@@ -72,3 +72,24 @@ def test_defect_balanced_profile_is_normalized_and_monotone() -> None:
     assert np.isclose(artifacts.profile.tau_profile[0], 0.0)
     assert np.isclose(artifacts.profile.tau_profile[-1], 1.0)
     assert np.all(np.diff(artifacts.profile.tau_profile) > 0.0)
+
+
+def test_defect_balanced_profile_uses_local_order_density_weight() -> None:
+    grid = np.asarray([1.0, 0.5, 0.0], dtype=np.float64)
+    stats = StepRefinementStats(
+        full_step_error=np.ones((1, 2), dtype=np.float64),
+        half_step_error=np.ones((1, 2), dtype=np.float64),
+        effective_order=np.asarray([[2.0, 3.0]], dtype=np.float64),
+        defect_strength=np.asarray([[4.0, 8.0]], dtype=np.float64),
+    )
+
+    artifacts = build_defect_balanced_profile(grid, stats, smoothing_window=1, eps=1.0e-12)
+
+    expected = np.asarray(
+        [
+            ((2.0 - 1.0) * 4.0) ** (1.0 / 2.0),
+            ((3.0 - 1.0) * 8.0) ** (1.0 / 3.0),
+        ],
+        dtype=np.float64,
+    )
+    assert np.allclose(artifacts.interval_alpha_profile, expected)

@@ -72,6 +72,45 @@ def test_noise_stork_set_timesteps_keeps_custom_sigmas_and_dt_list() -> None:
     )
 
 
+def test_noise_stork_set_timesteps_accepts_custom_sigmas_without_timesteps() -> None:
+    scheduler = build_scheduler("stork4_1st")
+    custom_sigmas = np.asarray([1.0, 0.9, 0.3, 0.1, 0.01], dtype=np.float64)
+    scheduler.set_timesteps(
+        num_inference_steps=len(custom_sigmas),
+        device=torch.device("cpu"),
+        sigmas=custom_sigmas.tolist(),
+    )
+
+    timesteps = scheduler.timesteps.detach().cpu().numpy()
+    assert np.allclose(scheduler.sigmas[:-1].detach().cpu().numpy(), custom_sigmas.astype(np.float32))
+    assert np.isclose(float(scheduler.sigmas[-1].item()), 0.0)
+    assert np.all(np.diff(timesteps) < 0.0)
+    assert np.allclose(
+        scheduler.dt_list.detach().cpu().numpy(),
+        (timesteps[:-1] - timesteps[1:]) / float(scheduler.config.num_train_timesteps),
+        atol=1.0e-6,
+    )
+
+
+def test_noise_stork_equivalent_custom_schedule_matches_default_state() -> None:
+    scheduler = build_scheduler("stork4_2nd")
+    scheduler.set_timesteps(num_inference_steps=5, device=torch.device("cpu"))
+    default_timesteps = scheduler.timesteps.detach().cpu().numpy()
+    default_sigmas = scheduler.sigmas[:-1].detach().cpu().numpy()
+    default_dt_list = scheduler.dt_list.detach().cpu().numpy()
+
+    scheduler.set_timesteps(
+        num_inference_steps=5,
+        device=torch.device("cpu"),
+        timesteps=default_timesteps.tolist(),
+        sigmas=default_sigmas.tolist(),
+    )
+
+    assert np.allclose(scheduler.timesteps.detach().cpu().numpy(), default_timesteps)
+    assert np.allclose(scheduler.sigmas[:-1].detach().cpu().numpy(), default_sigmas)
+    assert np.allclose(scheduler.dt_list.detach().cpu().numpy(), default_dt_list)
+
+
 def test_dpm_solver_variants_reject_custom_offline_schedules() -> None:
     for solver_name in ("dpm_solver_lu", "dpm_solver_default"):
         scheduler = build_scheduler(solver_name)

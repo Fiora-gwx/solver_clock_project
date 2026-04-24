@@ -9,7 +9,7 @@ clock:
   pilot_prompt_asset: diffusers_smoke_prompts
   smoothing_window: 3
   epsilon: 1.0e-12
-  q_min: 0.25
+  q_min: 1.05
   q_max: 6.0
   cache_path: outputs/cache/sadb_profiles
   target_nfes: [5, 7, 11, 15]

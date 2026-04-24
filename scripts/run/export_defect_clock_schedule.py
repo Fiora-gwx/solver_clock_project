@@ -91,7 +91,7 @@ def load_clock_settings(path: str) -> dict[str, Any]:
     if model_output_type not in {"epsilon", "v_prediction", "flow"}:
         raise ValueError("SADB expects clock.model_output_type to be one of: epsilon, v_prediction, flow.")
     clock["model_output_type"] = model_output_type
-    clock["q_min"] = float(clock.get("q_min", 0.25))
+    clock["q_min"] = float(clock.get("q_min", 1.05))
     clock["q_max"] = float(clock.get("q_max", 6.0))
     return clock
 

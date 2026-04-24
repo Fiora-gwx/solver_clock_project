@@ -1152,7 +1152,7 @@ def collect_solver_refinement_stats(
     model_output_type: str = "epsilon",
     sigma_floor: float = 1.0e-6,
     coordinate_domain: str = "timesteps",
-    q_min: float = 0.25,
+    q_min: float = 1.05,
     q_max: float = 6.0,
     eps: float = 1.0e-12,
 ) -> StepRefinementStats:
