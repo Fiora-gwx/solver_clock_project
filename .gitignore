@@ -26,6 +26,8 @@ env/
 # Large local assets and generated experiment outputs
 checkpoints/
 data/
+!third_party/STORK/external/Sana/diffusion/data/
+!third_party/STORK/external/Sana/diffusion/data/**
 outputs/
 temp/
 
