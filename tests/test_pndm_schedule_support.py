@@ -27,7 +27,14 @@ def test_noise_stork_accepts_custom_schedule_bundle() -> None:
     assert np.isclose(float(scheduler.sigmas[-1].item()), 0.0)
     assert np.allclose(
         scheduler.dt_list.detach().cpu().numpy(),
-        np.asarray([0.499, 0.49], dtype=np.float32),
+        np.asarray([0.499, 0.49, 0.01], dtype=np.float32),
+        atol=1.0e-6,
+    )
+    assert len(scheduler.dt_list) == scheduler.num_inference_steps
+    assert len(scheduler.sigmas) == scheduler.num_inference_steps + 1
+    assert np.isclose(
+        float(scheduler.dt_list.sum().item()),
+        float(scheduler.timesteps[0].item()) / float(scheduler.config.num_train_timesteps),
         atol=1.0e-6,
     )
 
@@ -48,7 +55,7 @@ def test_noise_stork_schedule_bundle_preserves_fractional_timesteps() -> None:
     assert np.allclose(scheduler.sigmas[:-1].detach().cpu().numpy(), sigmas.astype(np.float32))
     assert np.allclose(
         scheduler.dt_list.detach().cpu().numpy(),
-        np.asarray([0.4666666, 0.4566667], dtype=np.float32),
+        np.asarray([0.4666666, 0.4566667, 0.01], dtype=np.float32),
         atol=1.0e-6,
     )
 
@@ -67,7 +74,7 @@ def test_noise_stork_set_timesteps_keeps_custom_sigmas_and_dt_list() -> None:
     assert np.isclose(float(scheduler.sigmas[-1].item()), 0.0)
     assert np.allclose(
         scheduler.dt_list.detach().cpu().numpy(),
-        np.asarray([0.499, 0.49], dtype=np.float32),
+        np.asarray([0.499, 0.49, 0.01], dtype=np.float32),
         atol=1.0e-6,
     )
 
@@ -87,9 +94,30 @@ def test_noise_stork_set_timesteps_accepts_custom_sigmas_without_timesteps() -> 
     assert np.all(np.diff(timesteps) < 0.0)
     assert np.allclose(
         scheduler.dt_list.detach().cpu().numpy(),
-        (timesteps[:-1] - timesteps[1:]) / float(scheduler.config.num_train_timesteps),
+        np.concatenate([timesteps[:-1] - timesteps[1:], np.asarray([timesteps[-1]], dtype=np.float32)])
+        / float(scheduler.config.num_train_timesteps),
         atol=1.0e-6,
     )
+
+
+def test_noise_stork_dt_list_includes_terminal_interval() -> None:
+    scheduler = build_scheduler("stork4_1st")
+    scheduler.set_timesteps(
+        num_inference_steps=3,
+        device=torch.device("cpu"),
+        timesteps=[999.0, 500.0, 10.0],
+        sigmas=[4.0, 1.5, 0.1],
+    )
+
+    assert len(scheduler.timesteps) == 3
+    assert len(scheduler.sigmas) == 4
+    assert len(scheduler.dt_list) == 3
+    assert np.allclose(
+        scheduler.dt_list.detach().cpu().numpy(),
+        np.asarray([0.499, 0.49, 0.01], dtype=np.float32),
+        atol=1.0e-6,
+    )
+    assert np.isclose(float(scheduler._noise_dt_value(2)), 0.01, atol=1.0e-6)
 
 
 def test_noise_stork_equivalent_custom_schedule_matches_default_state() -> None:

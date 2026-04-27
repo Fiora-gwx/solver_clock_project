@@ -43,7 +43,6 @@ CONSTANTSFOLDER = f"{current_file.parent}/STORK_constants"
 
 
 
-
 class STORKScheduler(SchedulerMixin, ConfigMixin):
     """
     `STORKScheduler` uses modified stabilized Runge-Kutta method for the backward ODE in the diffusion or flow matching models.
@@ -218,18 +217,43 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
             raise ValueError("`mu` must be passed when `use_dynamic_shifting` is set to be `True`")
 
         if sigmas is not None and timesteps is not None:
-            if len(sigmas) != len(timesteps):
+            sigmas_has_extra_terminal = (
+                len(sigmas) == len(timesteps) + 1 and len(sigmas) > 0 and abs(float(sigmas[-1])) < 1e-12
+            )
+            if len(sigmas) != len(timesteps) and not sigmas_has_extra_terminal:
                 raise ValueError("`sigmas` and `timesteps` should have the same length")
 
+        sigma_count = None
+        if sigmas is not None:
+            sigma_count = len(sigmas) - 1 if timesteps is None and len(sigmas) > 0 and abs(float(sigmas[-1])) < 1e-12 else len(sigmas)
+
         if num_inference_steps is not None:
-            if (sigmas is not None and len(sigmas) != num_inference_steps) or (
+            sigmas_length_mismatch = (
+                sigma_count is not None
+                and sigma_count != num_inference_steps
+                and not (
+                    timesteps is None
+                    and sigmas is not None
+                    and len(sigmas) == num_inference_steps
+                    and len(sigmas) > 0
+                    and abs(float(sigmas[-1])) < 1e-12
+                )
+                and not (
+                    timesteps is not None
+                    and sigmas is not None
+                    and len(sigmas) == num_inference_steps + 1
+                    and len(sigmas) > 0
+                    and abs(float(sigmas[-1])) < 1e-12
+                )
+            )
+            if sigmas_length_mismatch or (
                 timesteps is not None and len(timesteps) != num_inference_steps
             ):
                 raise ValueError(
                     "`sigmas` and `timesteps` should have the same length as num_inference_steps, if `num_inference_steps` is provided"
                 )
         else:
-            num_inference_steps = len(sigmas) if sigmas is not None else len(timesteps)
+            num_inference_steps = sigma_count if sigmas is not None else len(timesteps)
 
         self.num_inference_steps = num_inference_steps
 
@@ -275,6 +299,8 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
                 sigma_array = self._noise_sigmas_from_timesteps(timestep_array)
             else:
                 sigma_array = np.asarray(sigmas, dtype=np.float32).reshape(-1)
+                if len(sigma_array) > 0 and abs(float(sigma_array[-1])) < 1e-12:
+                    sigma_array = sigma_array[:-1]
                 if sigma_array.ndim != 1 or len(sigma_array) == 0:
                     raise ValueError("Noise-based STORK custom sigmas must be a non-empty 1D array.")
                 if np.any(np.diff(sigma_array) >= 0):
@@ -294,17 +320,21 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
                 sigma_array = self._noise_sigmas_from_timesteps(timestep_array)
             else:
                 sigma_array = np.asarray(sigmas, dtype=np.float32).reshape(-1)
+                if (
+                    len(sigma_array) == len(timestep_array) + 1
+                    and len(sigma_array) > 0
+                    and abs(float(sigma_array[-1])) < 1e-12
+                ):
+                    sigma_array = sigma_array[:-1]
                 if len(sigma_array) != len(timestep_array):
                     raise ValueError("Noise-based STORK custom sigmas must have the same length as timesteps.")
                 if np.any(np.diff(sigma_array) >= 0):
                     raise ValueError("Noise-based STORK custom sigmas must be strictly descending.")
 
-        if len(normalized_timesteps) > 1:
-            dt_list = normalized_timesteps[:-1] - normalized_timesteps[1:]
-            self.dt = float(dt_list[0])
-        else:
-            dt_list = np.zeros((0,), dtype=np.float32)
-            self.dt = float(normalized_timesteps[0])
+        terminal_normalized_timestep = np.asarray([0.0], dtype=np.float32)
+        normalized_grid = np.concatenate([normalized_timesteps.astype(np.float32), terminal_normalized_timestep])
+        dt_list = normalized_grid[:-1] - normalized_grid[1:]
+        self.dt = float(dt_list[0]) if len(dt_list) > 0 else 0.0
 
         self.dt_list = torch.from_numpy(dt_list.astype(np.float32)).to(self.dtype)
         self._timesteps = timestep_array

@@ -17,7 +17,8 @@ solvers:
   - stork4_1st
 schedules:
   - SADB
+  - base
 solver_schedules:
-  euler: [SADB]
-  stork4_1st: [SADB]
+  euler: [base, SADB]
+  stork4_1st: [base, SADB]
 eval_nfes: [5, 7, 11, 15]
