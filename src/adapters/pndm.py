@@ -534,6 +534,17 @@ def _schedule_bundle_kwargs(
     raise ValueError(f"No compatible schedule field found. Scheduler supports: {supported_str}")
 
 
+def _apply_stork_runtime_options(scheduler, schedule_bundle: ScheduleBundle | None) -> None:
+    if schedule_bundle is None or not isinstance(scheduler, STORKScheduler):
+        return
+    meta = schedule_bundle.meta or {}
+    scheduler.adaptive_s = bool(meta.get("adaptive_s_enabled", meta.get("adaptive_s", False)))
+    if "adaptive_s_max" in meta:
+        scheduler.adaptive_s_max = int(meta["adaptive_s_max"])
+    if "adaptive_s_reference" in meta:
+        scheduler.adaptive_s_reference = str(meta["adaptive_s_reference"])
+
+
 def _configure_scheduler_timesteps(
     scheduler,
     *,
@@ -550,6 +561,8 @@ def _configure_scheduler_timesteps(
             "Custom offline schedules for DPMSolver are disabled. "
             "The deleted lambda-domain calibration path was not compatible with the clock construction."
         )
+
+    _apply_stork_runtime_options(scheduler, schedule_bundle)
 
     if _scheduler_uses_manual_sigma_state(scheduler):
         sigma_grid = None if schedule_bundle.sigma_grid is None else np.asarray(schedule_bundle.sigma_grid, dtype=np.float64)

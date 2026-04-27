@@ -88,6 +88,12 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
             The order of the Taylor expansion derivative to use for the sub-step velocity approximation. Only supports 1, 2 or 3.
         s (`int`, defaults to 50):
             The number of sub-steps to use in the STORK.
+        adaptive_s (`bool`, defaults to `False`):
+            Whether to increase the ROCK4 degree locally when a non-uniform noise schedule uses larger-than-base steps.
+        adaptive_s_max (`int`, defaults to 100):
+            Maximum requested ROCK4 degree when `adaptive_s` is enabled.
+        adaptive_s_reference (`str`, defaults to `"base_dt"`):
+            Reference step-size policy for adaptive `s`. Currently only `"base_dt"` is supported.
         precision (`str`, defaults to "float32"):
             The precision to use for the scheduler; supports "float32", "bfloat16", or "float16".
     """
@@ -120,6 +126,9 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
         use_karras_sigmas: Optional[bool] = False,
         use_exponential_sigmas: Optional[bool] = False,
         use_beta_sigmas: Optional[bool] = False,
+        adaptive_s: bool = False,
+        adaptive_s_max: int = 100,
+        adaptive_s_reference: str = "base_dt",
     ):
         
         super().__init__()
@@ -156,6 +165,15 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
         self.velocity_predictions = []
         self.noise_predictions = []
         self.s = s
+        self.adaptive_s = bool(adaptive_s)
+        self.adaptive_s_max = int(adaptive_s_max)
+        self.adaptive_s_reference = str(adaptive_s_reference)
+        self.base_dt = None
+        self.adaptive_s_requested_per_step = []
+        self.adaptive_s_used_per_step = []
+        self.adaptive_s_requested_max = int(s)
+        self.adaptive_s_used_max = int(s)
+        self._rock4_constants_cache = None
         self.derivative_order = derivative_order
 
         self.solver_order = solver_order
@@ -337,6 +355,21 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
         self.dt = float(dt_list[0]) if len(dt_list) > 0 else 0.0
 
         self.dt_list = torch.from_numpy(dt_list.astype(np.float32)).to(self.dtype)
+        self.base_dt = 1.0 / max(int(self.num_inference_steps), 1)
+        self.dt_max = float(self.dt_list.max().item()) if len(self.dt_list) > 0 else 0.0
+        self.dt_min = float(self.dt_list.min().item()) if len(self.dt_list) > 0 else 0.0
+        if len(self.dt_list) > 1:
+            ratios = (self.dt_list[1:] / torch.clamp(self.dt_list[:-1], min=1.0e-12)).abs()
+            self.dt_ratio_max = float(ratios.max().item())
+            self.dt_ratio_min = float(ratios.min().item())
+        else:
+            self.dt_ratio_max = 1.0
+            self.dt_ratio_min = 1.0
+        if len(self.dt_list) > 0:
+            uniform_dt = float(timestep_array[0]) / total_steps / float(len(self.dt_list))
+            self.dt_over_uniform = float(self.dt_max / max(uniform_dt, 1.0e-12))
+        else:
+            self.dt_over_uniform = 0.0
         self._timesteps = timestep_array
         self.timesteps = torch.from_numpy(timestep_array.copy()).to(dtype=self.dtype, device=device)
         self.sigmas = torch.from_numpy(
@@ -349,6 +382,10 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
 
         self.noise_predictions = []
         self.velocity_predictions = []
+        self.adaptive_s_requested_per_step = []
+        self.adaptive_s_used_per_step = []
+        self.adaptive_s_requested_max = int(self.s)
+        self.adaptive_s_used_max = int(self.s)
 
 
     def _noise_sigmas_from_timesteps(self, timesteps: np.ndarray) -> np.ndarray:
@@ -377,6 +414,28 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
                 return float(self.dt_list[0].item())
             return float(self.dt_list[min(index - 1, len(self.dt_list) - 1)].item())
         return float(self.dt_list[min(index, len(self.dt_list) - 1)].item())
+
+
+    def _local_stork_s(self, step_index: int) -> int:
+        base_s = int(self.s)
+        if not getattr(self, "adaptive_s", False):
+            return base_s
+        if str(getattr(self, "adaptive_s_reference", "base_dt")) != "base_dt":
+            raise ValueError("STORK adaptive_s currently only supports adaptive_s_reference='base_dt'.")
+        if not hasattr(self, "dt_list") or len(self.dt_list) == 0:
+            return base_s
+        local_dt = float(self.dt_list[min(step_index, len(self.dt_list) - 1)].item())
+        reference_dt = float(getattr(self, "base_dt", None) or (1.0 / max(int(self.num_inference_steps), 1)))
+        ratio = max(local_dt / max(reference_dt, 1.0e-12), 1.0)
+        requested_s = math.ceil(base_s * math.sqrt(ratio))
+        return min(max(requested_s, base_s), int(getattr(self, "adaptive_s_max", requested_s)))
+
+
+    def _record_adaptive_stork_s(self, requested_s: int, used_s: int) -> None:
+        self.adaptive_s_requested_per_step.append(int(requested_s))
+        self.adaptive_s_used_per_step.append(int(used_s))
+        self.adaptive_s_requested_max = max(int(getattr(self, "adaptive_s_requested_max", self.s)), int(requested_s))
+        self.adaptive_s_used_max = max(int(getattr(self, "adaptive_s_used_max", self.s)), int(used_s))
 
 
     def set_timesteps_flow_matching(self,
@@ -1046,7 +1105,9 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
         # Coefficients of ROCK4
         ms, fpa, fpb, fpbe, recf = self.coeff_rock4()
         # Choose the degree that's in the precomputed table
-        mdeg, mp = self.mdegr(self.s, ms)
+        requested_s = self._local_stork_s(self._step_index)
+        mdeg, mp = self.mdegr(requested_s, ms)
+        self._record_adaptive_stork_s(requested_s, int(mdeg))
         mz = int(mp[0])
         mr = int(mp[1])
 
@@ -1384,7 +1445,9 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
                 # Initial 2-step Adams-Bashforth update
                 drift_previous = self.initial_drift
 
-                img_next = sample - 1.5 * dt * drift_initial + 0.5 * dt * drift_previous
+                s = torch.as_tensor(self._noise_dt_value(self._step_index), device=sample.device, dtype=model_output.dtype)
+                r = torch.as_tensor(self._noise_dt_value(self._step_index, previous=True), device=sample.device, dtype=model_output.dtype)
+                img_next = sample - (s + s * s / (2 * r)) * drift_initial + (s * s / (2 * r)) * drift_previous
 
                 self.noise_predictions.append(noise_initial)
                 self._step_index += 1
@@ -1394,12 +1457,31 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
                 return SchedulerOutput(prev_sample=img_next)
             else:
                 # STORK4 update
-                h = torch.as_tensor(self._noise_dt_value(self._step_index, previous=True), device=sample.device, dtype=model_output.dtype)
+                h1 = torch.as_tensor(
+                    self._noise_dt_value(self._step_index, previous=True),
+                    device=sample.device,
+                    dtype=model_output.dtype,
+                )
+                h2 = torch.as_tensor(
+                    self._noise_dt_value(self._step_index - 1, previous=True),
+                    device=sample.device,
+                    dtype=model_output.dtype,
+                )
 
-                # The first derivative is calculated using the three point approximation, 
-                # and the second derivative is calculated using the standardtwo point approximation.
-                noise_derivative = (-self.noise_predictions[-2] + 4 * self.noise_predictions[-1] - 3 * noise_initial) / (2 * h)
-                noise_second_derivative = (self.noise_predictions[-2] - 2 * self.noise_predictions[-1] + noise_initial) / h**2
+                noise_derivative = (
+                    -noise_initial * (2 * h1 + h2) / (h1 * (h1 + h2))
+                    + self.noise_predictions[-1] * (h1 + h2) / (h1 * h2)
+                    - self.noise_predictions[-2] * h1 / (h2 * (h1 + h2))
+                )
+                noise_second_derivative = (
+                    2
+                    / (h1 * h2 * (h1 + h2))
+                    * (
+                        self.noise_predictions[-2] * h1
+                        - self.noise_predictions[-1] * (h1 + h2)
+                        + noise_initial * h2
+                    )
+                )
                 noise_third_derivative = None
 
                 self.noise_predictions.append(noise_initial)
@@ -1443,7 +1525,9 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
         # Coefficients of ROCK4
         ms, fpa, fpb, fpbe, recf = self.coeff_rock4()
         # Choose the degree that's in the precomputed table
-        mdeg, mp = self.mdegr(self.s, ms)
+        requested_s = self._local_stork_s(self._step_index)
+        mdeg, mp = self.mdegr(requested_s, ms)
+        self._record_adaptive_stork_s(requested_s, int(mdeg))
         mz = int(mp[0])
         mr = int(mp[1])
 
@@ -1741,6 +1825,9 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
             fpa, fpb, fpbe, recf (`torch.FloatTensor`):
                 The parameters for the finishing procedure.
         '''
+        if self._rock4_constants_cache is not None:
+            return self._rock4_constants_cache
+
         # Degrees
         data = loadmat(f'{CONSTANTSFOLDER}/ms.mat')
         ms = data['ms'][0]
@@ -1759,7 +1846,8 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
         data = loadmat(f'{CONSTANTSFOLDER}/recf.mat')
         recf = data['recf'][0]
 
-        return ms, fpa, fpb, fpbe, recf
+        self._rock4_constants_cache = (ms, fpa, fpb, fpbe, recf)
+        return self._rock4_constants_cache
 
 
 
@@ -1782,15 +1870,18 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
                 mp[1] (`int`): The pointer which gives the corresponding position of a_1 in the data recf for the selected degree.
         '''           
         mp = torch.zeros(2)
-        mp[1] = 1
-        mdeg = mdeg1
+        requested = int(mdeg1)
+        recf_offset = 0
+        mdeg = int(ms[-1])
+        mp[0] = len(ms) - 1
+        mp[1] = recf_offset
         for i in range(len(ms)):
-            if (ms[i]/mdeg) >= 1:
-                mdeg = ms[i]
+            degree = int(ms[i])
+            if degree >= requested or i == len(ms) - 1:
+                mdeg = degree
                 mp[0] = i
-                mp[1] = mp[1] - 1
+                mp[1] = recf_offset
                 break
-            else:   
-                mp[1] = mp[1] + ms[i] * 2 - 1
+            recf_offset += degree * 2 - 1
 
         return mdeg, mp

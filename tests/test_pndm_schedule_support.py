@@ -13,6 +13,23 @@ from src.adapters.pndm import (
 from src.utils.schedule_bundle import ScheduleBundle
 
 
+def _run_scheduler_states(model: torch.nn.Module, scheduler, initial_sample: torch.Tensor) -> list[torch.Tensor]:
+    states = [initial_sample.detach().clone()]
+    sample = initial_sample.detach().clone()
+    for timestep in scheduler.timesteps:
+        model_timestep = timestep
+        if not isinstance(model_timestep, torch.Tensor):
+            model_timestep = torch.tensor([model_timestep], device=sample.device)
+        if model_timestep.ndim == 0:
+            model_timestep = model_timestep[None]
+        if model_timestep.numel() == 1:
+            model_timestep = model_timestep.expand(sample.shape[0])
+        model_output = model(sample, model_timestep)
+        sample = scheduler.step(model_output, timestep, sample).prev_sample
+        states.append(sample.detach().clone())
+    return states
+
+
 def test_noise_stork_accepts_custom_schedule_bundle() -> None:
     scheduler = build_scheduler("stork4_1st")
     bundle = ScheduleBundle(timesteps=np.asarray([999.0, 500.0, 10.0], dtype=np.float64))
@@ -37,6 +54,30 @@ def test_noise_stork_accepts_custom_schedule_bundle() -> None:
         float(scheduler.timesteps[0].item()) / float(scheduler.config.num_train_timesteps),
         atol=1.0e-6,
     )
+
+
+def test_noise_stork_schedule_bundle_enables_adaptive_s() -> None:
+    scheduler = build_scheduler("stork4_1st")
+    bundle = ScheduleBundle(
+        timesteps=np.asarray([900.0, 100.0, 10.0], dtype=np.float64),
+        meta={
+            "adaptive_s_enabled": True,
+            "adaptive_s_max": 100,
+            "adaptive_s_reference": "base_dt",
+        },
+    )
+    _configure_scheduler_timesteps(
+        scheduler,
+        num_inference_steps=3,
+        device=torch.device("cpu"),
+        schedule_bundle=bundle,
+    )
+
+    assert scheduler.adaptive_s is True
+    assert scheduler.base_dt == 1.0 / 3.0
+    requested = [scheduler._local_stork_s(index) for index in range(len(scheduler.dt_list))]
+    assert requested[0] > scheduler.s
+    assert requested[1:] == [scheduler.s, scheduler.s]
 
 
 def test_noise_stork_schedule_bundle_preserves_fractional_timesteps() -> None:
@@ -137,6 +178,46 @@ def test_noise_stork_equivalent_custom_schedule_matches_default_state() -> None:
     assert np.allclose(scheduler.timesteps.detach().cpu().numpy(), default_timesteps)
     assert np.allclose(scheduler.sigmas[:-1].detach().cpu().numpy(), default_sigmas)
     assert np.allclose(scheduler.dt_list.detach().cpu().numpy(), default_dt_list)
+
+
+def test_noise_stork_base_equivalent_bundle_matches_default_trajectory() -> None:
+    class TimestepModel(torch.nn.Module):
+        def forward(self, x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+            values = torch.sin(timestep.float() / 1000.0).reshape(-1, 1, 1, 1)
+            return torch.ones_like(x) * values
+
+    default_scheduler = build_scheduler("stork4_1st")
+    default_scheduler.set_timesteps(num_inference_steps=5, device=torch.device("cpu"))
+    base_timesteps = default_scheduler.timesteps.detach().cpu().numpy()
+    base_sigmas = default_scheduler.sigmas[:-1].detach().cpu().numpy()
+    base_bundle = ScheduleBundle(timesteps=base_timesteps, sigmas=base_sigmas)
+
+    bundled_scheduler = build_scheduler("stork4_1st")
+    _configure_scheduler_timesteps(
+        bundled_scheduler,
+        num_inference_steps=5,
+        device=torch.device("cpu"),
+        schedule_bundle=base_bundle,
+    )
+
+    initial = torch.randn((2, 3, 4, 4), generator=torch.Generator().manual_seed(0))
+    default_states = _run_scheduler_states(TimestepModel(), default_scheduler, initial)
+    bundled_states = _run_scheduler_states(TimestepModel(), bundled_scheduler, initial)
+
+    assert len(default_states) == len(bundled_states)
+    for default_state, bundled_state in zip(default_states, bundled_states):
+        assert torch.allclose(default_state, bundled_state, atol=1.0e-6, rtol=1.0e-6)
+
+
+def test_noise_stork_default_sigma_timestep_grid_is_consistent() -> None:
+    scheduler = build_scheduler("stork4_1st")
+    scheduler.set_timesteps(num_inference_steps=7, device=torch.device("cpu"))
+
+    timesteps = scheduler.timesteps.detach().cpu().numpy()
+    sigmas = scheduler.sigmas[:-1].detach().cpu().numpy()
+    sigma_from_t = scheduler._noise_sigmas_from_timesteps(timesteps)
+
+    assert np.max(np.abs(sigmas - sigma_from_t)) < 1.0e-6
 
 
 def test_dpm_solver_variants_reject_custom_offline_schedules() -> None:

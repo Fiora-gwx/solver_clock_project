@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -144,6 +145,144 @@ def build_pndm_export_transforms(
             lambda values: _interp_timesteps_for_sigmas(scheduler, values),
         )
     raise ValueError(f"Unsupported PNDM coordinate domain: {coordinate_domain}")
+
+
+def _step_size_stats(nodes: np.ndarray, reference_nodes: np.ndarray | None = None) -> dict[str, float]:
+    values = np.asarray(nodes, dtype=np.float64)
+    intervals = np.abs(np.diff(values))
+    if intervals.size == 0:
+        return {
+            "max_dt": 0.0,
+            "min_dt": 0.0,
+            "max_neighbor_dt_ratio": 1.0,
+            "max_dt_over_base_dt": 1.0,
+        }
+    if intervals.size > 1:
+        neighbor = intervals[1:] / np.maximum(intervals[:-1], 1.0e-12)
+        max_neighbor = float(np.max(neighbor))
+    else:
+        max_neighbor = 1.0
+    if reference_nodes is not None:
+        reference_intervals = np.abs(np.diff(np.asarray(reference_nodes, dtype=np.float64)))
+        if reference_intervals.shape == intervals.shape:
+            max_over_base = float(np.max(intervals / np.maximum(reference_intervals, 1.0e-12)))
+        else:
+            max_over_base = 1.0
+    else:
+        max_over_base = 1.0
+    return {
+        "max_dt": float(np.max(intervals)),
+        "min_dt": float(np.min(intervals)),
+        "max_neighbor_dt_ratio": max_neighbor,
+        "max_dt_over_base_dt": max_over_base,
+    }
+
+
+def limit_schedule_step_sizes(
+    nodes: np.ndarray,
+    reference_nodes: np.ndarray,
+    *,
+    max_dt_factor: float | None,
+    max_neighbor_ratio: float | None,
+) -> tuple[np.ndarray, dict[str, float | bool]]:
+    values = np.asarray(nodes, dtype=np.float64)
+    reference = np.asarray(reference_nodes, dtype=np.float64)
+    if values.shape != reference.shape:
+        raise ValueError("nodes and reference_nodes must have matching shapes for step-size limiting.")
+    if values.ndim != 1 or len(values) < 2:
+        return values.copy(), {"step_limiter_enabled": False}
+
+    pre_stats = _step_size_stats(values, reference)
+    if max_dt_factor is None and max_neighbor_ratio is None:
+        return values.copy(), {
+            "step_limiter_enabled": False,
+            "pre_limit_max_dt": pre_stats["max_dt"],
+            "pre_limit_min_dt": pre_stats["min_dt"],
+            "pre_limit_max_neighbor_dt_ratio": pre_stats["max_neighbor_dt_ratio"],
+            "pre_limit_max_dt_over_base_dt": pre_stats["max_dt_over_base_dt"],
+            **pre_stats,
+        }
+
+    max_dt_factor = float(max_dt_factor) if max_dt_factor is not None else float("inf")
+    max_neighbor_ratio = float(max_neighbor_ratio) if max_neighbor_ratio is not None else float("inf")
+    if max_dt_factor <= 0.0:
+        raise ValueError("max_dt_factor must be positive.")
+    if max_neighbor_ratio <= 0.0:
+        raise ValueError("max_neighbor_dt_ratio must be positive.")
+
+    def satisfies(candidate: np.ndarray) -> bool:
+        stats = _step_size_stats(candidate, reference)
+        return (
+            stats["max_dt_over_base_dt"] <= max_dt_factor + 1.0e-12
+            and stats["max_neighbor_dt_ratio"] <= max_neighbor_ratio + 1.0e-12
+        )
+
+    if satisfies(values):
+        limited = values.copy()
+    else:
+        lo, hi = 0.0, 1.0
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            candidate = (1.0 - mid) * values + mid * reference
+            if satisfies(candidate):
+                hi = mid
+            else:
+                lo = mid
+        limited = (1.0 - hi) * values + hi * reference
+
+    post_stats = _step_size_stats(limited, reference)
+    return limited, {
+        "step_limiter_enabled": True,
+        "max_dt_factor": max_dt_factor,
+        "max_neighbor_dt_ratio": max_neighbor_ratio,
+        "pre_limit_max_dt": pre_stats["max_dt"],
+        "pre_limit_min_dt": pre_stats["min_dt"],
+        "pre_limit_max_neighbor_dt_ratio": pre_stats["max_neighbor_dt_ratio"],
+        "pre_limit_max_dt_over_base_dt": pre_stats["max_dt_over_base_dt"],
+        **post_stats,
+    }
+
+
+def _adaptive_s_schedule_meta(
+    scheduler,
+    time_grid: np.ndarray,
+    *,
+    enabled: bool,
+    adaptive_s_max: int,
+    adaptive_s_reference: str,
+) -> dict[str, Any]:
+    base_s = int(getattr(scheduler, "s", 50))
+    values = np.asarray(time_grid, dtype=np.float64)
+    intervals = np.abs(np.diff(values)) / float(scheduler.config.num_train_timesteps)
+    base_dt = 1.0 / max(int(intervals.size), 1)
+    requested_per_step: list[int] = []
+    used_per_step: list[int] = []
+    ms = None
+    if hasattr(scheduler, "coeff_rock4") and hasattr(scheduler, "mdegr"):
+        ms = scheduler.coeff_rock4()[0]
+    for local_dt in intervals:
+        if enabled:
+            ratio = max(float(local_dt) / max(base_dt, 1.0e-12), 1.0)
+            requested = min(max(math.ceil(base_s * math.sqrt(ratio)), base_s), int(adaptive_s_max))
+        else:
+            requested = base_s
+        if ms is not None:
+            used = int(scheduler.mdegr(requested, ms)[0])
+        else:
+            used = requested
+        requested_per_step.append(int(requested))
+        used_per_step.append(int(used))
+    return {
+        "adaptive_s_enabled": bool(enabled),
+        "adaptive_s_base": base_s,
+        "adaptive_s_max": int(adaptive_s_max),
+        "adaptive_s_reference": str(adaptive_s_reference),
+        "adaptive_s_base_dt": float(base_dt),
+        "adaptive_s_requested_max": int(max(requested_per_step, default=base_s)),
+        "adaptive_s_used_max": int(max(used_per_step, default=base_s)),
+        "adaptive_s_requested_per_step": requested_per_step,
+        "adaptive_s_used_per_step": used_per_step,
+    }
 
 
 def resolve_calibration_solver(clock_config: dict[str, Any], target_solver: str) -> str:
@@ -609,6 +748,52 @@ def export_pndm(args: argparse.Namespace) -> None:
                 },
                 representation_transform=representation_transform,
                 time_transform=time_transform,
+            )
+            max_dt_factor = clock_config.get("max_dt_factor")
+            max_neighbor_ratio = clock_config.get("max_neighbor_dt_ratio")
+            if max_dt_factor is not None or max_neighbor_ratio is not None:
+                reference_time_grid = build_pndm_native_coordinate_grid(
+                    target_scheduler,
+                    solver_name=target_solver,
+                    effective_nfe=int(effective_nfe),
+                    coordinate_domain="timesteps",
+                )
+                limited_time_grid, limiter_meta = limit_schedule_step_sizes(
+                    np.asarray(bundle.time_grid, dtype=np.float64),
+                    reference_time_grid,
+                    max_dt_factor=None if max_dt_factor is None else float(max_dt_factor),
+                    max_neighbor_ratio=None if max_neighbor_ratio is None else float(max_neighbor_ratio),
+                )
+                limited_sigma_grid = _interp_sigmas_for_timesteps(target_scheduler, limited_time_grid)
+                limited_sigma_grid[-1] = 0.0
+                bundle = type(bundle)(
+                    timesteps=limited_time_grid[:-1].copy(),
+                    time_grid=limited_time_grid,
+                    sigmas=limited_sigma_grid[:-1].copy(),
+                    sigma_grid=limited_sigma_grid,
+                    tau_grid=bundle.tau_grid,
+                    g_grid=bundle.g_grid,
+                    meta={**bundle.meta, **limiter_meta},
+                )
+            else:
+                schedule_stats = _step_size_stats(np.asarray(bundle.time_grid, dtype=np.float64))
+                bundle.meta.update(
+                    {
+                        "step_limiter_enabled": False,
+                        "max_dt": schedule_stats["max_dt"],
+                        "min_dt": schedule_stats["min_dt"],
+                        "max_neighbor_dt_ratio": schedule_stats["max_neighbor_dt_ratio"],
+                        "max_dt_over_base_dt": schedule_stats["max_dt_over_base_dt"],
+                    }
+                )
+            bundle.meta.update(
+                _adaptive_s_schedule_meta(
+                    target_scheduler,
+                    np.asarray(bundle.time_grid, dtype=np.float64),
+                    enabled=bool(clock_config.get("adaptive_s", False)),
+                    adaptive_s_max=int(clock_config.get("adaptive_s_max", 100)),
+                    adaptive_s_reference=str(clock_config.get("adaptive_s_reference", "base_dt")),
+                )
             )
             bundle.save(output_root / f"nfe_{int(effective_nfe):03d}")
         return
