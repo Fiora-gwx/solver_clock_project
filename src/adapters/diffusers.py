@@ -486,6 +486,24 @@ def replace_scheduler(pipeline, solver_name: str):
     return pipeline
 
 
+def _stork_uses_flow_prediction(scheduler) -> bool:
+    return isinstance(scheduler, STORKScheduler) and getattr(scheduler, "prediction_type", None) == "flow_prediction"
+
+
+def _stork_flow_anchor_sigmas(schedule_bundle: ScheduleBundle) -> list[float] | None:
+    sigmas = None
+    if schedule_bundle.sigma_grid is not None:
+        sigmas = schedule_bundle.sigma_grid
+    elif schedule_bundle.sigmas is not None:
+        sigmas = schedule_bundle.sigmas
+    if sigmas is None:
+        return None
+    values = torch.as_tensor(sigmas, dtype=torch.float32).detach().cpu().numpy()
+    if len(values) > 0 and abs(float(values[-1])) < 1.0e-12:
+        values = values[:-1]
+    return values.tolist()
+
+
 def build_pipeline_kwargs(
     pipeline,
     *,
@@ -523,7 +541,12 @@ def build_pipeline_kwargs(
     if "mu" in parameters and getattr(pipeline.scheduler.config, "use_dynamic_shifting", False):
         kwargs["mu"] = compute_dynamic_mu(pipeline, height=height, width=width)
     if schedule_bundle is not None:
-        if "sigmas" in parameters and schedule_bundle.sigmas is not None:
+        if _stork_uses_flow_prediction(pipeline.scheduler) and "sigmas" in parameters:
+            sigmas = _stork_flow_anchor_sigmas(schedule_bundle)
+            if sigmas is not None:
+                kwargs["sigmas"] = sigmas
+                kwargs["num_inference_steps"] = len(sigmas)
+        elif "sigmas" in parameters and schedule_bundle.sigmas is not None:
             kwargs["sigmas"] = schedule_bundle.sigmas.tolist()
         elif "timesteps" in parameters and schedule_bundle.timesteps is not None:
             kwargs["timesteps"] = schedule_bundle.timesteps.tolist()

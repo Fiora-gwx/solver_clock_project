@@ -427,7 +427,7 @@ def _set_scheduler_state_from_sigmas(
 
 
 def _scheduler_prefers_sigma_schedule(scheduler) -> bool:
-    return isinstance(scheduler, (HeunDiscreteScheduler, STORKScheduler))
+    return isinstance(scheduler, HeunDiscreteScheduler) or _stork_uses_flow_prediction(scheduler)
 
 
 def _scheduler_uses_manual_sigma_state(scheduler) -> bool:
@@ -458,6 +458,23 @@ def _bundle_anchor_sigmas(schedule_bundle: ScheduleBundle) -> np.ndarray | None:
     return None
 
 
+def _stork_uses_flow_prediction(scheduler) -> bool:
+    return isinstance(scheduler, STORKScheduler) and getattr(scheduler, "prediction_type", None) == "flow_prediction"
+
+
+def _stork_flow_anchor_sigmas(schedule_bundle: ScheduleBundle) -> np.ndarray | None:
+    sigmas = None
+    if schedule_bundle.sigma_grid is not None:
+        sigmas = np.asarray(schedule_bundle.sigma_grid, dtype=np.float64)
+    elif schedule_bundle.sigmas is not None:
+        sigmas = np.asarray(schedule_bundle.sigmas, dtype=np.float64)
+    if sigmas is None:
+        return None
+    if len(sigmas) > 0 and abs(float(sigmas[-1])) < 1.0e-12:
+        sigmas = sigmas[:-1]
+    return sigmas.astype(np.float32)
+
+
 def _schedule_timesteps_arg(scheduler, timesteps: np.ndarray) -> list[float] | list[int]:
     values = np.asarray(timesteps, dtype=np.float64)
     if isinstance(scheduler, STORKScheduler):
@@ -475,6 +492,13 @@ def _schedule_bundle_kwargs(
         raise ValueError(f"Unsupported schedule preference: {prefer}")
 
     kwargs: dict[str, list[float] | list[int]] = {}
+    if _stork_uses_flow_prediction(scheduler):
+        sigmas = _stork_flow_anchor_sigmas(schedule_bundle)
+        if sigmas is None:
+            raise ValueError("STORK flow schedules require full schedule sigmas or sigma_grid.")
+        kwargs["sigmas"] = sigmas.tolist()
+        return kwargs
+
     if prefer == "sigmas":
         sigmas = _bundle_anchor_sigmas(schedule_bundle)
         if sigmas is not None and scheduler_accepts(scheduler, "sigmas"):
@@ -1110,8 +1134,7 @@ def _build_native_scheduler_stepper(
         sigma_end = float(sigma_from_coordinate(float(coordinate_end)))
 
         kwargs: dict[str, object] = {"num_inference_steps": 2, "device": device}
-        if isinstance(scheduler, STORKScheduler):
-            kwargs["timesteps"] = [timestep_start, timestep_end]
+        if _stork_uses_flow_prediction(scheduler):
             kwargs["sigmas"] = [sigma_start, sigma_end]
         elif coordinate_domain == "sigmas" and scheduler_accepts(scheduler, "sigmas"):
             kwargs["sigmas"] = [sigma_start, sigma_end]

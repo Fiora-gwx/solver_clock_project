@@ -214,7 +214,7 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
                 automatically.
         """
         
-        if self.config.use_dynamic_shifting and mu is None:
+        if self.config.use_dynamic_shifting and mu is None and sigmas is None:
             raise ValueError("`mu` must be passed when `use_dynamic_shifting` is set to be `True`")
 
         if sigmas is not None and timesteps is not None:
@@ -382,6 +382,8 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
         if is_timesteps_provided:
             timesteps = np.array(timesteps).astype(np.float32)
 
+        is_sigmas_provided = sigmas is not None
+
         if sigmas is None:
             if timesteps is None:
                 timesteps = np.linspace(
@@ -390,26 +392,31 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
             sigmas = timesteps / self.config.num_train_timesteps
         else:
             sigmas = np.array(sigmas).astype(np.float32)
+            if len(sigmas) > 0 and abs(float(sigmas[-1])) < 1e-12:
+                sigmas = sigmas[:-1]
             num_inference_steps = len(sigmas)
+            self.num_inference_steps = num_inference_steps
 
         # 2. Perform timestep shifting. Either no shifting is applied, or resolution-dependent shifting of
         #    "exponential" or "linear" type is applied
-        if self.config.use_dynamic_shifting:
-            sigmas = self.time_shift(mu, 1.0, sigmas)
-        else:
-            sigmas = self.shift * sigmas / (1 + (self.shift - 1) * sigmas)
+        if not is_sigmas_provided:
+            if self.config.use_dynamic_shifting:
+                sigmas = self.time_shift(mu, 1.0, sigmas)
+            else:
+                sigmas = self.shift * sigmas / (1 + (self.shift - 1) * sigmas)
 
         # 3. If required, stretch the sigmas schedule to terminate at the configured `shift_terminal` value
-        if self.config.shift_terminal:
+        if self.config.shift_terminal and not is_sigmas_provided:
             sigmas = self.stretch_shift_to_terminal(sigmas)
 
         # 4. If required, convert sigmas to one of karras, exponential, or beta sigma schedules
-        if self.config.use_karras_sigmas:
-            sigmas = self._convert_to_karras(in_sigmas=sigmas, num_inference_steps=num_inference_steps)
-        elif self.config.use_exponential_sigmas:
-            sigmas = self._convert_to_exponential(in_sigmas=sigmas, num_inference_steps=num_inference_steps)
-        elif self.config.use_beta_sigmas:
-            sigmas = self._convert_to_beta(in_sigmas=sigmas, num_inference_steps=num_inference_steps)
+        if not is_sigmas_provided:
+            if self.config.use_karras_sigmas:
+                sigmas = self._convert_to_karras(in_sigmas=sigmas, num_inference_steps=num_inference_steps)
+            elif self.config.use_exponential_sigmas:
+                sigmas = self._convert_to_exponential(in_sigmas=sigmas, num_inference_steps=num_inference_steps)
+            elif self.config.use_beta_sigmas:
+                sigmas = self._convert_to_beta(in_sigmas=sigmas, num_inference_steps=num_inference_steps)
 
         # 5. Convert sigmas and timesteps to tensors and move to specified device
         sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32, device=device)
@@ -643,15 +650,19 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
 
             if self.derivative_order == 1:
                 # Ensure h1 is a tensor for proper broadcasting
-                h1_tensor = torch.tensor(h1, device=model_output.device, dtype=model_output.dtype)
+                h1_tensor = torch.as_tensor(h1, device=model_output.device, dtype=model_output.dtype)
                 velocity_derivative = (self.velocity_predictions[-1] - model_output) / h1_tensor
                 velocity_second_derivative = None
                 velocity_third_derivative = None
             elif self.derivative_order == 2:
                 # Ensure h1 and h2 are tensors for proper broadcasting
-                h1_tensor = torch.tensor(h1, device=model_output.device, dtype=model_output.dtype)
+                h1_tensor = torch.as_tensor(h1, device=model_output.device, dtype=model_output.dtype)
                 if self._step_index == 1:
-                    img_next = sample - 1.5 * model_output * self.dt_list[self._step_index] + 0.5 * self.velocity_predictions[-1] * self.dt_list[self._step_index-1]
+                    s = self.dt_list[self._step_index]
+                    r = self.dt_list[self._step_index - 1]
+                    s_tensor = torch.as_tensor(s, device=model_output.device, dtype=model_output.dtype)
+                    r_tensor = torch.as_tensor(r, device=model_output.device, dtype=model_output.dtype)
+                    img_next = sample - (s_tensor + s_tensor * s_tensor / (2 * r_tensor)) * model_output + (s_tensor * s_tensor / (2 * r_tensor)) * self.velocity_predictions[-1]
                     self._step_index += 1
                     self.velocity_predictions.append(model_output)
 
@@ -660,12 +671,20 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
                     return STORKSchedulerOutput(prev_sample=img_next)
                 else:
                     h2 = self.dt_list[self._step_index-2]
-                    h2_tensor = torch.tensor(h2, device=model_output.device, dtype=model_output.dtype)
-                    velocity_derivative = (-self.velocity_predictions[-2] + 4 * self.velocity_predictions[-1] - 3 * model_output) / (2 * h1_tensor)
+                    h2_tensor = torch.as_tensor(h2, device=model_output.device, dtype=model_output.dtype)
+                    velocity_derivative = (
+                        - model_output * (2 * h1_tensor + h2_tensor)
+                        / (h1_tensor * (h1_tensor + h2_tensor))
+                        + self.velocity_predictions[-1] * (h1_tensor + h2_tensor)
+                        / (h1_tensor * h2_tensor)
+                        - self.velocity_predictions[-2] * h1_tensor
+                        / (h2_tensor * (h1_tensor + h2_tensor))
+                    )
                     velocity_second_derivative = 2 / (h1_tensor * h2_tensor * (h1_tensor + h2_tensor)) * (self.velocity_predictions[-2] * h1_tensor - self.velocity_predictions[-1] * (h1_tensor + h2_tensor) + model_output * h2_tensor)
                     velocity_third_derivative = None
             elif self.derivative_order == 3:
-
+                # This branch still uses the upstream third-order approximation, which has not
+                # been corrected for non-uniform sigma schedules.
                 if self._step_index == 1 or self._step_index == 2:
                     img_next = sample - 1.5 * model_output * self.dt_list[self._step_index] + 0.5 * self.velocity_predictions[-1] * self.dt_list[self._step_index-1]
                     self._step_index += 1
@@ -678,9 +697,9 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
                     h2 = h1 + self.dt_list[self._step_index-2]
                     h3 = h2 + self.dt_list[self._step_index-3]
                     # Ensure h1, h2, and h3 are tensors for proper broadcasting
-                    h1_tensor = torch.tensor(h1, device=model_output.device, dtype=model_output.dtype)
-                    h2_tensor = torch.tensor(h2, device=model_output.device, dtype=model_output.dtype)
-                    h3_tensor = torch.tensor(h3, device=model_output.device, dtype=model_output.dtype)
+                    h1_tensor = torch.as_tensor(h1, device=model_output.device, dtype=model_output.dtype)
+                    h2_tensor = torch.as_tensor(h2, device=model_output.device, dtype=model_output.dtype)
+                    h3_tensor = torch.as_tensor(h3, device=model_output.device, dtype=model_output.dtype)
                     velocity_derivative = ((h2_tensor * h3_tensor) * (self.velocity_predictions[-1] - model_output) - (h1_tensor * h3_tensor) * (self.velocity_predictions[-2] - model_output) + (h1_tensor * h2_tensor) * (self.velocity_predictions[-3] - model_output)) / (h1_tensor * h2_tensor * h3_tensor)
                     velocity_second_derivative = 2 * ((h2_tensor + h3_tensor) * (self.velocity_predictions[-1] - model_output) - (h1_tensor + h3_tensor) * (self.velocity_predictions[-2] - model_output) + (h1_tensor + h2_tensor) * (self.velocity_predictions[-3] - model_output)) / (h1_tensor * h2_tensor * h3_tensor)
                     velocity_third_derivative = 6 * ((h2_tensor - h3_tensor) * (self.velocity_predictions[-1] - model_output) + (h3_tensor - h1_tensor) * (self.velocity_predictions[-2] - model_output) + (h1_tensor - h2_tensor) * (self.velocity_predictions[-3] - model_output)) / (h1_tensor * h2_tensor * h3_tensor)
@@ -778,15 +797,19 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
 
             if self.derivative_order == 1:
                 # Ensure h1 is a tensor for proper broadcasting
-                h1_tensor = torch.tensor(h1, device=model_output.device, dtype=model_output.dtype)
+                h1_tensor = torch.as_tensor(h1, device=model_output.device, dtype=model_output.dtype)
                 velocity_derivative = (self.velocity_predictions[-1] - model_output) / h1_tensor
                 velocity_second_derivative = None
                 velocity_third_derivative = None
             elif self.derivative_order == 2:
                 # Ensure h1 and h2 are tensors for proper broadcasting
-                h1_tensor = torch.tensor(h1, device=model_output.device, dtype=model_output.dtype)
+                h1_tensor = torch.as_tensor(h1, device=model_output.device, dtype=model_output.dtype)
                 if self._step_index == 1:
-                    img_next = sample - 1.5 * model_output * self.dt_list[self._step_index] + 0.5 * self.velocity_predictions[-1] * self.dt_list[self._step_index-1]
+                    s = self.dt_list[self._step_index]
+                    r = self.dt_list[self._step_index - 1]
+                    s_tensor = torch.as_tensor(s, device=model_output.device, dtype=model_output.dtype)
+                    r_tensor = torch.as_tensor(r, device=model_output.device, dtype=model_output.dtype)
+                    img_next = sample - (s_tensor + s_tensor * s_tensor / (2 * r_tensor)) * model_output + (s_tensor * s_tensor / (2 * r_tensor)) * self.velocity_predictions[-1]
                     self._step_index += 1
                     self.velocity_predictions.append(model_output)
 
@@ -795,12 +818,20 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
                     return STORKSchedulerOutput(prev_sample=img_next)
                 else:
                     h2 = self.dt_list[self._step_index-2]
-                    h2_tensor = torch.tensor(h2, device=model_output.device, dtype=model_output.dtype)
-                    velocity_derivative = (-self.velocity_predictions[-2] + 4 * self.velocity_predictions[-1] - 3 * model_output) / (2 * h1_tensor)
+                    h2_tensor = torch.as_tensor(h2, device=model_output.device, dtype=model_output.dtype)
+                    velocity_derivative = (
+                        - model_output * (2 * h1_tensor + h2_tensor)
+                        / (h1_tensor * (h1_tensor + h2_tensor))
+                        + self.velocity_predictions[-1] * (h1_tensor + h2_tensor)
+                        / (h1_tensor * h2_tensor)
+                        - self.velocity_predictions[-2] * h1_tensor
+                        / (h2_tensor * (h1_tensor + h2_tensor))
+                    )
                     velocity_second_derivative = 2 / (h1_tensor * h2_tensor * (h1_tensor + h2_tensor)) * (self.velocity_predictions[-2] * h1_tensor - self.velocity_predictions[-1] * (h1_tensor + h2_tensor) + model_output * h2_tensor)
                     velocity_third_derivative = None
             elif self.derivative_order == 3:
-
+                # This branch still uses the upstream third-order approximation, which has not
+                # been corrected for non-uniform sigma schedules.
                 if self._step_index == 1 or self._step_index == 2:
                     img_next = sample - 1.5 * model_output * self.dt_list[self._step_index] + 0.5 * self.velocity_predictions[-1] * self.dt_list[self._step_index-1]
                     self._step_index += 1
@@ -813,9 +844,9 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
                     h2 = h1 + self.dt_list[self._step_index-2]
                     h3 = h2 + self.dt_list[self._step_index-3]
                     # Ensure h1, h2, and h3 are tensors for proper broadcasting
-                    h1_tensor = torch.tensor(h1, device=model_output.device, dtype=model_output.dtype)
-                    h2_tensor = torch.tensor(h2, device=model_output.device, dtype=model_output.dtype)
-                    h3_tensor = torch.tensor(h3, device=model_output.device, dtype=model_output.dtype)
+                    h1_tensor = torch.as_tensor(h1, device=model_output.device, dtype=model_output.dtype)
+                    h2_tensor = torch.as_tensor(h2, device=model_output.device, dtype=model_output.dtype)
+                    h3_tensor = torch.as_tensor(h3, device=model_output.device, dtype=model_output.dtype)
                     velocity_derivative = ((h2_tensor * h3_tensor) * (self.velocity_predictions[-1] - model_output) - (h1_tensor * h3_tensor) * (self.velocity_predictions[-2] - model_output) + (h1_tensor * h2_tensor) * (self.velocity_predictions[-3] - model_output)) / (h1_tensor * h2_tensor * h3_tensor)
                     velocity_second_derivative = 2 * ((h2_tensor + h3_tensor) * (self.velocity_predictions[-1] - model_output) - (h1_tensor + h3_tensor) * (self.velocity_predictions[-2] - model_output) + (h1_tensor + h2_tensor) * (self.velocity_predictions[-3] - model_output)) / (h1_tensor * h2_tensor * h3_tensor)
                     velocity_third_derivative = 6 * ((h2_tensor - h3_tensor) * (self.velocity_predictions[-1] - model_output) + (h3_tensor - h1_tensor) * (self.velocity_predictions[-2] - model_output) + (h1_tensor - h2_tensor) * (self.velocity_predictions[-3] - model_output)) / (h1_tensor * h2_tensor * h3_tensor)
@@ -914,15 +945,19 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
 
             if self.derivative_order == 1:
                 # Ensure h1 is a tensor for proper broadcasting
-                h1_tensor = torch.tensor(h1, device=model_output.device, dtype=model_output.dtype)
+                h1_tensor = torch.as_tensor(h1, device=model_output.device, dtype=model_output.dtype)
                 velocity_derivative = (self.velocity_predictions[-1] - model_output) / h1_tensor
                 velocity_second_derivative = None
                 velocity_third_derivative = None
             elif self.derivative_order == 2:
                 # Ensure h1 and h2 are tensors for proper broadcasting
-                h1_tensor = torch.tensor(h1, device=model_output.device, dtype=model_output.dtype)
+                h1_tensor = torch.as_tensor(h1, device=model_output.device, dtype=model_output.dtype)
                 if self._step_index == 1:
-                    img_next = sample - 1.5 * model_output * self.dt_list[self._step_index] + 0.5 * self.velocity_predictions[-1] * self.dt_list[self._step_index-1]
+                    s = self.dt_list[self._step_index]
+                    r = self.dt_list[self._step_index - 1]
+                    s_tensor = torch.as_tensor(s, device=model_output.device, dtype=model_output.dtype)
+                    r_tensor = torch.as_tensor(r, device=model_output.device, dtype=model_output.dtype)
+                    img_next = sample - (s_tensor + s_tensor * s_tensor / (2 * r_tensor)) * model_output + (s_tensor * s_tensor / (2 * r_tensor)) * self.velocity_predictions[-1]
                     self._step_index += 1
                     self.velocity_predictions.append(model_output)
 
@@ -931,12 +966,20 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
                     return STORKSchedulerOutput(prev_sample=img_next)
                 else:
                     h2 = self.dt_list[self._step_index-2]
-                    h2_tensor = torch.tensor(h2, device=model_output.device, dtype=model_output.dtype)
-                    velocity_derivative = (-self.velocity_predictions[-2] + 4 * self.velocity_predictions[-1] - 3 * model_output) / (2 * h1_tensor)
+                    h2_tensor = torch.as_tensor(h2, device=model_output.device, dtype=model_output.dtype)
+                    velocity_derivative = (
+                        - model_output * (2 * h1_tensor + h2_tensor)
+                        / (h1_tensor * (h1_tensor + h2_tensor))
+                        + self.velocity_predictions[-1] * (h1_tensor + h2_tensor)
+                        / (h1_tensor * h2_tensor)
+                        - self.velocity_predictions[-2] * h1_tensor
+                        / (h2_tensor * (h1_tensor + h2_tensor))
+                    )
                     velocity_second_derivative = 2 / (h1_tensor * h2_tensor * (h1_tensor + h2_tensor)) * (self.velocity_predictions[-2] * h1_tensor - self.velocity_predictions[-1] * (h1_tensor + h2_tensor) + model_output * h2_tensor)
                     velocity_third_derivative = None
             elif self.derivative_order == 3:
-
+                # This branch still uses the upstream third-order approximation, which has not
+                # been corrected for non-uniform sigma schedules.
                 if self._step_index == 1 or self._step_index == 2:
                     img_next = sample - 1.5 * model_output * self.dt_list[self._step_index] + 0.5 * self.velocity_predictions[-1] * self.dt_list[self._step_index-1]
                     self._step_index += 1
@@ -949,9 +992,9 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
                     h2 = h1 + self.dt_list[self._step_index-2]
                     h3 = h2 + self.dt_list[self._step_index-3]
                     # Ensure h1, h2, and h3 are tensors for proper broadcasting
-                    h1_tensor = torch.tensor(h1, device=model_output.device, dtype=model_output.dtype)
-                    h2_tensor = torch.tensor(h2, device=model_output.device, dtype=model_output.dtype)
-                    h3_tensor = torch.tensor(h3, device=model_output.device, dtype=model_output.dtype)
+                    h1_tensor = torch.as_tensor(h1, device=model_output.device, dtype=model_output.dtype)
+                    h2_tensor = torch.as_tensor(h2, device=model_output.device, dtype=model_output.dtype)
+                    h3_tensor = torch.as_tensor(h3, device=model_output.device, dtype=model_output.dtype)
                     velocity_derivative = ((h2_tensor * h3_tensor) * (self.velocity_predictions[-1] - model_output) - (h1_tensor * h3_tensor) * (self.velocity_predictions[-2] - model_output) + (h1_tensor * h2_tensor) * (self.velocity_predictions[-3] - model_output)) / (h1_tensor * h2_tensor * h3_tensor)
                     velocity_second_derivative = 2 * ((h2_tensor + h3_tensor) * (self.velocity_predictions[-1] - model_output) - (h1_tensor + h3_tensor) * (self.velocity_predictions[-2] - model_output) + (h1_tensor + h2_tensor) * (self.velocity_predictions[-3] - model_output)) / (h1_tensor * h2_tensor * h3_tensor)
                     velocity_third_derivative = 6 * ((h2_tensor - h3_tensor) * (self.velocity_predictions[-1] - model_output) + (h3_tensor - h1_tensor) * (self.velocity_predictions[-2] - model_output) + (h1_tensor - h2_tensor) * (self.velocity_predictions[-3] - model_output)) / (h1_tensor * h2_tensor * h3_tensor)

@@ -14,17 +14,10 @@ model_assets:
   - pndm_model_ddim_cifar10
 solvers:
   - euler
-  - heun2
-  - deis
   - stork4_1st
-  - stork4_2nd
 schedules:
-  - base
   - SADB
 solver_schedules:
-  euler: [base, SADB]
-  heun2: [base, SADB]
-  deis: [base]
-  stork4_1st: [base, SADB]
-  stork4_2nd: [base, SADB]
-eval_nfes: [5, 7, 11, 15, 31, 63]
+  euler: [SADB]
+  stork4_1st: [SADB]
+eval_nfes: [5, 7, 11, 15]
