@@ -13,12 +13,12 @@ base_config:
 model_assets:
   - pndm_model_ddim_cifar10
 solvers:
-  - euler
+  - stork4_2nd
   - stork4_1st
 schedules:
   - SADB
   - base
 solver_schedules:
-  euler: [base, SADB]
   stork4_1st: [base, SADB]
-eval_nfes: [5, 7, 11, 15]
+  stork4_1st: [base, SADB]
+eval_nfes: [5, 7, 11]

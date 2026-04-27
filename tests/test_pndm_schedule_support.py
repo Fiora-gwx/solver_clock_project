@@ -318,17 +318,20 @@ def test_collect_solver_refinement_stats_accepts_stork_sigma_domain() -> None:
     stats = collect_solver_refinement_stats(
         model=model,
         scheduler=scheduler,
-        physical_grid=np.asarray([10.0, 5.0, 0.0], dtype=np.float64),
+        physical_grid=np.asarray([10.0, 5.0, 1.0, 0.0], dtype=np.float64),
         solver="stork4_2nd",
         image_size=4,
         batch_size=2,
         num_batches=1,
         seed=0,
+        observation_microbatch=1,
         coordinate_domain="sigmas",
     )
 
-    assert stats.full_step_error.shape == (2, 2)
-    assert stats.half_step_error.shape == (2, 2)
-    assert stats.effective_order.shape == (2, 2)
-    assert stats.defect_strength.shape == (2, 2)
+    assert stats.full_step_error.shape == (2, 3)
+    assert stats.half_step_error.shape == (2, 3)
+    assert stats.effective_order.shape == (2, 3)
+    assert stats.defect_strength.shape == (2, 3)
+    assert np.allclose(stats.full_step_error[:, 0], stats.full_step_error[:, 1])
+    assert np.allclose(stats.half_step_error[:, 0], stats.half_step_error[:, 1])
     assert np.all(np.isfinite(stats.defect_strength))

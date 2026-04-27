@@ -11,7 +11,13 @@ import numpy as np
 import torch
 from PIL import Image
 
-from src.clock.defect_balanced import StepRefinementStats, build_velocity_stepper, collect_step_refinement_stats
+from src.clock.defect_balanced import (
+    StepRefinementStats,
+    build_velocity_stepper,
+    collect_step_refinement_stats,
+    estimate_refinement_order_and_defect,
+    per_sample_l2_norm,
+)
 from src.clock.calibration import ForwardNormCollector
 from src.utils.nfe_budget import resolve_effective_nfe_plan
 from src.utils.config import load_yaml, repo_root
@@ -1161,6 +1167,146 @@ def _build_native_scheduler_stepper(
     return step
 
 
+def _build_stateful_stork_stepper(
+    *,
+    model: torch.nn.Module,
+    scheduler,
+) -> Callable[[torch.Tensor, float, float], torch.Tensor]:
+    def step(sample: torch.Tensor, _coordinate_start: float, _coordinate_end: float) -> torch.Tensor:
+        if scheduler._step_index is None:
+            scheduler._step_index = 0
+        scheduler_timestep = scheduler.timesteps[scheduler._step_index]
+        model_output = _evaluate_scheduler_model_output(model, scheduler, sample, scheduler_timestep)
+        step_output = scheduler.step(model_output, scheduler_timestep, sample)
+        return step_output.prev_sample
+
+    return step
+
+
+def collect_stork_refinement_stats_stateful(
+    *,
+    model: torch.nn.Module,
+    scheduler,
+    physical_grid: np.ndarray,
+    image_size: int,
+    batch_size: int,
+    num_batches: int,
+    seed: int,
+    model_output_type: str = "epsilon",
+    coordinate_domain: str = "sigmas",
+    observation_microbatch: int | None = None,
+    warmup_steps: int = 1,
+    q_min: float = 1.05,
+    q_max: float = 6.0,
+    eps: float = 1.0e-12,
+) -> StepRefinementStats:
+    del model_output_type
+    if str(coordinate_domain).lower().strip() != "sigmas":
+        raise ValueError("Stateful STORK refinement stats require sigma-domain physical grids.")
+
+    grid = np.asarray(physical_grid, dtype=np.float64)
+    if grid.ndim != 1 or len(grid) < 2:
+        raise ValueError("physical_grid must contain at least two sigma nodes.")
+    if np.any(np.diff(grid) >= 0):
+        raise ValueError("Stateful STORK sigma grids must be strictly descending.")
+
+    n_intervals = len(grid) - 1
+    device = next(model.parameters()).device
+    generator = torch.Generator(device=device).manual_seed(seed)
+
+    def make_refined_grid(factor: int) -> np.ndarray:
+        if factor < 1:
+            raise ValueError("refinement factor must be positive.")
+        points = [float(grid[0])]
+        for index in range(n_intervals):
+            subnodes = np.linspace(float(grid[index]), float(grid[index + 1]), factor + 1, dtype=np.float64)[1:]
+            points.extend(subnodes.tolist())
+        return np.asarray(points, dtype=np.float64)
+
+    def run_trajectory(sigma_grid: np.ndarray, initial_sample: torch.Tensor) -> list[torch.Tensor]:
+        scheduler.set_timesteps(device=device, sigmas=sigma_grid.astype(np.float32).tolist())
+        scheduler.noise_predictions = []
+        scheduler.velocity_predictions = []
+        scheduler._step_index = None
+        scheduler._begin_index = None
+
+        states = [initial_sample.detach().clone()]
+        sample = initial_sample.detach().clone()
+        stepper = _build_stateful_stork_stepper(model=model, scheduler=scheduler)
+        for index in range(len(scheduler.timesteps)):
+            sample = stepper(sample, float(sigma_grid[index]), float(sigma_grid[index + 1]))
+            states.append(sample.detach().clone())
+        return states
+
+    def trajectory_errors(initial_sample: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+        grid_1x = grid
+        grid_2x = make_refined_grid(2)
+        grid_4x = make_refined_grid(4)
+
+        traj_1x = run_trajectory(grid_1x, initial_sample)
+        traj_2x = run_trajectory(grid_2x, initial_sample)
+        traj_4x = run_trajectory(grid_4x, initial_sample)
+
+        full_errors = []
+        half_errors = []
+        for index in range(n_intervals):
+            full_errors.append(per_sample_l2_norm(traj_1x[index + 1] - traj_2x[2 * (index + 1)]).cpu().numpy())
+            half_errors.append(per_sample_l2_norm(traj_2x[2 * (index + 1)] - traj_4x[4 * (index + 1)]).cpu().numpy())
+
+        full_arr = np.stack(full_errors, axis=1)
+        half_arr = np.stack(half_errors, axis=1)
+
+        warmup_count = max(int(warmup_steps), 0)
+        if warmup_count > 0 and n_intervals > warmup_count:
+            full_arr[:, :warmup_count] = full_arr[:, warmup_count : warmup_count + 1]
+            half_arr[:, :warmup_count] = half_arr[:, warmup_count : warmup_count + 1]
+        return full_arr, half_arr
+
+    all_full_errors = []
+    all_half_errors = []
+
+    with torch.inference_mode():
+        for _ in range(num_batches):
+            initial_sample = torch.randn(
+                (batch_size, model.in_channels, image_size, image_size),
+                generator=generator,
+                device=device,
+            ) * float(grid[0])
+
+            if observation_microbatch is None or observation_microbatch <= 0 or observation_microbatch >= batch_size:
+                full_arr, half_arr = trajectory_errors(initial_sample)
+                all_full_errors.append(full_arr)
+                all_half_errors.append(half_arr)
+                continue
+
+            batch_full = []
+            batch_half = []
+            for start in range(0, batch_size, observation_microbatch):
+                stop = min(start + observation_microbatch, batch_size)
+                full_arr, half_arr = trajectory_errors(initial_sample[start:stop])
+                batch_full.append(full_arr)
+                batch_half.append(half_arr)
+            all_full_errors.append(np.concatenate(batch_full, axis=0))
+            all_half_errors.append(np.concatenate(batch_half, axis=0))
+
+    full_error = np.concatenate(all_full_errors, axis=0)
+    half_error = np.concatenate(all_half_errors, axis=0)
+    effective_order, defect_strength = estimate_refinement_order_and_defect(
+        full_step_error=full_error,
+        half_step_error=half_error,
+        step_sizes=np.abs(np.diff(grid)),
+        q_min=q_min,
+        q_max=q_max,
+        eps=eps,
+    )
+    return StepRefinementStats(
+        full_step_error=full_error,
+        half_step_error=half_error,
+        effective_order=effective_order,
+        defect_strength=defect_strength,
+    )
+
+
 def collect_solver_refinement_stats(
     *,
     model: torch.nn.Module,
@@ -1175,6 +1321,7 @@ def collect_solver_refinement_stats(
     model_output_type: str = "epsilon",
     sigma_floor: float = 1.0e-6,
     coordinate_domain: str = "timesteps",
+    warmup_steps: int = 1,
     q_min: float = 1.05,
     q_max: float = 6.0,
     eps: float = 1.0e-12,
@@ -1189,6 +1336,26 @@ def collect_solver_refinement_stats(
     normalized_domain = str(coordinate_domain).lower().strip()
     if normalized_domain not in {"timesteps", "sigmas"}:
         raise ValueError(f"Unsupported PNDM coordinate domain: {coordinate_domain}")
+
+    if normalized_solver in STORK_PNDM_SOLVERS:
+        if normalized_domain != "sigmas":
+            raise ValueError("Stateful STORK defect calibration requires sigma-domain physical grids.")
+        return collect_stork_refinement_stats_stateful(
+            model=model,
+            scheduler=scheduler,
+            physical_grid=grid,
+            image_size=image_size,
+            batch_size=batch_size,
+            num_batches=num_batches,
+            seed=seed,
+            model_output_type=model_output_type,
+            coordinate_domain=normalized_domain,
+            observation_microbatch=observation_microbatch,
+            warmup_steps=warmup_steps,
+            q_min=q_min,
+            q_max=q_max,
+            eps=eps,
+        )
 
     if normalized_domain == "timesteps":
         time_grid = grid

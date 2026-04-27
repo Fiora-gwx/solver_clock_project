@@ -1241,7 +1241,8 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
 
             self.noise_predictions.append(noise_initial)
         elif self._step_index == 4:
-            h = torch.as_tensor(self._noise_dt_value(self._step_index, previous=True), device=sample.device, dtype=model_output.dtype)
+            h_value = self._noise_dt_value(self._step_index) if self.derivative_order == 1 else self._noise_dt_value(self._step_index, previous=True)
+            h = torch.as_tensor(h_value, device=sample.device, dtype=model_output.dtype)
 
             noise_derivative = (-3 * noise_initial + 4 * self.noise_predictions[-1] - self.noise_predictions[-2]) / (2 * h)
             noise_second_derivative = (noise_initial - 2 * self.noise_predictions[-1] + self.noise_predictions[-2]) / (h ** 2)
@@ -1250,7 +1251,8 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
             self.noise_predictions.append(noise_initial)
         else:
             # ALL ELSE
-            h = torch.as_tensor(self._noise_dt_value(self._step_index, previous=True), device=sample.device, dtype=model_output.dtype)
+            h_value = self._noise_dt_value(self._step_index) if self.derivative_order == 1 else self._noise_dt_value(self._step_index, previous=True)
+            h = torch.as_tensor(h_value, device=sample.device, dtype=model_output.dtype)
             
             noise_derivative = (2 * self.noise_predictions[-3] - 9 * self.noise_predictions[-2] + 18 * self.noise_predictions[-1] - 11 * noise_initial) / (6 * h)
             noise_second_derivative = (-self.noise_predictions[-3] + 4 * self.noise_predictions[-2] -5 * self.noise_predictions[-1] + 2 * noise_initial) / (h**2)
@@ -1418,7 +1420,7 @@ class STORKScheduler(SchedulerMixin, ConfigMixin):
                 return SchedulerOutput(prev_sample=img_next)
             else:
                 # STORK4 update
-                h = torch.as_tensor(self._noise_dt_value(self._step_index, previous=True), device=sample.device, dtype=model_output.dtype)
+                h = torch.as_tensor(self._noise_dt_value(self._step_index), device=sample.device, dtype=model_output.dtype)
 
                 noise_derivative = (self.noise_predictions[-1] - noise_initial) / h
                 noise_second_derivative = None

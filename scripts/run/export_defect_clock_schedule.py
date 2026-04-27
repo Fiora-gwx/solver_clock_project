@@ -318,6 +318,7 @@ def build_or_load_pndm_profile(
     pilot_batch_size = int(clock_config.get("pilot_batch_size", 8))
     pilot_num_batches = int(clock_config.get("pilot_num_batches", 4))
     pilot_observation_microbatch = int(clock_config.get("pilot_observation_microbatch", 4))
+    warmup_steps = int(clock_config.get("warmup_steps", 1))
     cache_root = resolve_repo_path(clock_config.get("cache_path", "outputs/cache/sadb_profiles"))
     cache_dir = profile_cache_dir(
         cache_root=cache_root,
@@ -357,6 +358,7 @@ def build_or_load_pndm_profile(
             "dataset": dataset_config["name"],
             "pilot_data_source": "synthetic_noise_trajectories_only",
             "uses_dataset_samples": False,
+            "warmup_steps": warmup_steps,
         },
     )
     cached_profile = load_cached_profile_if_current(cache_dir, profile_meta)
@@ -389,6 +391,7 @@ def build_or_load_pndm_profile(
         model_output_type=str(clock_config["model_output_type"]),
         sigma_floor=epsilon,
         coordinate_domain=coordinate_domain,
+        warmup_steps=warmup_steps,
         q_min=q_min,
         q_max=q_max,
         eps=epsilon,
