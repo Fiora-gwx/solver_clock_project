@@ -120,6 +120,27 @@ def test_noise_stork_set_timesteps_keeps_custom_sigmas_and_dt_list() -> None:
     )
 
 
+def test_noise_stork_dt_list_uses_timesteps_not_sigma_gaps() -> None:
+    scheduler = build_scheduler("stork4_2nd")
+    scheduler.set_timesteps(
+        num_inference_steps=3,
+        device=torch.device("cpu"),
+        timesteps=[900.0, 400.0, 100.0],
+        sigmas=[80.0, 10.0, 1.0],
+    )
+
+    assert np.allclose(
+        scheduler.dt_list.detach().cpu().numpy(),
+        np.asarray([0.5, 0.3, 0.1], dtype=np.float32),
+        atol=1.0e-6,
+    )
+    assert not np.allclose(
+        scheduler.dt_list.detach().cpu().numpy(),
+        np.asarray([70.0, 9.0, 1.0], dtype=np.float32),
+        atol=1.0e-6,
+    )
+
+
 def test_noise_stork_set_timesteps_accepts_custom_sigmas_without_timesteps() -> None:
     scheduler = build_scheduler("stork4_1st")
     custom_sigmas = np.asarray([1.0, 0.9, 0.3, 0.1, 0.01], dtype=np.float64)

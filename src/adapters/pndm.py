@@ -15,6 +15,7 @@ from src.clock.defect_balanced import (
     StepRefinementStats,
     build_velocity_stepper,
     collect_step_refinement_stats,
+    collect_velocity_curvature_stats,
     estimate_refinement_order_and_defect,
     per_sample_l2_norm,
 )
@@ -1444,6 +1445,85 @@ def collect_solver_refinement_stats(
                     q_min=q_min,
                     q_max=q_max,
                     eps=eps,
+                )
+            )
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    return StepRefinementStats(
+        full_step_error=np.concatenate([item.full_step_error for item in batches], axis=0),
+        half_step_error=np.concatenate([item.half_step_error for item in batches], axis=0),
+        effective_order=np.concatenate([item.effective_order for item in batches], axis=0),
+        defect_strength=np.concatenate([item.defect_strength for item in batches], axis=0),
+    )
+
+
+def collect_velocity_curvature_calibration_stats(
+    *,
+    model: torch.nn.Module,
+    scheduler,
+    physical_grid: np.ndarray,
+    image_size: int,
+    batch_size: int,
+    num_batches: int,
+    seed: int,
+    observation_microbatch: int | None = None,
+    model_output_type: str = "epsilon",
+    sigma_floor: float = 1.0e-6,
+    coordinate_domain: str = "timesteps",
+    pilot_solver: str = "heun2",
+    pilot_pieces: int = 4,
+    q_const: float = 3.0,
+    eps: float = 1.0e-12,
+    defect_clip_quantile: float | None = None,
+) -> StepRefinementStats:
+    grid = np.asarray(physical_grid, dtype=np.float64)
+    if grid.ndim != 1 or len(grid) < 2:
+        raise ValueError("physical_grid must contain at least two points.")
+
+    normalized_domain = str(coordinate_domain).lower().strip()
+    if normalized_domain not in {"timesteps", "sigmas"}:
+        raise ValueError(f"Unsupported PNDM coordinate domain: {coordinate_domain}")
+
+    if normalized_domain == "timesteps":
+        sigma_grid = _interp_sigmas_for_timesteps(scheduler, grid)
+        sigma_grid[-1] = 0.0
+        velocity_fn = build_velocity_oracle(
+            model,
+            scheduler,
+            model_output_type=model_output_type,
+            sigma_floor=sigma_floor,
+        )
+    else:
+        sigma_grid = grid
+        velocity_fn = build_sigma_derivative_oracle(
+            model,
+            scheduler,
+            model_output_type=model_output_type,
+        )
+
+    step_fn = build_velocity_stepper(velocity_fn, pilot_solver)
+    device = next(model.parameters()).device
+    generator = torch.Generator(device=device).manual_seed(seed)
+    batches: list[StepRefinementStats] = []
+    with torch.inference_mode():
+        for _ in range(num_batches):
+            sample = torch.randn(
+                (batch_size, model.in_channels, image_size, image_size),
+                generator=generator,
+                device=device,
+            ) * float(sigma_grid[0])
+            batches.append(
+                collect_velocity_curvature_stats(
+                    initial_sample=sample,
+                    physical_grid=grid,
+                    velocity_fn=velocity_fn,
+                    pilot_step_fn=step_fn,
+                    pilot_pieces=pilot_pieces,
+                    observation_microbatch=observation_microbatch,
+                    q_const=q_const,
+                    eps=eps,
+                    defect_clip_quantile=defect_clip_quantile,
                 )
             )
             if device.type == "cuda":

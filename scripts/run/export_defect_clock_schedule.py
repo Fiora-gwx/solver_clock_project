@@ -20,6 +20,7 @@ from src.adapters.pndm import (
     build_pndm_native_coordinate_grid,
     build_pndm_sigma_grid,
     build_scheduler,
+    collect_velocity_curvature_calibration_stats,
     collect_solver_refinement_stats,
     load_model,
     load_native_config,
@@ -40,7 +41,8 @@ from src.utils.config import dump_json, ensure_dir, load_json, load_yaml, resolv
 
 
 SCHEDULE_FAMILY = "SADB"
-ESTIMATOR_NAME = "step_refinement"
+DEFAULT_ESTIMATOR_NAME = "step_refinement"
+VELOCITY_CURVATURE_ESTIMATOR_NAME = "velocity_curvature"
 PROFILE_ARRAY_FILES = (
     "physical_grid.npy",
     "alpha_profile.npy",
@@ -87,7 +89,14 @@ def load_clock_settings(path: str) -> dict[str, Any]:
         raise TypeError("clock config must contain a `clock` mapping.")
     if str(clock.get("family", "")).upper() != SCHEDULE_FAMILY:
         raise ValueError(f"Defect-clock exporter expects `clock.family: {SCHEDULE_FAMILY}`.")
-    clock["estimator"] = ESTIMATOR_NAME
+    estimator = str(clock.get("estimator", DEFAULT_ESTIMATOR_NAME)).lower().replace("-", "_")
+    if estimator in {"curvature", "velocity_curvature", "velocity_curvature_q3"}:
+        estimator = VELOCITY_CURVATURE_ESTIMATOR_NAME
+    if estimator not in {DEFAULT_ESTIMATOR_NAME, VELOCITY_CURVATURE_ESTIMATOR_NAME}:
+        raise ValueError(
+            "SADB expects clock.estimator to be one of: step_refinement, velocity_curvature."
+        )
+    clock["estimator"] = estimator
     model_output_type = str(clock.get("model_output_type", "epsilon")).lower()
     if model_output_type not in {"epsilon", "v_prediction", "flow"}:
         raise ValueError("SADB expects clock.model_output_type to be one of: epsilon, v_prediction, flow.")
@@ -147,6 +156,14 @@ def build_pndm_export_transforms(
     raise ValueError(f"Unsupported PNDM coordinate domain: {coordinate_domain}")
 
 
+def build_pndm_timestep_export_transform(*, scheduler, coordinate_domain: str):
+    if coordinate_domain == "timesteps":
+        return lambda values: np.asarray(values, dtype=np.float64)
+    if coordinate_domain == "sigmas":
+        return lambda values: _interp_timesteps_for_sigmas(scheduler, values)
+    raise ValueError(f"Unsupported PNDM coordinate domain: {coordinate_domain}")
+
+
 def _step_size_stats(nodes: np.ndarray, reference_nodes: np.ndarray | None = None) -> dict[str, float]:
     values = np.asarray(nodes, dtype=np.float64)
     intervals = np.abs(np.diff(values))
@@ -165,7 +182,8 @@ def _step_size_stats(nodes: np.ndarray, reference_nodes: np.ndarray | None = Non
     if reference_nodes is not None:
         reference_intervals = np.abs(np.diff(np.asarray(reference_nodes, dtype=np.float64)))
         if reference_intervals.shape == intervals.shape:
-            max_over_base = float(np.max(intervals / np.maximum(reference_intervals, 1.0e-12)))
+            valid = reference_intervals > 1.0e-12
+            max_over_base = float(np.max(intervals[valid] / reference_intervals[valid])) if np.any(valid) else 1.0
         else:
             max_over_base = 1.0
     else:
@@ -176,6 +194,16 @@ def _step_size_stats(nodes: np.ndarray, reference_nodes: np.ndarray | None = Non
         "max_neighbor_dt_ratio": max_neighbor,
         "max_dt_over_base_dt": max_over_base,
     }
+
+
+def _limiter_reference_time_grid(reference_nodes: np.ndarray) -> np.ndarray:
+    reference = np.asarray(reference_nodes, dtype=np.float64)
+    if reference.ndim != 1 or len(reference) < 2:
+        return reference.copy()
+    intervals = np.abs(np.diff(reference))
+    if np.any(intervals <= 1.0e-12):
+        return np.linspace(float(reference[0]), float(reference[-1]), len(reference), dtype=np.float64)
+    return reference.copy()
 
 
 def limit_schedule_step_sizes(
@@ -315,8 +343,9 @@ def profile_cache_dir(
     guidance_scale: float | None = None,
     model_output_type: str | None = None,
     coordinate_domain: str | None = None,
+    estimator: str = DEFAULT_ESTIMATOR_NAME,
 ) -> Path:
-    parts = [backend, SCHEDULE_FAMILY, ESTIMATOR_NAME]
+    parts = [backend, SCHEDULE_FAMILY, estimator]
     if dataset_name:
         parts.append(dataset_name)
     parts.extend(
@@ -408,6 +437,7 @@ def _build_profile_meta(
     q_max: float,
     model_output_type: str,
     coordinate_domain: str,
+    estimator: str = DEFAULT_ESTIMATOR_NAME,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     meta = {
@@ -415,7 +445,7 @@ def _build_profile_meta(
         "model_asset": model_asset,
         "schedule_family": SCHEDULE_FAMILY,
         "schedule_implementation_version": DEFECT_BALANCED_CLOCK_VERSION,
-        "estimator": ESTIMATOR_NAME,
+        "estimator": estimator,
         "solver": solver,
         "calibration_solver": calibration_solver,
         "physical_grid_size": physical_grid_size,
@@ -428,7 +458,11 @@ def _build_profile_meta(
         "q_max": q_max,
         "model_output_type": model_output_type,
         "coordinate_domain": coordinate_domain,
-        "calibration_method": "solver_step_refinement_full_half_quarter",
+        "calibration_method": (
+            "velocity_curvature_pilot_trajectory"
+            if estimator == VELOCITY_CURVATURE_ESTIMATOR_NAME
+            else "solver_step_refinement_full_half_quarter"
+        ),
     }
     if extra:
         meta.update(extra)
@@ -448,6 +482,7 @@ def build_or_load_pndm_profile(
     schedule_cfg = native_config["Schedule"]
     target_solver = str(args.solver or "euler")
     calibration_solver = resolve_calibration_solver(clock_config, target_solver)
+    estimator = str(clock_config["estimator"])
     coordinate_domain = preferred_calibration_domain(calibration_solver)
     physical_grid_size = int(clock_config.get("physical_grid_size", 65))
     smoothing_window = int(clock_config.get("smoothing_window", 1))
@@ -466,6 +501,7 @@ def build_or_load_pndm_profile(
         model_asset=str(model_asset),
         solver=target_solver,
         calibration_solver=calibration_solver,
+        estimator=estimator,
         physical_grid_size=physical_grid_size,
         pilot_batch_size=pilot_batch_size,
         pilot_num_batches=pilot_num_batches,
@@ -478,11 +514,29 @@ def build_or_load_pndm_profile(
         model_output_type=str(clock_config["model_output_type"]),
         coordinate_domain=coordinate_domain,
     )
+    extra_meta = {
+        "dataset": dataset_config["name"],
+        "pilot_data_source": "synthetic_noise_trajectories_only",
+        "uses_dataset_samples": False,
+        "warmup_steps": warmup_steps,
+    }
+    if estimator == VELOCITY_CURVATURE_ESTIMATOR_NAME:
+        extra_meta.update(
+            {
+                "velocity_curvature_q_const": float(clock_config.get("velocity_curvature_q_const", 3.0)),
+                "velocity_curvature_pilot_solver": str(clock_config.get("velocity_curvature_pilot_solver", "heun2")),
+                "velocity_curvature_pilot_pieces": int(clock_config.get("velocity_curvature_pilot_pieces", 4)),
+                "velocity_curvature_defect_clip_quantile": clock_config.get(
+                    "velocity_curvature_defect_clip_quantile", None
+                ),
+            }
+        )
     profile_meta = _build_profile_meta(
         backend="pndm",
         model_asset=str(model_asset),
         solver=target_solver,
         calibration_solver=calibration_solver,
+        estimator=estimator,
         physical_grid_size=physical_grid_size,
         pilot_batch_size=pilot_batch_size,
         pilot_num_batches=pilot_num_batches,
@@ -493,12 +547,7 @@ def build_or_load_pndm_profile(
         q_max=q_max,
         model_output_type=str(clock_config["model_output_type"]),
         coordinate_domain=coordinate_domain,
-        extra={
-            "dataset": dataset_config["name"],
-            "pilot_data_source": "synthetic_noise_trajectories_only",
-            "uses_dataset_samples": False,
-            "warmup_steps": warmup_steps,
-        },
+        extra=extra_meta,
     )
     cached_profile = load_cached_profile_if_current(cache_dir, profile_meta)
     if cached_profile is not None:
@@ -517,24 +566,44 @@ def build_or_load_pndm_profile(
         diffusion_step=int(schedule_cfg["diffusion_step"]),
         physical_grid_size=physical_grid_size,
     )
-    stats = collect_solver_refinement_stats(
-        model=model,
-        scheduler=scheduler,
-        physical_grid=physical_grid,
-        solver=calibration_solver,
-        image_size=int(dataset_config["image_size"]),
-        batch_size=pilot_batch_size,
-        num_batches=pilot_num_batches,
-        seed=args.seed,
-        observation_microbatch=pilot_observation_microbatch,
-        model_output_type=str(clock_config["model_output_type"]),
-        sigma_floor=epsilon,
-        coordinate_domain=coordinate_domain,
-        warmup_steps=warmup_steps,
-        q_min=q_min,
-        q_max=q_max,
-        eps=epsilon,
-    )
+    if estimator == VELOCITY_CURVATURE_ESTIMATOR_NAME:
+        stats = collect_velocity_curvature_calibration_stats(
+            model=model,
+            scheduler=scheduler,
+            physical_grid=physical_grid,
+            image_size=int(dataset_config["image_size"]),
+            batch_size=pilot_batch_size,
+            num_batches=pilot_num_batches,
+            seed=args.seed,
+            observation_microbatch=pilot_observation_microbatch,
+            model_output_type=str(clock_config["model_output_type"]),
+            sigma_floor=epsilon,
+            coordinate_domain=coordinate_domain,
+            pilot_solver=str(clock_config.get("velocity_curvature_pilot_solver", "heun2")),
+            pilot_pieces=int(clock_config.get("velocity_curvature_pilot_pieces", 4)),
+            q_const=float(clock_config.get("velocity_curvature_q_const", 3.0)),
+            eps=epsilon,
+            defect_clip_quantile=clock_config.get("velocity_curvature_defect_clip_quantile", None),
+        )
+    else:
+        stats = collect_solver_refinement_stats(
+            model=model,
+            scheduler=scheduler,
+            physical_grid=physical_grid,
+            solver=calibration_solver,
+            image_size=int(dataset_config["image_size"]),
+            batch_size=pilot_batch_size,
+            num_batches=pilot_num_batches,
+            seed=args.seed,
+            observation_microbatch=pilot_observation_microbatch,
+            model_output_type=str(clock_config["model_output_type"]),
+            sigma_floor=epsilon,
+            coordinate_domain=coordinate_domain,
+            warmup_steps=warmup_steps,
+            q_min=q_min,
+            q_max=q_max,
+            eps=epsilon,
+        )
 
     artifacts = build_defect_balanced_profile(
         physical_grid,
@@ -563,6 +632,9 @@ def build_or_load_diffusers_profile(
     model_asset = str(args.model_asset)
     target_solver = normalize_diffusers_solver(str(args.solver or "flow_euler"))
     calibration_solver = normalize_diffusers_solver(resolve_calibration_solver(clock_config, target_solver))
+    estimator = str(clock_config["estimator"])
+    if estimator == VELOCITY_CURVATURE_ESTIMATOR_NAME:
+        raise ValueError("velocity_curvature calibration is currently implemented for backend=pndm only.")
     effective_model_output_type = "flow"
     physical_grid_size = int(clock_config.get("physical_grid_size", 65))
     smoothing_window = int(clock_config.get("smoothing_window", 1))
@@ -581,6 +653,7 @@ def build_or_load_diffusers_profile(
         model_asset=model_asset,
         solver=target_solver,
         calibration_solver=calibration_solver,
+        estimator=estimator,
         physical_grid_size=physical_grid_size,
         pilot_batch_size=pilot_batch_size,
         pilot_num_batches=pilot_num_batches,
@@ -602,6 +675,7 @@ def build_or_load_diffusers_profile(
         model_asset=model_asset,
         solver=target_solver,
         calibration_solver=calibration_solver,
+        estimator=estimator,
         physical_grid_size=physical_grid_size,
         pilot_batch_size=pilot_batch_size,
         pilot_num_batches=pilot_num_batches,
@@ -701,7 +775,7 @@ def export_pndm(args: argparse.Namespace) -> None:
         "coordinate_domain": coordinate_domain,
         "clock_config": args.clock_config,
         "clock_model_output_type": str(profile_meta.get("model_output_type", "flow")),
-        "estimator": ESTIMATOR_NAME,
+        "estimator": str(clock_config["estimator"]),
         "shared_profile_dir": str(cache_dir),
         "shared_profile_meta": profile_meta,
         "schedule_implementation_version": DEFECT_BALANCED_CLOCK_VERSION,
@@ -760,7 +834,7 @@ def export_pndm(args: argparse.Namespace) -> None:
                 )
                 limited_time_grid, limiter_meta = limit_schedule_step_sizes(
                     np.asarray(bundle.time_grid, dtype=np.float64),
-                    reference_time_grid,
+                    _limiter_reference_time_grid(reference_time_grid),
                     max_dt_factor=None if max_dt_factor is None else float(max_dt_factor),
                     max_neighbor_ratio=None if max_neighbor_ratio is None else float(max_neighbor_ratio),
                 )
@@ -797,15 +871,54 @@ def export_pndm(args: argparse.Namespace) -> None:
             )
             bundle.save(output_root / f"nfe_{int(effective_nfe):03d}")
         return
-    export_clock_sweep(
-        profile,
-        target_nfes,
-        output_root=args.output_root,
-        solver_name=target_solver,
-        representation=representation,
-        schedule_family=SCHEDULE_FAMILY,
-        meta=export_meta,
+    native_config = load_native_config(dataset_config["native_config"])
+    schedule_cfg = native_config["Schedule"]
+    target_scheduler = build_scheduler(
+        target_solver,
+        diffusion_step=schedule_cfg["diffusion_step"],
+        beta_start=schedule_cfg["beta_start"],
+        beta_end=schedule_cfg["beta_end"],
+        beta_schedule=schedule_cfg["type"],
     )
+    timestep_transform = build_pndm_timestep_export_transform(
+        scheduler=target_scheduler,
+        coordinate_domain=coordinate_domain,
+    )
+    output_root = Path(args.output_root)
+    for effective_nfe in target_nfes:
+        bundle = build_reparameterized_bundle(
+            profile,
+            effective_nfe=int(effective_nfe),
+            solver_name=target_solver,
+            representation=representation,
+            schedule_family=SCHEDULE_FAMILY,
+            meta=export_meta,
+            representation_transform=timestep_transform,
+            time_transform=timestep_transform,
+        )
+        max_dt_factor = clock_config.get("max_dt_factor")
+        max_neighbor_ratio = clock_config.get("max_neighbor_dt_ratio")
+        if max_dt_factor is not None or max_neighbor_ratio is not None:
+            reference_time_grid = build_pndm_native_coordinate_grid(
+                target_scheduler,
+                solver_name=target_solver,
+                effective_nfe=int(effective_nfe),
+                coordinate_domain="timesteps",
+            )
+            limited_time_grid, limiter_meta = limit_schedule_step_sizes(
+                np.asarray(bundle.time_grid, dtype=np.float64),
+                _limiter_reference_time_grid(reference_time_grid),
+                max_dt_factor=None if max_dt_factor is None else float(max_dt_factor),
+                max_neighbor_ratio=None if max_neighbor_ratio is None else float(max_neighbor_ratio),
+            )
+            bundle = type(bundle)(
+                timesteps=limited_time_grid[:-1].copy(),
+                time_grid=limited_time_grid,
+                tau_grid=bundle.tau_grid,
+                g_grid=bundle.g_grid,
+                meta={**bundle.meta, **limiter_meta},
+            )
+        bundle.save(output_root / f"nfe_{int(effective_nfe):03d}")
 
 
 def export_diffusers(args: argparse.Namespace) -> None:
@@ -831,7 +944,7 @@ def export_diffusers(args: argparse.Namespace) -> None:
             "calibration_solver": profile_meta["calibration_solver"],
             "clock_config": args.clock_config,
             "clock_model_output_type": str(clock_config["model_output_type"]),
-            "estimator": ESTIMATOR_NAME,
+            "estimator": str(clock_config["estimator"]),
             "shared_profile_dir": str(cache_dir),
             "shared_profile_meta": profile_meta,
             "schedule_implementation_version": DEFECT_BALANCED_CLOCK_VERSION,

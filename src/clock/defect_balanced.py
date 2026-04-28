@@ -110,6 +110,95 @@ def _refined_step(step_fn: StepFn, sample: torch.Tensor, start: float, end: floa
     return current
 
 
+def nonuniform_second_derivative(f_k, f_km1, f_km2, h1: float, h2: float):
+    h1_tensor = torch.as_tensor(float(h1), device=f_k.device, dtype=f_k.dtype)
+    h2_tensor = torch.as_tensor(float(h2), device=f_k.device, dtype=f_k.dtype)
+    return (
+        2
+        / (h1_tensor * h2_tensor * (h1_tensor + h2_tensor))
+        * (f_km2 * h1_tensor - f_km1 * (h1_tensor + h2_tensor) + f_k * h2_tensor)
+    )
+
+
+def collect_velocity_curvature_stats(
+    *,
+    initial_sample: torch.Tensor,
+    physical_grid: np.ndarray,
+    velocity_fn: VelocityFn,
+    pilot_step_fn: StepFn,
+    pilot_pieces: int = 4,
+    observation_microbatch: int | None = None,
+    q_const: float = 3.0,
+    eps: float = 1.0e-12,
+    defect_clip_quantile: float | None = None,
+) -> StepRefinementStats:
+    grid = np.asarray(physical_grid, dtype=np.float64)
+    if grid.ndim != 1 or len(grid) < 2:
+        raise ValueError("physical_grid must be a 1D array with at least two points.")
+    if q_const <= 1.0:
+        raise ValueError("q_const must be greater than 1.")
+    if pilot_pieces < 1:
+        raise ValueError("pilot_pieces must be positive.")
+    if defect_clip_quantile is not None and not 0.0 < float(defect_clip_quantile) <= 1.0:
+        raise ValueError("defect_clip_quantile must be in (0, 1].")
+
+    def evaluate_velocity(sample: torch.Tensor, coordinate: float) -> torch.Tensor:
+        coordinate_tensor = torch.as_tensor(float(coordinate), device=sample.device, dtype=sample.dtype)
+        return velocity_fn(sample, coordinate_tensor)
+
+    current = initial_sample.detach()
+    velocities = [
+        _microbatch_map(
+            current,
+            microbatch_size=observation_microbatch,
+            fn=lambda batch: evaluate_velocity(batch, float(grid[0])),
+        ).detach()
+    ]
+    for index in range(len(grid) - 1):
+        start = float(grid[index])
+        end = float(grid[index + 1])
+        current = _microbatch_map(
+            current,
+            microbatch_size=observation_microbatch,
+            fn=lambda batch, s=start, e=end: _refined_step(pilot_step_fn, batch, s, e, pilot_pieces),
+        ).detach()
+        velocities.append(
+            _microbatch_map(
+                current,
+                microbatch_size=observation_microbatch,
+                fn=lambda batch, coordinate=end: evaluate_velocity(batch, coordinate),
+            ).detach()
+        )
+
+    defect = np.full((initial_sample.shape[0], len(grid) - 1), float(eps), dtype=np.float64)
+    for node_index in range(2, len(grid)):
+        h1 = abs(float(grid[node_index - 1]) - float(grid[node_index]))
+        h2 = abs(float(grid[node_index - 2]) - float(grid[node_index - 1]))
+        curvature = nonuniform_second_derivative(
+            velocities[node_index],
+            velocities[node_index - 1],
+            velocities[node_index - 2],
+            h1,
+            h2,
+        )
+        defect[:, node_index - 1] = per_sample_l2_norm(curvature).cpu().numpy()
+
+    if defect.shape[1] > 1:
+        defect[:, 0] = defect[:, 1]
+    defect = np.maximum(defect, float(eps))
+    if defect_clip_quantile is not None:
+        cap = float(np.quantile(defect, float(defect_clip_quantile)))
+        defect = np.minimum(defect, max(cap, float(eps)))
+
+    dummy = np.zeros_like(defect)
+    return StepRefinementStats(
+        full_step_error=dummy,
+        half_step_error=dummy,
+        effective_order=np.full_like(defect, float(q_const), dtype=np.float64),
+        defect_strength=defect,
+    )
+
+
 def estimate_refinement_order_and_defect(
     *,
     full_step_error: np.ndarray,

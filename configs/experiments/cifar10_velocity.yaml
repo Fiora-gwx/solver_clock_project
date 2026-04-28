@@ -1,4 +1,4 @@
-name: cifar10_partial
+name: cifar10_velocity_curvature_heun_q3
 backend: pndm
 
 base_config:
@@ -10,7 +10,7 @@ base_config:
   preview_samples: 8
   num_samples: 20000
   batch_size: 1024
-  clock_config: configs/clocks/SADB_stork_loose_adaptive.yaml
+  clock_config: configs/clocks/SADB_velocity_curvature_q3.yaml
 
 model_assets:
   - pndm_model_ddim_cifar10
