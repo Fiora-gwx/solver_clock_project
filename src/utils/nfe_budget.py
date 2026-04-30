@@ -4,12 +4,15 @@ from dataclasses import dataclass
 
 
 ONE_EVAL_SOLVERS = {
+    "base",
     "euler",
     "deis",
     "dpm_solver_lu",
     "dpm_solver_default",
     "dpm_solver_pp",
     "dpm_solverpp",
+    "sde_dpm_solver_pp",
+    "sde_dpmsolverpp",
     "unipc",
     "stork4_1st",
     "stork4_2nd",

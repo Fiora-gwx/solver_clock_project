@@ -17,3 +17,21 @@ models:
     image_size: 1024
     guidance_scale: 3.5
     calibration_num_samples: 2
+  stable_diffusion_15:
+    asset_key: hf_stable_diffusion_15
+    default_solver: dpm_solver_pp
+    image_size: 512
+    guidance_scale: 7.5
+    calibration_num_samples: 4
+  sdxl:
+    asset_key: hf_sdxl_base_10
+    default_solver: dpm_solver_pp
+    image_size: 1024
+    guidance_scale: 5.0
+    calibration_num_samples: 2
+  deepfloyd_if_stage1:
+    asset_key: hf_deepfloyd_if_stage1
+    default_solver: dpm_solver_pp
+    image_size: 64
+    guidance_scale: 7.0
+    calibration_num_samples: 2

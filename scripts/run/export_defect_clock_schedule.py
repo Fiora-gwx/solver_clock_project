@@ -110,9 +110,30 @@ def normalize_diffusers_solver(name: str) -> str:
     normalized = name.lower().replace("-", "_")
     if normalized == "heun2":
         return "flow_heun"
-    if normalized == "euler":
-        return "flow_euler"
     return normalized
+
+
+def _diffusers_solver_uses_flow_prediction(name: str) -> bool:
+    return normalize_diffusers_solver(name).startswith("flow_")
+
+
+def _build_diffusers_sigma_to_timestep_transform(scheduler):
+    if not hasattr(scheduler, "alphas_cumprod"):
+        raise RuntimeError(f"Scheduler {scheduler.__class__.__name__} does not expose alphas_cumprod.")
+    alphas = scheduler.alphas_cumprod.detach().float().cpu().numpy()
+    train_sigmas = np.sqrt(np.clip(1.0 - alphas, 0.0, None) / np.clip(alphas, 1.0e-12, None))
+    log_train_sigmas = np.log(np.clip(train_sigmas, 1.0e-10, None))
+    train_timesteps = np.arange(len(train_sigmas), dtype=np.float64)
+
+    def transform(sigmas: np.ndarray) -> np.ndarray:
+        values = np.asarray(sigmas, dtype=np.float64)
+        return np.interp(
+            np.log(np.clip(values, 1.0e-10, None)),
+            log_train_sigmas,
+            train_timesteps,
+        )
+
+    return transform
 
 
 def schedule_family_label() -> str:
@@ -635,7 +656,7 @@ def build_or_load_diffusers_profile(
     estimator = str(clock_config["estimator"])
     if estimator == VELOCITY_CURVATURE_ESTIMATOR_NAME:
         raise ValueError("velocity_curvature calibration is currently implemented for backend=pndm only.")
-    effective_model_output_type = "flow"
+    effective_model_output_type = "flow" if _diffusers_solver_uses_flow_prediction(target_solver) else str(clock_config["model_output_type"])
     physical_grid_size = int(clock_config.get("physical_grid_size", 65))
     smoothing_window = int(clock_config.get("smoothing_window", 1))
     epsilon = float(clock_config.get("epsilon", 1.0e-12))
@@ -930,6 +951,16 @@ def export_diffusers(args: argparse.Namespace) -> None:
         args=args,
         clock_config=clock_config,
     )
+    time_transform = None
+    if not _diffusers_solver_uses_flow_prediction(str(args.solver or "flow_euler")):
+        from src.adapters.diffusers import load_pipeline, replace_scheduler
+
+        pipeline = load_pipeline(manifest.path(args.model_asset), device="cuda", dtype_name=args.dtype)
+        replace_scheduler(pipeline, str(args.solver or "flow_euler"))
+        time_transform = _build_diffusers_sigma_to_timestep_transform(pipeline.scheduler)
+        del pipeline
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     export_clock_sweep(
         profile,
         target_nfes,
@@ -949,6 +980,7 @@ def export_diffusers(args: argparse.Namespace) -> None:
             "shared_profile_meta": profile_meta,
             "schedule_implementation_version": DEFECT_BALANCED_CLOCK_VERSION,
         },
+        time_transform=time_transform,
     )
 
 

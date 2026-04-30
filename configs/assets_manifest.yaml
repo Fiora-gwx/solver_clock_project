@@ -1,5 +1,4 @@
 project_root: /home/gwx/solver_clock_project
-
 assets:
   ays_published_inventory:
     type: metadata
@@ -13,9 +12,6 @@ assets:
   ays_published_deepfloyd_if_stage1_10step:
     type: schedule_bundle
     path: schedules/ays_like/published/deepfloyd_if_stage1/nfe_010
-  ays_published_stable_video_diffusion_10step:
-    type: schedule_bundle
-    path: schedules/ays_like/published/stable_video_diffusion/nfe_010
   pndm_model_ddim_cifar10:
     type: checkpoint
     path: checkpoints/pndm/models/ddim_cifar10.ckpt
@@ -55,3 +51,12 @@ assets:
   diffusers_practical_prompts:
     type: prompts
     path: data/pndm/prompts/modern_diffusers_practical_prompts.json
+  hf_stable_diffusion_15:
+    type: diffusers_model
+    path: checkpoints/hf/runwayml--stable-diffusion-v1-5
+  hf_sdxl_base_10:
+    type: diffusers_model
+    path: checkpoints/hf/stabilityai--stable-diffusion-xl-base-1.0
+  hf_deepfloyd_if_stage1:
+    type: diffusers_model
+    path: checkpoints/hf/DeepFloyd--IF-I-XL-v1.0

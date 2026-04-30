@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import torch
 
 from src.clock.calibration import ForwardNormCollector
@@ -28,6 +29,7 @@ _ensure_local_diffusers()
 from diffusers import (  # type: ignore  # noqa: E402
     DPMSolverMultistepScheduler,
     DiffusionPipeline,
+    EulerDiscreteScheduler,
     FlowMatchHeunDiscreteScheduler,
     UniPCMultistepScheduler,
 )
@@ -115,6 +117,10 @@ def _pipeline_kind(pipeline) -> str:
         return "flux"
     if "stablediffusion3" in name:
         return "sd3"
+    if "stablediffusionxl" in name:
+        return "sdxl"
+    if "stablediffusion" in name:
+        return "stable_diffusion"
     if "lumina2" in name:
         return "lumina2"
     raise ValueError(f"Unsupported diffusers pipeline for defect calibration: {pipeline.__class__.__name__}")
@@ -389,6 +395,255 @@ def _prepare_lumina2_defect_batch(
     return DiffusersDefectBatch(initial_latents=latents.detach(), sigma_max=sigma_max, velocity_fn=velocity_fn)
 
 
+def _scheduler_sigma_values(scheduler) -> torch.Tensor:
+    sigmas = getattr(scheduler, "sigmas", None)
+    if sigmas is None:
+        raise RuntimeError("The selected diffusers scheduler does not expose sigmas for defect calibration.")
+    return sigmas.detach().float().cpu() if isinstance(sigmas, torch.Tensor) else torch.tensor(sigmas, dtype=torch.float32)
+
+
+def _vp_timestep_from_sigma(scheduler, sigma: torch.Tensor) -> float:
+    if not hasattr(scheduler, "alphas_cumprod"):
+        raise RuntimeError(f"Scheduler {scheduler.__class__.__name__} does not expose alphas_cumprod.")
+    alphas = scheduler.alphas_cumprod.detach().float().cpu().numpy()
+    train_sigmas = np.sqrt(np.clip(1.0 - alphas, 0.0, None) / np.clip(alphas, 1.0e-12, None))
+    sigma_value = max(float(sigma.detach().float().reshape(()).cpu().item()), 1.0e-10)
+    return float(
+        np.interp(
+            np.log(sigma_value),
+            np.log(np.clip(train_sigmas, 1.0e-10, None)),
+            np.arange(len(train_sigmas), dtype=np.float64),
+        )
+    )
+
+
+def _prepare_sd_defect_latents(
+    pipeline,
+    *,
+    batch_size: int,
+    generator: torch.Generator,
+    height: int,
+    width: int,
+) -> tuple[torch.Tensor, float]:
+    device = get_pipeline_device(pipeline)
+    dtype = find_denoiser_module(pipeline).dtype
+    sigma_values = _scheduler_sigma_values(pipeline.scheduler)
+    sigma_max = float(sigma_values[0].item())
+    vae_scale_factor = getattr(pipeline, "vae_scale_factor", 8)
+    shape = (
+        batch_size,
+        int(pipeline.unet.config.in_channels),
+        height // vae_scale_factor,
+        width // vae_scale_factor,
+    )
+    latents = torch.randn(shape, generator=generator, device=device, dtype=dtype) * sigma_max
+    return latents, sigma_max
+
+
+def _prepare_stable_diffusion_defect_batch(
+    pipeline,
+    *,
+    prompt: str | list[str],
+    batch_size: int,
+    generator: torch.Generator,
+    height: int,
+    width: int,
+    guidance_scale: float,
+) -> DiffusersDefectBatch:
+    device = get_pipeline_device(pipeline)
+    do_cfg = guidance_scale > 1.0
+    prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(
+        prompt,
+        device,
+        1,
+        do_cfg,
+        negative_prompt=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        lora_scale=None,
+        clip_skip=None,
+    )
+    positive_prompt_embeds = prompt_embeds
+    negative_prompt_embeds = negative_prompt_embeds
+    latents, sigma_max = _prepare_sd_defect_latents(
+        pipeline,
+        batch_size=batch_size,
+        generator=generator,
+        height=height,
+        width=width,
+    )
+    timestep_cond = None
+    if getattr(pipeline.unet.config, "time_cond_proj_dim", None) is not None:
+        guidance = torch.tensor(guidance_scale - 1.0, device=device, dtype=latents.dtype).repeat(batch_size)
+        timestep_cond = pipeline.get_guidance_scale_embedding(
+            guidance,
+            embedding_dim=pipeline.unet.config.time_cond_proj_dim,
+        ).to(device=device, dtype=latents.dtype)
+
+    def velocity_fn(current_latents: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        batch = current_latents.shape[0]
+        timestep_value = _vp_timestep_from_sigma(pipeline.scheduler, sigma)
+        timestep = torch.full((batch,), timestep_value, device=current_latents.device, dtype=torch.float32)
+        latent_model_input = torch.cat([current_latents] * 2) if do_cfg else current_latents
+        sigma_value = sigma.reshape(()).to(device=current_latents.device, dtype=current_latents.dtype)
+        latent_model_input = latent_model_input / torch.sqrt(sigma_value.square() + 1.0)
+        active_prompt_embeds = (
+            torch.cat(
+                [
+                    _slice_batch_tensor(negative_prompt_embeds, batch),
+                    _slice_batch_tensor(positive_prompt_embeds, batch),
+                ],
+                dim=0,
+            )
+            if do_cfg
+            else _slice_batch_tensor(positive_prompt_embeds, batch)
+        )
+        noise_pred = pipeline.unet(
+            latent_model_input,
+            timestep,
+            encoder_hidden_states=active_prompt_embeds,
+            timestep_cond=_slice_batch_tensor(timestep_cond, batch),
+            cross_attention_kwargs=None,
+            added_cond_kwargs=None,
+            return_dict=False,
+        )[0]
+        if do_cfg:
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+        return noise_pred
+
+    return DiffusersDefectBatch(initial_latents=latents.detach(), sigma_max=sigma_max, velocity_fn=velocity_fn)
+
+
+def _prepare_sdxl_defect_batch(
+    pipeline,
+    *,
+    prompt: str | list[str],
+    batch_size: int,
+    generator: torch.Generator,
+    height: int,
+    width: int,
+    guidance_scale: float,
+) -> DiffusersDefectBatch:
+    device = get_pipeline_device(pipeline)
+    do_cfg = guidance_scale > 1.0
+    (
+        prompt_embeds,
+        negative_prompt_embeds,
+        pooled_prompt_embeds,
+        negative_pooled_prompt_embeds,
+    ) = pipeline.encode_prompt(
+        prompt=prompt,
+        prompt_2=None,
+        device=device,
+        num_images_per_prompt=1,
+        do_classifier_free_guidance=do_cfg,
+        negative_prompt=None,
+        negative_prompt_2=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        pooled_prompt_embeds=None,
+        negative_pooled_prompt_embeds=None,
+        lora_scale=None,
+        clip_skip=None,
+    )
+    positive_prompt_embeds = prompt_embeds
+    positive_add_text_embeds = pooled_prompt_embeds
+    negative_prompt_embeds = negative_prompt_embeds
+    negative_add_text_embeds = negative_pooled_prompt_embeds
+    if pipeline.text_encoder_2 is None:
+        text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
+    else:
+        text_encoder_projection_dim = pipeline.text_encoder_2.config.projection_dim
+    positive_add_time_ids = pipeline._get_add_time_ids(
+        (height, width),
+        (0, 0),
+        (height, width),
+        dtype=prompt_embeds.dtype,
+        text_encoder_projection_dim=text_encoder_projection_dim,
+    )
+    negative_add_time_ids = positive_add_time_ids
+    positive_prompt_embeds = positive_prompt_embeds.to(device)
+    negative_prompt_embeds = negative_prompt_embeds.to(device)
+    positive_add_text_embeds = positive_add_text_embeds.to(device)
+    negative_add_text_embeds = negative_add_text_embeds.to(device)
+    positive_add_time_ids = positive_add_time_ids.to(device).repeat(batch_size, 1)
+    negative_add_time_ids = negative_add_time_ids.to(device).repeat(batch_size, 1)
+    latents, sigma_max = _prepare_sd_defect_latents(
+        pipeline,
+        batch_size=batch_size,
+        generator=generator,
+        height=height,
+        width=width,
+    )
+    timestep_cond = None
+    if getattr(pipeline.unet.config, "time_cond_proj_dim", None) is not None:
+        guidance = torch.tensor(guidance_scale - 1.0, device=device, dtype=latents.dtype).repeat(batch_size)
+        timestep_cond = pipeline.get_guidance_scale_embedding(
+            guidance,
+            embedding_dim=pipeline.unet.config.time_cond_proj_dim,
+        ).to(device=device, dtype=latents.dtype)
+
+    def velocity_fn(current_latents: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        batch = current_latents.shape[0]
+        timestep_value = _vp_timestep_from_sigma(pipeline.scheduler, sigma)
+        timestep = torch.full((batch,), timestep_value, device=current_latents.device, dtype=torch.float32)
+        latent_model_input = torch.cat([current_latents] * 2) if do_cfg else current_latents
+        sigma_value = sigma.reshape(()).to(device=current_latents.device, dtype=current_latents.dtype)
+        latent_model_input = latent_model_input / torch.sqrt(sigma_value.square() + 1.0)
+        active_prompt_embeds = (
+            torch.cat(
+                [
+                    _slice_batch_tensor(negative_prompt_embeds, batch),
+                    _slice_batch_tensor(positive_prompt_embeds, batch),
+                ],
+                dim=0,
+            )
+            if do_cfg
+            else _slice_batch_tensor(positive_prompt_embeds, batch)
+        )
+        active_add_text_embeds = (
+            torch.cat(
+                [
+                    _slice_batch_tensor(negative_add_text_embeds, batch),
+                    _slice_batch_tensor(positive_add_text_embeds, batch),
+                ],
+                dim=0,
+            )
+            if do_cfg
+            else _slice_batch_tensor(positive_add_text_embeds, batch)
+        )
+        active_add_time_ids = (
+            torch.cat(
+                [
+                    _slice_batch_tensor(negative_add_time_ids, batch),
+                    _slice_batch_tensor(positive_add_time_ids, batch),
+                ],
+                dim=0,
+            )
+            if do_cfg
+            else _slice_batch_tensor(positive_add_time_ids, batch)
+        )
+        noise_pred = pipeline.unet(
+            latent_model_input,
+            timestep,
+            encoder_hidden_states=active_prompt_embeds,
+            timestep_cond=_slice_batch_tensor(timestep_cond, batch),
+            cross_attention_kwargs=None,
+            added_cond_kwargs={
+                "text_embeds": active_add_text_embeds,
+                "time_ids": active_add_time_ids,
+            },
+            return_dict=False,
+        )[0]
+        if do_cfg:
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+        return noise_pred
+
+    return DiffusersDefectBatch(initial_latents=latents.detach(), sigma_max=sigma_max, velocity_fn=velocity_fn)
+
+
 def prepare_defect_batch(
     pipeline,
     *,
@@ -432,6 +687,26 @@ def prepare_defect_batch(
             width=width,
             guidance_scale=guidance_scale,
         )
+    if kind == "stable_diffusion":
+        return _prepare_stable_diffusion_defect_batch(
+            pipeline,
+            prompt=prompt,
+            batch_size=batch_size,
+            generator=generator,
+            height=height,
+            width=width,
+            guidance_scale=guidance_scale,
+        )
+    if kind == "sdxl":
+        return _prepare_sdxl_defect_batch(
+            pipeline,
+            prompt=prompt,
+            batch_size=batch_size,
+            generator=generator,
+            height=height,
+            width=width,
+            guidance_scale=guidance_scale,
+        )
     raise ValueError(f"Unsupported diffusers pipeline for defect calibration: {pipeline.__class__.__name__}")
 
 
@@ -441,7 +716,9 @@ def replace_scheduler(pipeline, solver_name: str):
         return pipeline
 
     shift = getattr(pipeline.scheduler.config, "shift", 1.0)
-    if solver == "flow_heun":
+    if solver == "euler":
+        pipeline.scheduler = EulerDiscreteScheduler.from_config(pipeline.scheduler.config)
+    elif solver == "flow_heun":
         pipeline.scheduler = FlowMatchHeunDiscreteScheduler.from_config(pipeline.scheduler.config, shift=shift)
     elif solver == "flow_dpm_solver":
         pipeline.scheduler = DPMSolverMultistepScheduler.from_config(
@@ -456,6 +733,18 @@ def replace_scheduler(pipeline, solver_name: str):
             use_flow_sigmas=True,
             prediction_type="flow_prediction",
             flow_shift=shift,
+        )
+    elif solver in {"dpm_solver_pp", "dpm_solverpp"}:
+        pipeline.scheduler = DPMSolverMultistepScheduler.from_config(
+            pipeline.scheduler.config,
+            algorithm_type="dpmsolver++",
+            solver_order=2,
+        )
+    elif solver in {"sde_dpm_solver_pp", "sde_dpmsolverpp"}:
+        pipeline.scheduler = DPMSolverMultistepScheduler.from_config(
+            pipeline.scheduler.config,
+            algorithm_type="sde-dpmsolver++",
+            solver_order=2,
         )
     elif solver in {"flow_stork4_1st", "flow_stork_4_1st"}:
         pipeline.scheduler = STORKScheduler.from_config(
@@ -546,10 +835,10 @@ def build_pipeline_kwargs(
             if sigmas is not None:
                 kwargs["sigmas"] = sigmas
                 kwargs["num_inference_steps"] = len(sigmas)
+        elif "timesteps" in parameters and schedule_bundle.timesteps is not None:
+            kwargs["timesteps"] = [int(x) for x in schedule_bundle.timesteps.tolist()]
         elif "sigmas" in parameters and schedule_bundle.sigmas is not None:
             kwargs["sigmas"] = schedule_bundle.sigmas.tolist()
-        elif "timesteps" in parameters and schedule_bundle.timesteps is not None:
-            kwargs["timesteps"] = schedule_bundle.timesteps.tolist()
     return kwargs
 
 

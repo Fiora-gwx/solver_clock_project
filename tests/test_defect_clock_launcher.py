@@ -142,6 +142,73 @@ def test_build_invocations_expands_sadb_schedules_for_pndm_and_diffusers() -> No
     assert any("SADB" in str(invocation.schedule_dir) for invocation in diffusers_invocations)
 
 
+def test_build_invocations_expands_diffusers_seeds_and_published_ays() -> None:
+    args = _build_args()
+    config = {
+        "name": "diffusers_ays_seeds",
+        "backend": "diffusers",
+        "models": ["stable_diffusion_15"],
+        "solvers": ["dpm_solver_pp"],
+        "schedules": ["base", "AYS"],
+        "nfes": [10],
+        "seeds": [0, 1, 2],
+    }
+    execution = resolve_execution_config(config, args)
+    invocations = build_invocations(args, config, execution_config=execution)
+    assert len(invocations) == 6
+    labels = [invocation.label for invocation in invocations]
+    assert any(":base:seed_002:nfe_010" in label for label in labels)
+    ays_invocations = [invocation for invocation in invocations if ":ays:" in invocation.label]
+    assert len(ays_invocations) == 3
+    assert all("schedules/ays_like/published/stable_diffusion_15/nfe_010" in str(item.schedule_dir) for item in ays_invocations)
+    assert all("seed_" in str(item.output_dir) for item in invocations)
+
+
+def test_build_invocations_rejects_non_10_step_published_diffusers_ays() -> None:
+    args = _build_args()
+    config = {
+        "name": "diffusers_bad_ays_nfe",
+        "backend": "diffusers",
+        "models": ["stable_diffusion_15"],
+        "solvers": ["dpm_solver_pp"],
+        "schedules": ["AYS"],
+        "nfes": [8],
+    }
+    execution = resolve_execution_config(config, args)
+    try:
+        build_invocations(args, config, execution_config=execution)
+    except ValueError as error:
+        assert "10-step only" in str(error)
+    else:
+        raise AssertionError("Expected published diffusers AYS to reject nfe != 10.")
+
+
+def test_build_invocations_expands_labeled_sadb_clock_variants() -> None:
+    args = _build_args()
+    config = {
+        "name": "diffusers_sadb_variants",
+        "backend": "diffusers",
+        "models": ["stable_diffusion_15"],
+        "solvers": ["dpm_solver_pp"],
+        "schedules": ["SADB"],
+        "nfes": [10],
+        "seeds": [0],
+        "schedule_clock_configs": {
+            "SADB": {
+                "small": "configs/clocks/SADB_diffusers_sd_small.yaml",
+                "medium": "configs/clocks/SADB_diffusers_sd_medium.yaml",
+            }
+        },
+    }
+    execution = resolve_execution_config(config, args)
+    invocations = build_invocations(args, config, execution_config=execution)
+    assert len(invocations) == 2
+    assert {invocation.label.split(":")[3] for invocation in invocations} == {"SADB[small]", "SADB[medium]"}
+    assert all(invocation.prepare_steps for invocation in invocations)
+    assert any("/small/" in str(invocation.schedule_dir) for invocation in invocations)
+    assert any("/medium/" in str(invocation.schedule_dir) for invocation in invocations)
+
+
 def test_build_invocations_rejects_custom_schedules_for_dpm_solver() -> None:
     args = _build_args()
     pndm_config = {

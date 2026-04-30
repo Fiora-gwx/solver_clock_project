@@ -1,6 +1,6 @@
 clock:
   family: SADB
-  calibration_solver: euler
+  calibration_solver: heun2
   model_output_type: epsilon
 
   physical_grid_size: 65
@@ -16,7 +16,7 @@ clock:
   cache_path: outputs/cache/sadb_profiles
 
   # Loose step-size limiter
-  max_dt_factor: 2.5
+  max_dt_factor: 1.5
   max_neighbor_dt_ratio: 4.0
 
   # STORK adaptive s
@@ -24,5 +24,7 @@ clock:
   adaptive_s_max: 100
   adaptive_s_reference: base_dt
 
+  stork_first_step_factor: 0.5
+  stork_warmup_steps: 1
   # fallback only; run_experiment_config 会用 experiment 的 eval_nfes 覆盖
   target_nfes: [5, 7, 9, 11, 15, 23, 31]

@@ -1,0 +1,22 @@
+name: sd15_sdxl_practical_sadb
+backend: diffusers
+base_config:
+  prompt_asset: diffusers_practical_prompts
+  seeds: [0, 1, 2]
+  num_gpus: 4
+  prepare_schedules_first: true
+  materialize_schedules: true
+models:
+  - stable_diffusion_15
+  - sdxl
+solvers:
+  - dpm_solver_pp
+  - sde_dpm_solver_pp
+schedules:
+  - base
+  - AYS
+  - SADB
+schedule_clock_configs:
+  SADB: configs/clocks/SADB_diffusers_sd_medium.yaml
+eval_nfes: [10]
+metrics: [clipscore, imagereward]
