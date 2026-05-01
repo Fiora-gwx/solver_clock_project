@@ -8,9 +8,9 @@ import torch
 
 from src.clock.profile import ClockProfile, build_clock_profile_from_alpha
 
-StepFn = Callable[[torch.Tensor, float, float], torch.Tensor]
-VelocityFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-DEFECT_BALANCED_CLOCK_VERSION = 3
+StepFn = Callable[[torch.Tensor, float, float, int, int], torch.Tensor]
+VelocityFn = Callable[..., torch.Tensor]
+DEFECT_BALANCED_CLOCK_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -54,15 +54,42 @@ def _microbatch_map(
     sample: torch.Tensor,
     *,
     microbatch_size: int | None,
-    fn: Callable[[torch.Tensor], torch.Tensor],
+    fn: Callable[[torch.Tensor, int, int], torch.Tensor],
 ) -> torch.Tensor:
     if microbatch_size is None or microbatch_size <= 0 or microbatch_size >= sample.shape[0]:
-        return fn(sample)
+        return fn(sample, 0, sample.shape[0])
     outputs: list[torch.Tensor] = []
     for start in range(0, sample.shape[0], microbatch_size):
         stop = min(start + microbatch_size, sample.shape[0])
-        outputs.append(fn(sample[start:stop]))
+        outputs.append(fn(sample[start:stop], start, stop))
     return torch.cat(outputs, dim=0)
+
+
+def _call_velocity(
+    velocity_fn: VelocityFn,
+    sample: torch.Tensor,
+    coordinate: torch.Tensor,
+    sample_start: int,
+    sample_stop: int,
+) -> torch.Tensor:
+    try:
+        return velocity_fn(sample, coordinate, sample_start, sample_stop)
+    except TypeError:
+        return velocity_fn(sample, coordinate)
+
+
+def _call_step(
+    step_fn: StepFn,
+    sample: torch.Tensor,
+    coordinate_start: float,
+    coordinate_end: float,
+    sample_start: int,
+    sample_stop: int,
+) -> torch.Tensor:
+    try:
+        return step_fn(sample, coordinate_start, coordinate_end, sample_start, sample_stop)
+    except TypeError:
+        return step_fn(sample, coordinate_start, coordinate_end)
 
 
 def euler_step(
@@ -70,10 +97,12 @@ def euler_step(
     sample: torch.Tensor,
     coordinate_start: float,
     coordinate_end: float,
+    sample_start: int = 0,
+    sample_stop: int | None = None,
 ) -> torch.Tensor:
     step = float(coordinate_end) - float(coordinate_start)
     coordinate = torch.as_tensor(float(coordinate_start), device=sample.device, dtype=sample.dtype)
-    return sample + velocity_fn(sample, coordinate) * step
+    return sample + _call_velocity(velocity_fn, sample, coordinate, sample_start, sample.shape[0] if sample_stop is None else sample_stop) * step
 
 
 def heun2_step(
@@ -81,32 +110,48 @@ def heun2_step(
     sample: torch.Tensor,
     coordinate_start: float,
     coordinate_end: float,
+    sample_start: int = 0,
+    sample_stop: int | None = None,
 ) -> torch.Tensor:
     step = float(coordinate_end) - float(coordinate_start)
     start = torch.as_tensor(float(coordinate_start), device=sample.device, dtype=sample.dtype)
     end = torch.as_tensor(float(coordinate_end), device=sample.device, dtype=sample.dtype)
-    velocity_start = velocity_fn(sample, start)
+    resolved_stop = sample.shape[0] if sample_stop is None else sample_stop
+    velocity_start = _call_velocity(velocity_fn, sample, start, sample_start, resolved_stop)
     predicted = sample + velocity_start * step
-    velocity_end = velocity_fn(predicted, end)
+    velocity_end = _call_velocity(velocity_fn, predicted, end, sample_start, resolved_stop)
     return sample + 0.5 * (velocity_start + velocity_end) * step
 
 
 def build_velocity_stepper(velocity_fn: VelocityFn, method: str) -> StepFn:
     normalized = str(method).lower().replace("-", "_")
     if normalized in {"euler", "flow_euler"}:
-        return lambda sample, start, end: euler_step(velocity_fn, sample, start, end)
+        return lambda sample, start, end, sample_start, sample_stop: euler_step(
+            velocity_fn, sample, start, end, sample_start, sample_stop
+        )
     if normalized in {"heun2", "flow_heun"}:
-        return lambda sample, start, end: heun2_step(velocity_fn, sample, start, end)
+        return lambda sample, start, end, sample_start, sample_stop: heun2_step(
+            velocity_fn, sample, start, end, sample_start, sample_stop
+        )
     raise ValueError(f"Unsupported velocity-based refinement solver: {method}")
 
 
-def _refined_step(step_fn: StepFn, sample: torch.Tensor, start: float, end: float, pieces: int) -> torch.Tensor:
+def _refined_step(
+    step_fn: StepFn,
+    sample: torch.Tensor,
+    start: float,
+    end: float,
+    pieces: int,
+    sample_start: int = 0,
+    sample_stop: int | None = None,
+) -> torch.Tensor:
     if pieces < 1:
         raise ValueError("pieces must be positive.")
     current = sample
     nodes = np.linspace(float(start), float(end), int(pieces) + 1, dtype=np.float64)
+    resolved_stop = sample.shape[0] if sample_stop is None else sample_stop
     for index in range(int(pieces)):
-        current = step_fn(current, float(nodes[index]), float(nodes[index + 1]))
+        current = _call_step(step_fn, current, float(nodes[index]), float(nodes[index + 1]), sample_start, resolved_stop)
     return current
 
 
@@ -142,16 +187,16 @@ def collect_velocity_curvature_stats(
     if defect_clip_quantile is not None and not 0.0 < float(defect_clip_quantile) <= 1.0:
         raise ValueError("defect_clip_quantile must be in (0, 1].")
 
-    def evaluate_velocity(sample: torch.Tensor, coordinate: float) -> torch.Tensor:
+    def evaluate_velocity(sample: torch.Tensor, coordinate: float, sample_start: int, sample_stop: int) -> torch.Tensor:
         coordinate_tensor = torch.as_tensor(float(coordinate), device=sample.device, dtype=sample.dtype)
-        return velocity_fn(sample, coordinate_tensor)
+        return _call_velocity(velocity_fn, sample, coordinate_tensor, sample_start, sample_stop)
 
     current = initial_sample.detach()
     velocities = [
         _microbatch_map(
             current,
             microbatch_size=observation_microbatch,
-            fn=lambda batch: evaluate_velocity(batch, float(grid[0])),
+            fn=lambda batch, batch_start, batch_stop: evaluate_velocity(batch, float(grid[0]), batch_start, batch_stop),
         ).detach()
     ]
     for index in range(len(grid) - 1):
@@ -160,13 +205,17 @@ def collect_velocity_curvature_stats(
         current = _microbatch_map(
             current,
             microbatch_size=observation_microbatch,
-            fn=lambda batch, s=start, e=end: _refined_step(pilot_step_fn, batch, s, e, pilot_pieces),
+            fn=lambda batch, batch_start, batch_stop, s=start, e=end: _refined_step(
+                pilot_step_fn, batch, s, e, pilot_pieces, batch_start, batch_stop
+            ),
         ).detach()
         velocities.append(
             _microbatch_map(
                 current,
                 microbatch_size=observation_microbatch,
-                fn=lambda batch, coordinate=end: evaluate_velocity(batch, coordinate),
+                fn=lambda batch, batch_start, batch_stop, coordinate=end: evaluate_velocity(
+                    batch, coordinate, batch_start, batch_stop
+                ),
             ).detach()
         )
 
@@ -254,17 +303,23 @@ def collect_step_refinement_stats(
         full = _microbatch_map(
             current,
             microbatch_size=observation_microbatch,
-            fn=lambda batch, s=start, e=end: _refined_step(step_fn, batch, s, e, 1),
+            fn=lambda batch, batch_start, batch_stop, s=start, e=end: _refined_step(
+                step_fn, batch, s, e, 1, batch_start, batch_stop
+            ),
         )
         half = _microbatch_map(
             current,
             microbatch_size=observation_microbatch,
-            fn=lambda batch, s=start, e=end: _refined_step(step_fn, batch, s, e, 2),
+            fn=lambda batch, batch_start, batch_stop, s=start, e=end: _refined_step(
+                step_fn, batch, s, e, 2, batch_start, batch_stop
+            ),
         )
         quarter = _microbatch_map(
             current,
             microbatch_size=observation_microbatch,
-            fn=lambda batch, s=start, e=end: _refined_step(step_fn, batch, s, e, 4),
+            fn=lambda batch, batch_start, batch_stop, s=start, e=end: _refined_step(
+                step_fn, batch, s, e, 4, batch_start, batch_stop
+            ),
         )
         full_errors.append(per_sample_l2_norm(full - half).cpu().numpy())
         half_errors.append(per_sample_l2_norm(half - quarter).cpu().numpy())

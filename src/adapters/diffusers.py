@@ -138,15 +138,16 @@ def _scheduler_mu_kwargs(pipeline, *, height: int, width: int) -> dict[str, floa
     return {}
 
 
-def _slice_batch_tensor(tensor: torch.Tensor | None, batch_size: int) -> torch.Tensor | None:
+def _slice_batch_tensor(tensor: torch.Tensor | None, batch_size: int, batch_start: int = 0) -> torch.Tensor | None:
     if tensor is None:
         return None
     if tensor.ndim == 0:
         return tensor
-    if tensor.shape[0] == batch_size:
+    if tensor.shape[0] == batch_size and batch_start == 0:
         return tensor
-    if tensor.shape[0] > batch_size:
-        return tensor[:batch_size]
+    batch_stop = int(batch_start) + int(batch_size)
+    if tensor.shape[0] >= batch_stop:
+        return tensor[int(batch_start) : batch_stop]
     if tensor.shape[0] == 1:
         expand_shape = (batch_size, *tensor.shape[1:])
         return tensor.expand(*expand_shape)
@@ -159,6 +160,7 @@ def build_defect_sigma_grid(
     physical_grid_size: int,
     height: int,
     width: int,
+    physical_grid_mode: str = "scheduler_sigmas",
 ) -> np.ndarray:
     if physical_grid_size < 2:
         raise ValueError("physical_grid_size must be at least 2.")
@@ -168,9 +170,54 @@ def build_defect_sigma_grid(
     raw_sigmas = getattr(pipeline.scheduler, "sigmas", None)
     if raw_sigmas is None:
         raise RuntimeError("The selected diffusers scheduler does not expose a sigma sequence for defect calibration.")
-    sigma_tensor = raw_sigmas.detach().float() if isinstance(raw_sigmas, torch.Tensor) else torch.tensor(raw_sigmas, dtype=torch.float32)
-    sigma_max = float(sigma_tensor[0].item())
-    return np.linspace(sigma_max, 0.0, physical_grid_size, dtype=np.float64)
+    sigma_tensor = raw_sigmas.detach().float().cpu() if isinstance(raw_sigmas, torch.Tensor) else torch.tensor(raw_sigmas, dtype=torch.float32)
+    scheduler_sigmas = sigma_tensor.numpy().astype(np.float64)
+    positive_sigmas = scheduler_sigmas[scheduler_sigmas > 0.0]
+    if len(positive_sigmas) == 0:
+        raise RuntimeError("The selected diffusers scheduler produced no positive sigma values for defect calibration.")
+    sigma_max = float(positive_sigmas[0])
+    sigma_min = float(positive_sigmas[-1])
+    mode = str(physical_grid_mode).lower()
+    if mode == "linear_sigma":
+        sigma_values = np.linspace(sigma_max, 0.0, physical_grid_size, dtype=np.float64)
+    elif mode == "scheduler_sigmas":
+        if len(scheduler_sigmas) >= physical_grid_size:
+            sigma_values = scheduler_sigmas[:physical_grid_size].astype(np.float64)
+        else:
+            sigma_values = np.concatenate([positive_sigmas, np.asarray([0.0], dtype=np.float64)])
+        if len(sigma_values) != physical_grid_size:
+            x_old = np.linspace(0.0, 1.0, len(sigma_values), dtype=np.float64)
+            x_new = np.linspace(0.0, 1.0, physical_grid_size, dtype=np.float64)
+            sigma_values = np.interp(x_new, x_old, sigma_values)
+        sigma_values[-1] = 0.0
+    elif mode == "log_sigma":
+        sigma_values = np.concatenate(
+            [
+                np.exp(np.linspace(math.log(sigma_max), math.log(max(sigma_min, 1.0e-12)), physical_grid_size - 1)),
+                np.asarray([0.0], dtype=np.float64),
+            ]
+        )
+    elif mode == "karras_sigma":
+        rho = 7.0
+        ramp = np.linspace(0.0, 1.0, physical_grid_size - 1, dtype=np.float64)
+        min_inv_rho = max(sigma_min, 1.0e-12) ** (1.0 / rho)
+        max_inv_rho = sigma_max ** (1.0 / rho)
+        sigma_values = np.concatenate(
+            [
+                (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho,
+                np.asarray([0.0], dtype=np.float64),
+            ]
+        )
+    else:
+        raise ValueError(
+            "physical_grid_mode must be one of: linear_sigma, scheduler_sigmas, log_sigma, karras_sigma."
+        )
+    if len(sigma_values) != physical_grid_size:
+        raise RuntimeError(f"Expected physical grid length {physical_grid_size}, got {len(sigma_values)}.")
+    if np.any(np.diff(sigma_values) > 1.0e-8):
+        raise RuntimeError("Defect sigma grid must be non-increasing.")
+    sigma_values[-1] = 0.0
+    return sigma_values.astype(np.float64)
 
 
 def _prepare_flux_defect_batch(
@@ -212,7 +259,12 @@ def _prepare_flux_defect_batch(
     if getattr(pipeline.transformer.config, "guidance_embeds", False):
         guidance = torch.full((batch_size,), guidance_scale, device=device, dtype=torch.float32)
 
-    def velocity_fn(current_latents: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    def velocity_fn(
+        current_latents: torch.Tensor,
+        sigma: torch.Tensor,
+        batch_start: int = 0,
+        batch_stop: int | None = None,
+    ) -> torch.Tensor:
         del scheduler_kwargs
         batch = current_latents.shape[0]
         timestep = (sigma.reshape(()).to(device=current_latents.device, dtype=current_latents.dtype) * float(pipeline.scheduler.config.num_train_timesteps))
@@ -220,9 +272,9 @@ def _prepare_flux_defect_batch(
         return pipeline.transformer(
             hidden_states=current_latents,
             timestep=timestep,
-            guidance=_slice_batch_tensor(guidance, batch),
-            pooled_projections=_slice_batch_tensor(pooled_prompt_embeds, batch),
-            encoder_hidden_states=_slice_batch_tensor(prompt_embeds, batch),
+            guidance=_slice_batch_tensor(guidance, batch, batch_start),
+            pooled_projections=_slice_batch_tensor(pooled_prompt_embeds, batch, batch_start),
+            encoder_hidden_states=_slice_batch_tensor(prompt_embeds, batch, batch_start),
             txt_ids=text_ids,
             img_ids=latent_image_ids,
             joint_attention_kwargs=None,
@@ -280,7 +332,12 @@ def _prepare_sd3_defect_batch(
     )
     sigma_max = float(build_defect_sigma_grid(pipeline, physical_grid_size=3, height=height, width=width)[0])
 
-    def velocity_fn(current_latents: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    def velocity_fn(
+        current_latents: torch.Tensor,
+        sigma: torch.Tensor,
+        batch_start: int = 0,
+        batch_stop: int | None = None,
+    ) -> torch.Tensor:
         batch = current_latents.shape[0]
         timestep_scalar = sigma.reshape(()).to(device=current_latents.device, dtype=current_latents.dtype)
         timestep_scalar = timestep_scalar * float(pipeline.scheduler.config.num_train_timesteps)
@@ -291,13 +348,16 @@ def _prepare_sd3_defect_batch(
                 hidden_states=latent_input,
                 timestep=timestep,
                 encoder_hidden_states=torch.cat(
-                    [_slice_batch_tensor(negative_prompt_embeds, batch), _slice_batch_tensor(prompt_embeds, batch)],
+                    [
+                        _slice_batch_tensor(negative_prompt_embeds, batch, batch_start),
+                        _slice_batch_tensor(prompt_embeds, batch, batch_start),
+                    ],
                     dim=0,
                 ),
                 pooled_projections=torch.cat(
                     [
-                        _slice_batch_tensor(negative_pooled_prompt_embeds, batch),
-                        _slice_batch_tensor(pooled_prompt_embeds, batch),
+                        _slice_batch_tensor(negative_pooled_prompt_embeds, batch, batch_start),
+                        _slice_batch_tensor(pooled_prompt_embeds, batch, batch_start),
                     ],
                     dim=0,
                 ),
@@ -311,8 +371,8 @@ def _prepare_sd3_defect_batch(
         return pipeline.transformer(
             hidden_states=current_latents,
             timestep=timestep,
-            encoder_hidden_states=_slice_batch_tensor(prompt_embeds, batch),
-            pooled_projections=_slice_batch_tensor(pooled_prompt_embeds, batch),
+            encoder_hidden_states=_slice_batch_tensor(prompt_embeds, batch, batch_start),
+            pooled_projections=_slice_batch_tensor(pooled_prompt_embeds, batch, batch_start),
             joint_attention_kwargs=None,
             return_dict=False,
         )[0]
@@ -363,15 +423,20 @@ def _prepare_lumina2_defect_batch(
     )
     sigma_max = float(build_defect_sigma_grid(pipeline, physical_grid_size=3, height=height, width=width)[0])
 
-    def velocity_fn(current_latents: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    def velocity_fn(
+        current_latents: torch.Tensor,
+        sigma: torch.Tensor,
+        batch_start: int = 0,
+        batch_stop: int | None = None,
+    ) -> torch.Tensor:
         batch = current_latents.shape[0]
         current_timestep = 1.0 - sigma.reshape(()).to(device=current_latents.device, dtype=current_latents.dtype)
         current_timestep = current_timestep.expand(current_latents.shape[0])
         noise_pred_cond = pipeline.transformer(
             hidden_states=current_latents,
             timestep=current_timestep,
-            encoder_hidden_states=_slice_batch_tensor(prompt_embeds, batch),
-            encoder_attention_mask=_slice_batch_tensor(prompt_attention_mask, batch),
+            encoder_hidden_states=_slice_batch_tensor(prompt_embeds, batch, batch_start),
+            encoder_attention_mask=_slice_batch_tensor(prompt_attention_mask, batch, batch_start),
             return_dict=False,
             attention_kwargs=None,
         )[0]
@@ -381,8 +446,8 @@ def _prepare_lumina2_defect_batch(
         noise_pred_uncond = pipeline.transformer(
             hidden_states=current_latents,
             timestep=current_timestep,
-            encoder_hidden_states=_slice_batch_tensor(negative_prompt_embeds, batch),
-            encoder_attention_mask=_slice_batch_tensor(negative_prompt_attention_mask, batch),
+            encoder_hidden_states=_slice_batch_tensor(negative_prompt_embeds, batch, batch_start),
+            encoder_attention_mask=_slice_batch_tensor(negative_prompt_attention_mask, batch, batch_start),
             return_dict=False,
             attention_kwargs=None,
         )[0]
@@ -481,25 +546,29 @@ def _prepare_stable_diffusion_defect_batch(
             embedding_dim=pipeline.unet.config.time_cond_proj_dim,
         ).to(device=device, dtype=latents.dtype)
 
-    def velocity_fn(current_latents: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    def velocity_fn(
+        current_latents: torch.Tensor,
+        sigma: torch.Tensor,
+        batch_start: int = 0,
+        batch_stop: int | None = None,
+    ) -> torch.Tensor:
         batch = current_latents.shape[0]
         timestep_value = _vp_timestep_from_sigma(pipeline.scheduler, sigma)
         latent_model_input = torch.cat([current_latents] * 2) if do_cfg else current_latents
         timestep = torch.full((latent_model_input.shape[0],), timestep_value, device=current_latents.device, dtype=torch.float32)
         sigma_value = sigma.reshape(()).to(device=current_latents.device, dtype=current_latents.dtype)
         latent_model_input = latent_model_input / torch.sqrt(sigma_value.square() + 1.0)
-        active_prompt_embeds = (
-            torch.cat(
+        if do_cfg:
+            active_prompt_embeds = torch.cat(
                 [
-                    _slice_batch_tensor(negative_prompt_embeds, batch),
-                    _slice_batch_tensor(positive_prompt_embeds, batch),
+                    _slice_batch_tensor(negative_prompt_embeds, batch, batch_start),
+                    _slice_batch_tensor(positive_prompt_embeds, batch, batch_start),
                 ],
                 dim=0,
             )
-            if do_cfg
-            else _slice_batch_tensor(positive_prompt_embeds, batch)
-        )
-        active_timestep_cond = _slice_batch_tensor(timestep_cond, batch)
+        else:
+            active_prompt_embeds = _slice_batch_tensor(positive_prompt_embeds, batch, batch_start)
+        active_timestep_cond = _slice_batch_tensor(timestep_cond, batch, batch_start)
         if do_cfg and active_timestep_cond is not None:
             active_timestep_cond = torch.cat([active_timestep_cond, active_timestep_cond], dim=0)
         noise_pred = pipeline.unet(
@@ -588,47 +657,51 @@ def _prepare_sdxl_defect_batch(
             embedding_dim=pipeline.unet.config.time_cond_proj_dim,
         ).to(device=device, dtype=latents.dtype)
 
-    def velocity_fn(current_latents: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    def velocity_fn(
+        current_latents: torch.Tensor,
+        sigma: torch.Tensor,
+        batch_start: int = 0,
+        batch_stop: int | None = None,
+    ) -> torch.Tensor:
         batch = current_latents.shape[0]
         timestep_value = _vp_timestep_from_sigma(pipeline.scheduler, sigma)
         latent_model_input = torch.cat([current_latents] * 2) if do_cfg else current_latents
         timestep = torch.full((latent_model_input.shape[0],), timestep_value, device=current_latents.device, dtype=torch.float32)
         sigma_value = sigma.reshape(()).to(device=current_latents.device, dtype=current_latents.dtype)
         latent_model_input = latent_model_input / torch.sqrt(sigma_value.square() + 1.0)
-        active_prompt_embeds = (
-            torch.cat(
+        if do_cfg:
+            active_prompt_embeds = torch.cat(
                 [
-                    _slice_batch_tensor(negative_prompt_embeds, batch),
-                    _slice_batch_tensor(positive_prompt_embeds, batch),
+                    _slice_batch_tensor(negative_prompt_embeds, batch, batch_start),
+                    _slice_batch_tensor(positive_prompt_embeds, batch, batch_start),
                 ],
                 dim=0,
             )
-            if do_cfg
-            else _slice_batch_tensor(positive_prompt_embeds, batch)
-        )
+        else:
+            active_prompt_embeds = _slice_batch_tensor(positive_prompt_embeds, batch, batch_start)
         active_add_text_embeds = (
             torch.cat(
                 [
-                    _slice_batch_tensor(negative_add_text_embeds, batch),
-                    _slice_batch_tensor(positive_add_text_embeds, batch),
+                    _slice_batch_tensor(negative_add_text_embeds, batch, batch_start),
+                    _slice_batch_tensor(positive_add_text_embeds, batch, batch_start),
                 ],
                 dim=0,
             )
             if do_cfg
-            else _slice_batch_tensor(positive_add_text_embeds, batch)
+            else _slice_batch_tensor(positive_add_text_embeds, batch, batch_start)
         )
         active_add_time_ids = (
             torch.cat(
                 [
-                    _slice_batch_tensor(negative_add_time_ids, batch),
-                    _slice_batch_tensor(positive_add_time_ids, batch),
+                    _slice_batch_tensor(negative_add_time_ids, batch, batch_start),
+                    _slice_batch_tensor(positive_add_time_ids, batch, batch_start),
                 ],
                 dim=0,
             )
             if do_cfg
-            else _slice_batch_tensor(positive_add_time_ids, batch)
+            else _slice_batch_tensor(positive_add_time_ids, batch, batch_start)
         )
-        active_timestep_cond = _slice_batch_tensor(timestep_cond, batch)
+        active_timestep_cond = _slice_batch_tensor(timestep_cond, batch, batch_start)
         if do_cfg and active_timestep_cond is not None:
             active_timestep_cond = torch.cat([active_timestep_cond, active_timestep_cond], dim=0)
         noise_pred = pipeline.unet(
@@ -800,6 +873,27 @@ def _stork_flow_anchor_sigmas(schedule_bundle: ScheduleBundle) -> list[float] | 
     return values.tolist()
 
 
+def _snap_descending_timesteps(values: np.ndarray, *, num_train_timesteps: int) -> np.ndarray:
+    raw = np.asarray(values, dtype=np.float64)
+    if raw.ndim != 1 or len(raw) == 0:
+        raise ValueError("Custom scheduler timesteps must be a non-empty 1D array.")
+    max_timestep = int(num_train_timesteps) - 1
+    if len(raw) > max_timestep:
+        raise ValueError(
+            f"Cannot make {len(raw)} strictly decreasing timesteps within [1, {max_timestep}]."
+        )
+    snapped = np.rint(raw).astype(np.int64)
+    previous = max_timestep + 1
+    for index in range(len(snapped)):
+        lower = len(snapped) - index
+        upper = previous - 1
+        snapped[index] = int(np.clip(snapped[index], lower, upper))
+        previous = int(snapped[index])
+    if np.any(np.diff(snapped) >= 0):
+        raise ValueError(f"Snapped timesteps must be strictly descending, got {snapped.tolist()}.")
+    return snapped
+
+
 def build_pipeline_kwargs(
     pipeline,
     *,
@@ -843,7 +937,11 @@ def build_pipeline_kwargs(
                 kwargs["sigmas"] = sigmas
                 kwargs["num_inference_steps"] = len(sigmas)
         elif "timesteps" in parameters and schedule_bundle.timesteps is not None:
-            kwargs["timesteps"] = [int(x) for x in schedule_bundle.timesteps.tolist()]
+            num_train_timesteps = int(getattr(pipeline.scheduler.config, "num_train_timesteps", 1000))
+            kwargs["timesteps"] = _snap_descending_timesteps(
+                schedule_bundle.timesteps,
+                num_train_timesteps=num_train_timesteps,
+            ).tolist()
         elif "sigmas" in parameters and schedule_bundle.sigmas is not None:
             kwargs["sigmas"] = schedule_bundle.sigmas.tolist()
     return kwargs

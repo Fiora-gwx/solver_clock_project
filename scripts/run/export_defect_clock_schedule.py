@@ -240,6 +240,30 @@ def _step_size_stats(nodes: np.ndarray, reference_nodes: np.ndarray | None = Non
     }
 
 
+def _snap_descending_timesteps(values: np.ndarray, *, num_train_timesteps: int) -> tuple[np.ndarray, dict[str, Any]]:
+    raw = np.asarray(values, dtype=np.float64)
+    if raw.ndim != 1 or len(raw) == 0:
+        raise ValueError("Custom scheduler timesteps must be a non-empty 1D array.")
+    max_timestep = int(num_train_timesteps) - 1
+    if len(raw) > max_timestep:
+        raise ValueError(f"Cannot snap {len(raw)} timesteps into a strictly descending training grid.")
+    snapped = np.rint(raw).astype(np.int64)
+    previous = max_timestep + 1
+    for index in range(len(snapped)):
+        lower = len(snapped) - index
+        upper = previous - 1
+        snapped[index] = int(np.clip(snapped[index], lower, upper))
+        previous = int(snapped[index])
+    if np.any(np.diff(snapped) >= 0):
+        raise ValueError(f"Snapped timesteps must be strictly descending, got {snapped.tolist()}.")
+    snap_error = np.abs(raw - snapped.astype(np.float64))
+    return snapped.astype(np.float64), {
+        "timestep_snap_enabled": True,
+        "timestep_snap_max_abs_error": float(np.max(snap_error)),
+        "timestep_snap_mean_abs_error": float(np.mean(snap_error)),
+    }
+
+
 def _limiter_reference_time_grid(reference_nodes: np.ndarray) -> np.ndarray:
     reference = np.asarray(reference_nodes, dtype=np.float64)
     if reference.ndim != 1 or len(reference) < 2:
@@ -388,6 +412,7 @@ def profile_cache_dir(
     model_output_type: str | None = None,
     coordinate_domain: str | None = None,
     estimator: str = DEFAULT_ESTIMATOR_NAME,
+    physical_grid_mode: str | None = None,
 ) -> Path:
     parts = [backend, SCHEDULE_FAMILY, estimator]
     if dataset_name:
@@ -407,6 +432,8 @@ def profile_cache_dir(
             f"seed_{seed}",
         ]
     )
+    if physical_grid_mode:
+        parts.append(f"gridmode_{physical_grid_mode}")
     if prompt_tag:
         parts.append(f"prompt_{prompt_tag}")
     if height is not None and width is not None:
@@ -483,6 +510,7 @@ def _build_profile_meta(
     coordinate_domain: str,
     estimator: str = DEFAULT_ESTIMATOR_NAME,
     extra: dict[str, Any] | None = None,
+    physical_grid_mode: str | None = None,
 ) -> dict[str, Any]:
     meta = {
         "backend": backend,
@@ -493,6 +521,7 @@ def _build_profile_meta(
         "solver": solver,
         "calibration_solver": calibration_solver,
         "physical_grid_size": physical_grid_size,
+        "physical_grid_mode": physical_grid_mode,
         "pilot_batch_size": pilot_batch_size,
         "pilot_num_batches": pilot_num_batches,
         "pilot_observation_microbatch": pilot_observation_microbatch,
@@ -547,6 +576,7 @@ def build_or_load_pndm_profile(
         calibration_solver=calibration_solver,
         estimator=estimator,
         physical_grid_size=physical_grid_size,
+        physical_grid_mode=None,
         pilot_batch_size=pilot_batch_size,
         pilot_num_batches=pilot_num_batches,
         pilot_observation_microbatch=pilot_observation_microbatch,
@@ -582,6 +612,7 @@ def build_or_load_pndm_profile(
         calibration_solver=calibration_solver,
         estimator=estimator,
         physical_grid_size=physical_grid_size,
+        physical_grid_mode=None,
         pilot_batch_size=pilot_batch_size,
         pilot_num_batches=pilot_num_batches,
         pilot_observation_microbatch=pilot_observation_microbatch,
@@ -681,6 +712,7 @@ def build_or_load_diffusers_profile(
         raise ValueError("velocity_curvature calibration is currently implemented for backend=pndm only.")
     effective_model_output_type = "flow" if _diffusers_solver_uses_flow_prediction(target_solver) else str(clock_config["model_output_type"])
     physical_grid_size = int(clock_config.get("physical_grid_size", 65))
+    physical_grid_mode = str(clock_config.get("physical_grid_mode", "scheduler_sigmas"))
     smoothing_window = int(clock_config.get("smoothing_window", 1))
     epsilon = float(clock_config.get("epsilon", 1.0e-12))
     q_min = float(clock_config["q_min"])
@@ -699,6 +731,7 @@ def build_or_load_diffusers_profile(
         calibration_solver=calibration_solver,
         estimator=estimator,
         physical_grid_size=physical_grid_size,
+        physical_grid_mode=physical_grid_mode,
         pilot_batch_size=pilot_batch_size,
         pilot_num_batches=pilot_num_batches,
         pilot_observation_microbatch=pilot_observation_microbatch,
@@ -721,6 +754,7 @@ def build_or_load_diffusers_profile(
         calibration_solver=calibration_solver,
         estimator=estimator,
         physical_grid_size=physical_grid_size,
+        physical_grid_mode=physical_grid_mode,
         pilot_batch_size=pilot_batch_size,
         pilot_num_batches=pilot_num_batches,
         pilot_observation_microbatch=pilot_observation_microbatch,
@@ -733,6 +767,8 @@ def build_or_load_diffusers_profile(
         extra={
             "pilot_prompt_asset": pilot_prompt_asset,
             "uses_evaluation_prompts": False,
+            "guidance_scale": float(args.guidance_scale),
+            "physical_grid_mode": physical_grid_mode,
         },
     )
     cached_profile = load_cached_profile_if_current(cache_dir, profile_meta)
@@ -749,6 +785,7 @@ def build_or_load_diffusers_profile(
         physical_grid_size=physical_grid_size,
         height=args.height,
         width=args.width,
+        physical_grid_mode=physical_grid_mode,
     )
     stats_batches = []
     with torch.inference_mode():
@@ -1003,6 +1040,7 @@ def export_diffusers(args: argparse.Namespace) -> None:
                     "clock_config": args.clock_config,
                     "clock_model_output_type": str(clock_config["model_output_type"]),
                     "estimator": str(clock_config["estimator"]),
+                    "physical_grid_mode": profile_meta.get("physical_grid_mode"),
                     "shared_profile_dir": str(cache_dir),
                     "shared_profile_meta": profile_meta,
                     "schedule_implementation_version": DEFECT_BALANCED_CLOCK_VERSION,
@@ -1045,6 +1083,25 @@ def export_diffusers(args: argparse.Namespace) -> None:
                         "max_dt_over_base_dt": schedule_stats["max_dt_over_base_dt"],
                     }
                 )
+            if bundle.timesteps is not None:
+                snapped_timesteps, snap_meta = _snap_descending_timesteps(
+                    np.asarray(bundle.timesteps, dtype=np.float64),
+                    num_train_timesteps=int(target_scheduler.config.num_train_timesteps),
+                )
+                snapped_time_grid = np.concatenate(
+                    [snapped_timesteps, np.asarray([0.0], dtype=np.float64)]
+                )
+                snapped_sigma_grid = timestep_to_sigma(snapped_time_grid)
+                snapped_sigma_grid[-1] = 0.0
+                bundle = type(bundle)(
+                    timesteps=snapped_timesteps,
+                    time_grid=snapped_time_grid,
+                    sigmas=snapped_sigma_grid[:-1].copy(),
+                    sigma_grid=snapped_sigma_grid,
+                    tau_grid=bundle.tau_grid,
+                    g_grid=bundle.g_grid,
+                    meta={**bundle.meta, **snap_meta},
+                )
             output_dir = Path(args.output_root) / f"nfe_{int(effective_nfe):03d}"
             exported.append(bundle.save(output_dir))
         del pipeline
@@ -1066,6 +1123,7 @@ def export_diffusers(args: argparse.Namespace) -> None:
             "clock_config": args.clock_config,
             "clock_model_output_type": str(clock_config["model_output_type"]),
             "estimator": str(clock_config["estimator"]),
+            "physical_grid_mode": profile_meta.get("physical_grid_mode"),
             "shared_profile_dir": str(cache_dir),
             "shared_profile_meta": profile_meta,
             "schedule_implementation_version": DEFECT_BALANCED_CLOCK_VERSION,

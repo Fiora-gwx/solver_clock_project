@@ -3,9 +3,10 @@ clock:
   calibration_solver: euler
   model_output_type: epsilon
   physical_grid_size: 65
+  physical_grid_mode: scheduler_sigmas
   pilot_batch_size: 8
   pilot_num_batches: 4
-  pilot_observation_microbatch: 4
+  pilot_observation_microbatch: 8
   pilot_prompt_asset: diffusers_smoke_prompts
   smoothing_window: 3
   epsilon: 1.0e-12

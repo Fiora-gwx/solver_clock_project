@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -83,19 +84,24 @@ def compact_result_csv(
 def append_result_row(csv_path: str | Path, row: dict[str, Any]) -> Path:
     resolved = resolve_repo_path(csv_path)
     resolved.parent.mkdir(parents=True, exist_ok=True)
-    existing_rows: list[dict[str, Any]] = []
-    if resolved.exists():
-        with resolved.open("r", encoding="utf-8", newline="") as handle:
-            existing_rows = list(csv.DictReader(handle))
+    lock_path = resolved.with_suffix(resolved.suffix + ".lock")
+    with lock_path.open("w", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        existing_rows: list[dict[str, Any]] = []
+        if resolved.exists():
+            with resolved.open("r", encoding="utf-8", newline="") as handle:
+                existing_rows = list(csv.DictReader(handle))
 
-    normalized_row = compact_result_row(dict(row))
-    row_identity = result_row_identity(normalized_row)
-    replaced = False
-    for index, existing_row in enumerate(existing_rows):
-        if result_row_identity(existing_row) == row_identity:
-            existing_rows[index] = normalized_row
-            replaced = True
-            break
-    if not replaced:
-        existing_rows.append(normalized_row)
-    return write_result_rows(resolved, existing_rows)
+        normalized_row = compact_result_row(dict(row))
+        row_identity = result_row_identity(normalized_row)
+        replaced = False
+        for index, existing_row in enumerate(existing_rows):
+            if result_row_identity(existing_row) == row_identity:
+                existing_rows[index] = normalized_row
+                replaced = True
+                break
+        if not replaced:
+            existing_rows.append(normalized_row)
+        result = write_result_rows(resolved, existing_rows)
+        fcntl.flock(lock_handle, fcntl.LOCK_UN)
+        return result

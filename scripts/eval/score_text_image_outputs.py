@@ -93,6 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics", default="clipscore,imagereward")
     parser.add_argument("--output-csv", required=True)
     parser.add_argument("--aggregate-csv", required=True)
+    parser.add_argument("--summary-csv", default=None, help="Optional run summary CSV to update with aggregate means.")
     parser.add_argument("--clip-model", default="openai/clip-vit-large-patch14")
     parser.add_argument("--image-reward-model", default="ImageReward-v1.0")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -166,6 +167,39 @@ def mean(values: list[float | None]) -> float | None:
 def write_csv(path: str | Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
     resolved = resolve_repo_path(path)
     resolved.parent.mkdir(parents=True, exist_ok=True)
+    with resolved.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def row_key(row: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        str(row.get(key, ""))
+        for key in ("backend", "model_asset", "solver", "schedule", "nfe", "seed", "guidance_scale")
+    )
+
+
+def update_summary_csv(path: str | Path, aggregate_rows: list[dict[str, Any]]) -> None:
+    resolved = resolve_repo_path(path)
+    if not resolved.exists():
+        return
+    with resolved.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or [])
+        rows = [dict(row) for row in reader]
+    if not rows:
+        return
+    for field in ("clip_score", "image_reward"):
+        if field not in fieldnames:
+            fieldnames.append(field)
+    aggregate_by_key = {row_key(row): row for row in aggregate_rows}
+    for row in rows:
+        aggregate = aggregate_by_key.get(row_key(row))
+        if aggregate is None:
+            continue
+        row["clip_score"] = aggregate.get("clip_score_mean", row.get("clip_score", ""))
+        row["image_reward"] = aggregate.get("image_reward_mean", row.get("image_reward", ""))
     with resolved.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -281,6 +315,8 @@ def main() -> None:
             "image_reward_mean",
         ],
     )
+    if args.summary_csv:
+        update_summary_csv(args.summary_csv, aggregate_rows)
 
 
 if __name__ == "__main__":

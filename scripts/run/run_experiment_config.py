@@ -1202,17 +1202,73 @@ def run_prepare_phase(
     steps: list[PrepareStep],
     *,
     runtime_config: str,
-    prepare_gpu: int,
+    gpu_ids: tuple[int, ...],
+    log_dir_root: Path,
+    experiment_name: str,
 ) -> None:
     if not steps:
         return
-    env_overrides = {"CUDA_VISIBLE_DEVICES": str(prepare_gpu)}
-    for step in steps:
+    if not gpu_ids:
+        raise ValueError("At least one GPU id is required for schedule preparation.")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = resolve_repo_path(log_dir_root / f"{experiment_name}_prepare_{timestamp}")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[prepare-dispatch] steps={len(steps)} gpu_ids={list(gpu_ids)} logs={log_dir}")
+
+    pending = list(enumerate(steps))
+    running: list[tuple[subprocess.Popen[str], Any, Path, int, int, PrepareStep]] = []
+    failed: list[str] = []
+    available_gpus = list(gpu_ids)
+
+    def launch(step_index: int, step: PrepareStep, gpu_id: int) -> None:
         runtime_env = get_runtime_env(step.runtime_backend, runtime_config)
-        print(f"[prepare] {step.key}")
-        print(f"  gpu: {prepare_gpu}")
+        command = [str(runtime_env.python), *[str(argument) for argument in step.arguments]]
+        env = build_subprocess_env(env_overrides={"CUDA_VISIBLE_DEVICES": str(gpu_id)})
+        safe_key = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in step.key)[:160]
+        log_path = log_dir / f"prepare_{step_index:03d}_gpu{gpu_id}_{safe_key}.log"
+        handle = log_path.open("w", encoding="utf-8")
+        print(f"[prepare] index={step_index} gpu={gpu_id} key={step.key} log={log_path}")
         print(f"  {command_preview(runtime_env, step.arguments)}")
-        run_in_runtime_env(runtime_env, step.arguments, env_overrides=env_overrides)
+        process = subprocess.Popen(
+            command,
+            cwd=str(repo_root()),
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        running.append((process, handle, log_path, gpu_id, step_index, step))
+
+    while pending or running:
+        while pending and available_gpus:
+            step_index, step = pending.pop(0)
+            gpu_id = available_gpus.pop(0)
+            launch(step_index, step, gpu_id)
+
+        for item in list(running):
+            process, handle, log_path, gpu_id, step_index, step = item
+            return_code = process.poll()
+            if return_code is None:
+                continue
+            handle.close()
+            running.remove(item)
+            available_gpus.append(gpu_id)
+            if return_code == 0:
+                print(f"[prepare] completed index={step_index} gpu={gpu_id} key={step.key}")
+            else:
+                failed.append(f"index={step_index} gpu={gpu_id} key={step.key} log={log_path}")
+
+        if failed:
+            for process, handle, *_rest in running:
+                process.terminate()
+                handle.close()
+            raise RuntimeError("One or more prepare steps failed:\n" + "\n".join(f"  - {item}" for item in failed))
+
+        if running:
+            import time
+
+            time.sleep(1.0)
 
 
 def print_invocations(invocations: list[ExperimentInvocation], runtime_config: str) -> None:
@@ -1263,6 +1319,79 @@ def execute_invocations(
         print(f"[run] {invocation.label}")
         print(f"  {command_preview(runtime_env, invocation.run_arguments)}")
         run_in_runtime_env(runtime_env, invocation.run_arguments)
+
+
+def metric_script_names(experiment_config: Mapping[str, Any]) -> list[str]:
+    metrics: list[str] = []
+    if wants_metric(experiment_config, "clipscore"):
+        metrics.append("clipscore")
+    if wants_metric(experiment_config, "imagereward"):
+        metrics.append("imagereward")
+    return metrics
+
+
+def run_scoring_phase(
+    args: argparse.Namespace,
+    experiment_config: Mapping[str, Any],
+    *,
+    execution_config: ExecutionConfig,
+) -> None:
+    if str(experiment_config.get("backend", "")) != "diffusers":
+        return
+    metrics = metric_script_names(experiment_config)
+    if not metrics:
+        return
+
+    runtime_env = get_runtime_env("diffusers", args.runtime_config)
+    experiment_name = str(experiment_config["name"])
+    outputs_root = Path(args.outputs_root) / experiment_name
+    metrics_root = Path(args.metrics_root)
+    detail_csv = metrics_root / f"{experiment_name}_detail.csv"
+    aggregate_csv = metrics_root / f"{experiment_name}_aggregate.csv"
+    pairwise_csv = metrics_root / f"{experiment_name}_pairwise.csv"
+    prompt_asset = str(experiment_config.get("prompt_asset", "diffusers_smoke_prompts"))
+    gpu_id = execution_config.gpu_ids[0]
+
+    score_args = (
+        "scripts/eval/score_text_image_outputs.py",
+        "--manifest",
+        args.manifest,
+        "--outputs-root",
+        str(outputs_root),
+        "--prompt-asset",
+        prompt_asset,
+        "--metrics",
+        ",".join(metrics),
+        "--output-csv",
+        str(detail_csv),
+        "--aggregate-csv",
+        str(aggregate_csv),
+        "--summary-csv",
+        str(metrics_root / f"{experiment_name}.csv"),
+        "--device",
+        "cuda",
+    )
+    print(f"[score] metrics={metrics} gpu={gpu_id}")
+    print(f"  {command_preview(runtime_env, score_args)}")
+    run_in_runtime_env(runtime_env, score_args, env_overrides={"CUDA_VISIBLE_DEVICES": str(gpu_id)})
+
+    pairwise_metrics = []
+    if "clipscore" in metrics:
+        pairwise_metrics.append("clip_score")
+    if "imagereward" in metrics:
+        pairwise_metrics.append("image_reward")
+    pairwise_args = (
+        "scripts/eval/pairwise_win_rates.py",
+        "--input-csv",
+        str(detail_csv),
+        "--output-csv",
+        str(pairwise_csv),
+        "--metrics",
+        ",".join(pairwise_metrics),
+    )
+    print("[pairwise]")
+    print(f"  {command_preview(runtime_env, pairwise_args)}")
+    run_in_runtime_env(runtime_env, pairwise_args)
 
 
 def build_child_command(args: argparse.Namespace, *, shard_count: int, shard_index: int, skip_existing: bool) -> list[str]:
@@ -1365,6 +1494,8 @@ def main() -> None:
         invocations = invocations[: args.limit]
     if not invocations:
         print("No pending invocations.")
+        if args.execute and not args.distributed_child and args.shard_count == 1:
+            run_scoring_phase(args, experiment_config, execution_config=execution_config)
         return
     print(f"[summary] invocations={len(invocations)} unique_prepare_steps={count_unique_prepare_steps(invocations)}")
 
@@ -1374,7 +1505,13 @@ def main() -> None:
             raise FileNotFoundError(
                 "This experiment requires materializable schedule assets, but execution.materialize_schedules is disabled."
             )
-        run_prepare_phase(prepare_steps, runtime_config=args.runtime_config, prepare_gpu=execution_config.prepare_gpu)
+        run_prepare_phase(
+            prepare_steps,
+            runtime_config=args.runtime_config,
+            gpu_ids=execution_config.gpu_ids,
+            log_dir_root=execution_config.log_dir_root,
+            experiment_name=str(experiment_config["name"]),
+        )
         validate_schedule_dirs(invocations)
         write_schedule_cache_record(
             experiment_name=str(experiment_config["name"]),
@@ -1384,6 +1521,7 @@ def main() -> None:
 
     if args.execute and not args.distributed_child and args.shard_count == 1 and execution_config.num_gpus > 1:
         dispatch_multi_gpu(args, experiment_config, execution_config=execution_config)
+        run_scoring_phase(args, experiment_config, execution_config=execution_config)
         return
 
     invocations = shard_invocations(invocations, shard_count=args.shard_count, shard_index=args.shard_index)
@@ -1405,6 +1543,7 @@ def main() -> None:
                 schedule_cache_root=execution_config.schedule_cache_root,
                 invocations=invocations,
             )
+            run_scoring_phase(args, experiment_config, execution_config=execution_config)
 
 
 if __name__ == "__main__":
