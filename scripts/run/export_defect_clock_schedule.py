@@ -136,6 +136,29 @@ def _build_diffusers_sigma_to_timestep_transform(scheduler):
     return transform
 
 
+def _build_diffusers_timestep_to_sigma_transform(scheduler):
+    if not hasattr(scheduler, "alphas_cumprod"):
+        raise RuntimeError(f"Scheduler {scheduler.__class__.__name__} does not expose alphas_cumprod.")
+    alphas = scheduler.alphas_cumprod.detach().float().cpu().numpy()
+    train_sigmas = np.sqrt(np.clip(1.0 - alphas, 0.0, None) / np.clip(alphas, 1.0e-12, None))
+    train_timesteps = np.arange(len(train_sigmas), dtype=np.float64)
+
+    def transform(timesteps: np.ndarray) -> np.ndarray:
+        values = np.asarray(timesteps, dtype=np.float64)
+        sigmas = np.interp(np.clip(values, 0.0, float(len(train_sigmas) - 1)), train_timesteps, train_sigmas)
+        sigmas = np.asarray(sigmas, dtype=np.float64)
+        sigmas[np.asarray(values) <= 0.0] = 0.0
+        return sigmas
+
+    return transform
+
+
+def _diffusers_reference_time_grid(scheduler, *, effective_nfe: int, device: str = "cuda") -> np.ndarray:
+    scheduler.set_timesteps(int(effective_nfe), device=device)
+    timesteps = scheduler.timesteps.detach().float().cpu().numpy()
+    return np.concatenate([timesteps, np.asarray([0.0], dtype=np.float64)])
+
+
 def schedule_family_label() -> str:
     return SCHEDULE_FAMILY
 
@@ -718,8 +741,7 @@ def build_or_load_diffusers_profile(
 
     prompts_path = manifest.path(pilot_prompt_asset) if manifest.has(pilot_prompt_asset) else pilot_prompt_asset
     prompts = load_json(prompts_path)
-    prompt_text = str(prompts[0])
-    prompt_batch = [prompt_text] * pilot_batch_size
+    prompt_pool = [str(prompt) for prompt in prompts]
     pipeline = load_pipeline(manifest.path(model_asset), device="cuda", dtype_name=args.dtype)
     replace_scheduler(pipeline, calibration_solver)
     physical_grid = build_defect_sigma_grid(
@@ -731,6 +753,10 @@ def build_or_load_diffusers_profile(
     stats_batches = []
     with torch.inference_mode():
         for batch_index in range(pilot_num_batches):
+            prompt_batch = [
+                prompt_pool[(batch_index * pilot_batch_size + item_index) % len(prompt_pool)]
+                for item_index in range(pilot_batch_size)
+            ]
             batch = prepare_defect_batch(
                 pipeline,
                 prompt=prompt_batch,
@@ -952,15 +978,79 @@ def export_diffusers(args: argparse.Namespace) -> None:
         clock_config=clock_config,
     )
     time_transform = None
+    target_scheduler = None
     if not _diffusers_solver_uses_flow_prediction(str(args.solver or "flow_euler")):
         from src.adapters.diffusers import load_pipeline, replace_scheduler
 
         pipeline = load_pipeline(manifest.path(args.model_asset), device="cuda", dtype_name=args.dtype)
         replace_scheduler(pipeline, str(args.solver or "flow_euler"))
-        time_transform = _build_diffusers_sigma_to_timestep_transform(pipeline.scheduler)
+        target_scheduler = pipeline.scheduler
+        time_transform = _build_diffusers_sigma_to_timestep_transform(target_scheduler)
+        timestep_to_sigma = _build_diffusers_timestep_to_sigma_transform(target_scheduler)
+        exported = []
+        for effective_nfe in target_nfes:
+            bundle = build_reparameterized_bundle(
+                profile,
+                effective_nfe=int(effective_nfe),
+                solver_name=str(args.solver or "flow_euler"),
+                representation="sigmas",
+                schedule_family=SCHEDULE_FAMILY,
+                meta={
+                    "backend": "diffusers",
+                    "model_asset": args.model_asset,
+                    "solver": args.solver or "flow_euler",
+                    "calibration_solver": profile_meta["calibration_solver"],
+                    "clock_config": args.clock_config,
+                    "clock_model_output_type": str(clock_config["model_output_type"]),
+                    "estimator": str(clock_config["estimator"]),
+                    "shared_profile_dir": str(cache_dir),
+                    "shared_profile_meta": profile_meta,
+                    "schedule_implementation_version": DEFECT_BALANCED_CLOCK_VERSION,
+                },
+                time_transform=time_transform,
+            )
+            max_dt_factor = clock_config.get("max_dt_factor")
+            max_neighbor_ratio = clock_config.get("max_neighbor_dt_ratio")
+            if max_dt_factor is not None or max_neighbor_ratio is not None:
+                reference_time_grid = _diffusers_reference_time_grid(
+                    target_scheduler,
+                    effective_nfe=int(effective_nfe),
+                    device="cuda",
+                )
+                limited_time_grid, limiter_meta = limit_schedule_step_sizes(
+                    np.asarray(bundle.time_grid, dtype=np.float64),
+                    _limiter_reference_time_grid(reference_time_grid),
+                    max_dt_factor=None if max_dt_factor is None else float(max_dt_factor),
+                    max_neighbor_ratio=None if max_neighbor_ratio is None else float(max_neighbor_ratio),
+                )
+                limited_sigma_grid = timestep_to_sigma(limited_time_grid)
+                limited_sigma_grid[-1] = 0.0
+                bundle = type(bundle)(
+                    timesteps=limited_time_grid[:-1].copy(),
+                    time_grid=limited_time_grid,
+                    sigmas=limited_sigma_grid[:-1].copy(),
+                    sigma_grid=limited_sigma_grid,
+                    tau_grid=bundle.tau_grid,
+                    g_grid=bundle.g_grid,
+                    meta={**bundle.meta, **limiter_meta},
+                )
+            else:
+                schedule_stats = _step_size_stats(np.asarray(bundle.time_grid, dtype=np.float64))
+                bundle.meta.update(
+                    {
+                        "step_limiter_enabled": False,
+                        "max_dt": schedule_stats["max_dt"],
+                        "min_dt": schedule_stats["min_dt"],
+                        "max_neighbor_dt_ratio": schedule_stats["max_neighbor_dt_ratio"],
+                        "max_dt_over_base_dt": schedule_stats["max_dt_over_base_dt"],
+                    }
+                )
+            output_dir = Path(args.output_root) / f"nfe_{int(effective_nfe):03d}"
+            exported.append(bundle.save(output_dir))
         del pipeline
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        return
     export_clock_sweep(
         profile,
         target_nfes,

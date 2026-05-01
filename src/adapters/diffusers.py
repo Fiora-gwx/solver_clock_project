@@ -429,6 +429,7 @@ def _prepare_sd_defect_latents(
     dtype = find_denoiser_module(pipeline).dtype
     sigma_values = _scheduler_sigma_values(pipeline.scheduler)
     sigma_max = float(sigma_values[0].item())
+    init_noise_sigma = float(getattr(pipeline.scheduler, "init_noise_sigma", sigma_max))
     vae_scale_factor = getattr(pipeline, "vae_scale_factor", 8)
     shape = (
         batch_size,
@@ -436,7 +437,7 @@ def _prepare_sd_defect_latents(
         height // vae_scale_factor,
         width // vae_scale_factor,
     )
-    latents = torch.randn(shape, generator=generator, device=device, dtype=dtype) * sigma_max
+    latents = torch.randn(shape, generator=generator, device=device, dtype=dtype) * init_noise_sigma
     return latents, sigma_max
 
 
@@ -483,8 +484,8 @@ def _prepare_stable_diffusion_defect_batch(
     def velocity_fn(current_latents: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         batch = current_latents.shape[0]
         timestep_value = _vp_timestep_from_sigma(pipeline.scheduler, sigma)
-        timestep = torch.full((batch,), timestep_value, device=current_latents.device, dtype=torch.float32)
         latent_model_input = torch.cat([current_latents] * 2) if do_cfg else current_latents
+        timestep = torch.full((latent_model_input.shape[0],), timestep_value, device=current_latents.device, dtype=torch.float32)
         sigma_value = sigma.reshape(()).to(device=current_latents.device, dtype=current_latents.dtype)
         latent_model_input = latent_model_input / torch.sqrt(sigma_value.square() + 1.0)
         active_prompt_embeds = (
@@ -498,11 +499,14 @@ def _prepare_stable_diffusion_defect_batch(
             if do_cfg
             else _slice_batch_tensor(positive_prompt_embeds, batch)
         )
+        active_timestep_cond = _slice_batch_tensor(timestep_cond, batch)
+        if do_cfg and active_timestep_cond is not None:
+            active_timestep_cond = torch.cat([active_timestep_cond, active_timestep_cond], dim=0)
         noise_pred = pipeline.unet(
             latent_model_input,
             timestep,
             encoder_hidden_states=active_prompt_embeds,
-            timestep_cond=_slice_batch_tensor(timestep_cond, batch),
+            timestep_cond=active_timestep_cond,
             cross_attention_kwargs=None,
             added_cond_kwargs=None,
             return_dict=False,
@@ -587,8 +591,8 @@ def _prepare_sdxl_defect_batch(
     def velocity_fn(current_latents: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         batch = current_latents.shape[0]
         timestep_value = _vp_timestep_from_sigma(pipeline.scheduler, sigma)
-        timestep = torch.full((batch,), timestep_value, device=current_latents.device, dtype=torch.float32)
         latent_model_input = torch.cat([current_latents] * 2) if do_cfg else current_latents
+        timestep = torch.full((latent_model_input.shape[0],), timestep_value, device=current_latents.device, dtype=torch.float32)
         sigma_value = sigma.reshape(()).to(device=current_latents.device, dtype=current_latents.dtype)
         latent_model_input = latent_model_input / torch.sqrt(sigma_value.square() + 1.0)
         active_prompt_embeds = (
@@ -624,11 +628,14 @@ def _prepare_sdxl_defect_batch(
             if do_cfg
             else _slice_batch_tensor(positive_add_time_ids, batch)
         )
+        active_timestep_cond = _slice_batch_tensor(timestep_cond, batch)
+        if do_cfg and active_timestep_cond is not None:
+            active_timestep_cond = torch.cat([active_timestep_cond, active_timestep_cond], dim=0)
         noise_pred = pipeline.unet(
             latent_model_input,
             timestep,
             encoder_hidden_states=active_prompt_embeds,
-            timestep_cond=_slice_batch_tensor(timestep_cond, batch),
+            timestep_cond=active_timestep_cond,
             cross_attention_kwargs=None,
             added_cond_kwargs={
                 "text_embeds": active_add_text_embeds,

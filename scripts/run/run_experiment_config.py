@@ -1091,6 +1091,11 @@ def filter_existing_invocations(invocations: list[ExperimentInvocation]) -> tupl
         if invocation.output_dir is None:
             pending.append(invocation)
             continue
+        if invocation.materializable and invocation.schedule_dir is not None:
+            resolved_schedule_dir = resolve_repo_path(invocation.schedule_dir)
+            if not resolved_schedule_dir.exists() or not _is_current_materializable_schedule_bundle_dir(resolved_schedule_dir):
+                pending.append(invocation)
+                continue
         if (resolve_repo_path(invocation.output_dir) / "run_manifest.json").exists():
             skipped.append(invocation)
             continue

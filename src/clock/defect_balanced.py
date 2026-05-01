@@ -10,7 +10,7 @@ from src.clock.profile import ClockProfile, build_clock_profile_from_alpha
 
 StepFn = Callable[[torch.Tensor, float, float], torch.Tensor]
 VelocityFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-DEFECT_BALANCED_CLOCK_VERSION = 2
+DEFECT_BALANCED_CLOCK_VERSION = 3
 
 
 @dataclass(frozen=True)

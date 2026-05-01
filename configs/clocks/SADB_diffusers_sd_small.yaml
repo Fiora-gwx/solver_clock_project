@@ -11,5 +11,7 @@ clock:
   epsilon: 1.0e-12
   q_min: 1.05
   q_max: 6.0
+  max_dt_factor: 1.5
+  max_neighbor_dt_ratio: 4.0
   cache_path: outputs/cache/sadb_profiles
   target_nfes: [10]
