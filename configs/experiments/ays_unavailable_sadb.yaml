@@ -1,0 +1,21 @@
+name: ays_unavailable_sadb
+backend: diffusers
+base_config:
+  prompt_asset: diffusers_practical_prompts
+  seeds: [0, 1, 2]
+  num_gpus: 4
+  prepare_schedules_first: true
+  materialize_schedules: true
+models:
+  - sd35_medium
+  - flux_dev
+  - lumina_image_2
+solvers:
+  - flow_euler
+schedules:
+  - base
+  - SADB
+schedule_clock_configs:
+  SADB: configs/clocks/SADB_diffusers_sd_medium.yaml
+eval_nfes: [10]
+metrics: [clipscore, imagereward]

@@ -146,6 +146,27 @@ def experiment_seeds(experiment_config: Mapping[str, Any]) -> list[int]:
     return [int(seed) for seed in raw_seeds]
 
 
+def guidance_scales_for_model(experiment_config: Mapping[str, Any], model_config: Mapping[str, Any]) -> list[float]:
+    raw_scales = experiment_config.get("guidance_scales", experiment_config.get("guidance_scale"))
+    if raw_scales is None:
+        return [float(model_config.get("guidance_scale", 3.5))]
+    if isinstance(raw_scales, (int, float)):
+        return [float(raw_scales)]
+    if not isinstance(raw_scales, (list, tuple)) or not raw_scales:
+        raise TypeError("`guidance_scales` must be a non-empty numeric list when provided.")
+    return [float(value) for value in raw_scales]
+
+
+def format_guidance_part(guidance_scale: float) -> str:
+    return f"cfg_{guidance_scale:g}"
+
+
+def should_partition_by_guidance(experiment_config: Mapping[str, Any], guidance_scales: list[float]) -> bool:
+    if "partition_by_guidance" in experiment_config:
+        return bool(experiment_config["partition_by_guidance"])
+    return "guidance_scales" in experiment_config or "guidance_scale" in experiment_config or len(guidance_scales) > 1
+
+
 def canonical_schedule_name(name: str) -> tuple[str, str]:
     normalized = name.lower().replace("-", "_")
     mapping = {
@@ -812,121 +833,131 @@ def build_diffusers_invocations(
         model_config = model_catalog[model_key]
         model_asset = str(model_config["asset_key"])
         image_size = int(model_config.get("image_size", 512))
-        guidance_scale = float(model_config.get("guidance_scale", 3.5))
+        guidance_scales = guidance_scales_for_model(experiment_config, model_config)
+        partition_by_guidance = should_partition_by_guidance(experiment_config, guidance_scales)
 
-        for solver in solvers:
-            active_schedules = solver_schedule_overrides[solver]
-            for raw_schedule in active_schedules:
-                schedule_name, schedule_folder = canonical_schedule_name(str(raw_schedule))
-                active_clock_variants = active_clock_variants_for_schedule(
-                    schedule_name,
-                    schedule_clock_configs=schedule_clock_configs,
-                )
+        for guidance_scale in guidance_scales:
+            guidance_parts = (format_guidance_part(guidance_scale),) if partition_by_guidance else ()
+            for solver in solvers:
+                active_schedules = solver_schedule_overrides[solver]
+                for raw_schedule in active_schedules:
+                    schedule_name, schedule_folder = canonical_schedule_name(str(raw_schedule))
+                    active_clock_variants = active_clock_variants_for_schedule(
+                        schedule_name,
+                        schedule_clock_configs=schedule_clock_configs,
+                    )
 
-                for clock_variant in active_clock_variants:
-                    materializable = is_materializable_schedule("diffusers", schedule_name)
-                    display_name = schedule_display_name(schedule_name, clock_variant.label)
+                    for clock_variant in active_clock_variants:
+                        materializable = is_materializable_schedule("diffusers", schedule_name)
+                        display_name = schedule_display_name(schedule_name, clock_variant.label)
 
-                    for seed in seeds:
-                        schedule_parts = maybe_seeded_schedule_parts(
-                            extend_schedule_parts((model_key, solver), clock_variant.label),
-                            schedule_name=schedule_name,
-                            seed=seed,
-                            seed_count=len(seeds),
-                        )
-                        prepare_steps = build_diffusers_prepare_steps(
-                            manifest_path=manifest_path,
-                            schedule_cache_root=schedule_cache_root,
-                            model_key=model_key,
-                            model_asset=model_asset,
-                            solver=solver,
-                            schedule_name=schedule_name,
-                            schedule_folder=schedule_folder,
-                            target_nfes=target_nfes,
-                            prompt_asset=prompt_asset,
-                            seed=seed,
-                            dtype_name=dtype_name,
-                            image_size=image_size,
-                            guidance_scale=guidance_scale,
-                            clock_config_path=clock_variant.config_path,
-                            clock_label=clock_variant.label,
-                            schedule_parts=schedule_parts,
-                        )
-                        schedule_root_path = resolve_schedule_root(
-                            schedule_cache_root=schedule_cache_root,
-                            schedule_folder=schedule_folder,
-                            backend="diffusers",
-                            materializable=materializable,
-                            parts=schedule_parts,
-                        )
-
-                        for nfe in target_nfes:
-                            if schedule_name == "base":
-                                schedule_dir = None
-                            elif schedule_name == "ays":
-                                schedule_dir = diffusers_published_ays_schedule_dir(
-                                    manifest_path,
-                                    model_key=model_key,
-                                    nfe=nfe,
-                                )
-                            else:
-                                schedule_dir = schedule_target_dir(schedule_root_path, nfe)
-                            notes: list[str] = []
-                            if schedule_dir is not None and not resolve_repo_path(schedule_dir).exists():
-                                notes.append(
-                                    "schedule_missing_materializable" if materializable else "schedule_missing_external_asset"
-                                )
-
-                            output_dir = Path(outputs_root) / experiment_config["name"] / "diffusers" / model_key / solver / schedule_name
-                            if clock_variant.label is not None:
-                                output_dir = output_dir / clock_variant.label
-                            if len(seeds) > 1:
-                                output_dir = output_dir / f"seed_{seed:03d}"
-                            output_dir = output_dir / f"nfe_{nfe:03d}"
-                            run_arguments = [
-                                "scripts/run/run_diffusers_experiment.py",
-                                "--manifest",
-                                manifest_path,
-                                "--model-asset",
-                                model_asset,
-                                "--solver",
-                                solver,
-                                "--prompt-asset",
-                                prompt_asset,
-                                "--nfe",
-                                str(nfe),
-                                "--seed",
-                                str(seed),
-                                "--schedule-name",
-                                display_name,
-                                "--output-dir",
-                                str(output_dir),
-                                "--summary-csv",
-                                str(summary_csv),
-                                "--dtype",
-                                dtype_name,
-                                "--height",
-                                str(image_size),
-                                "--width",
-                                str(image_size),
-                                "--guidance-scale",
-                                str(guidance_scale),
-                            ]
-                            if schedule_dir is not None:
-                                run_arguments.extend(["--schedule-dir", str(schedule_dir)])
-
-                            invocations.append(
-                                ExperimentInvocation(
-                                    label=f"diffusers:{model_key}:{solver}:{display_name}:seed_{seed:03d}:nfe_{nfe:03d}",
-                                    runtime_backend="diffusers",
-                                    run_arguments=tuple(run_arguments),
-                                    prepare_steps=prepare_steps,
-                                    output_dir=output_dir,
-                                    schedule_dir=schedule_dir,
-                                    materializable=materializable,
-                                    notes=tuple(notes),
-                                )
+                        for seed in seeds:
+                            schedule_parts = maybe_seeded_schedule_parts(
+                                extend_schedule_parts((model_key, solver, *guidance_parts), clock_variant.label),
+                                schedule_name=schedule_name,
+                                seed=seed,
+                                seed_count=len(seeds),
                             )
+                            prepare_steps = build_diffusers_prepare_steps(
+                                manifest_path=manifest_path,
+                                schedule_cache_root=schedule_cache_root,
+                                model_key=model_key,
+                                model_asset=model_asset,
+                                solver=solver,
+                                schedule_name=schedule_name,
+                                schedule_folder=schedule_folder,
+                                target_nfes=target_nfes,
+                                prompt_asset=prompt_asset,
+                                seed=seed,
+                                dtype_name=dtype_name,
+                                image_size=image_size,
+                                guidance_scale=guidance_scale,
+                                clock_config_path=clock_variant.config_path,
+                                clock_label=clock_variant.label,
+                                schedule_parts=schedule_parts,
+                            )
+                            schedule_root_path = resolve_schedule_root(
+                                schedule_cache_root=schedule_cache_root,
+                                schedule_folder=schedule_folder,
+                                backend="diffusers",
+                                materializable=materializable,
+                                parts=schedule_parts,
+                            )
+
+                            for nfe in target_nfes:
+                                if schedule_name == "base":
+                                    schedule_dir = None
+                                elif schedule_name == "ays":
+                                    schedule_dir = diffusers_published_ays_schedule_dir(
+                                        manifest_path,
+                                        model_key=model_key,
+                                        nfe=nfe,
+                                    )
+                                else:
+                                    schedule_dir = schedule_target_dir(schedule_root_path, nfe)
+                                notes: list[str] = []
+                                if schedule_dir is not None and not resolve_repo_path(schedule_dir).exists():
+                                    notes.append(
+                                        "schedule_missing_materializable" if materializable else "schedule_missing_external_asset"
+                                    )
+
+                                output_dir = Path(outputs_root) / experiment_config["name"] / "diffusers" / model_key / solver
+                                if partition_by_guidance:
+                                    output_dir = output_dir / format_guidance_part(guidance_scale)
+                                output_dir = output_dir / schedule_name
+                                if clock_variant.label is not None:
+                                    output_dir = output_dir / clock_variant.label
+                                if len(seeds) > 1:
+                                    output_dir = output_dir / f"seed_{seed:03d}"
+                                output_dir = output_dir / f"nfe_{nfe:03d}"
+                                run_arguments = [
+                                    "scripts/run/run_diffusers_experiment.py",
+                                    "--manifest",
+                                    manifest_path,
+                                    "--model-asset",
+                                    model_asset,
+                                    "--solver",
+                                    solver,
+                                    "--prompt-asset",
+                                    prompt_asset,
+                                    "--nfe",
+                                    str(nfe),
+                                    "--seed",
+                                    str(seed),
+                                    "--schedule-name",
+                                    display_name,
+                                    "--output-dir",
+                                    str(output_dir),
+                                    "--summary-csv",
+                                    str(summary_csv),
+                                    "--dtype",
+                                    dtype_name,
+                                    "--height",
+                                    str(image_size),
+                                    "--width",
+                                    str(image_size),
+                                    "--guidance-scale",
+                                    str(guidance_scale),
+                                ]
+                                if schedule_dir is not None:
+                                    run_arguments.extend(["--schedule-dir", str(schedule_dir)])
+
+                                label_parts = ["diffusers", model_key, solver]
+                                if partition_by_guidance:
+                                    label_parts.append(format_guidance_part(guidance_scale))
+                                label_parts.extend([display_name, f"seed_{seed:03d}", f"nfe_{nfe:03d}"])
+                                invocations.append(
+                                    ExperimentInvocation(
+                                        label=":".join(label_parts),
+                                        runtime_backend="diffusers",
+                                        run_arguments=tuple(run_arguments),
+                                        prepare_steps=prepare_steps,
+                                        output_dir=output_dir,
+                                        schedule_dir=schedule_dir,
+                                        materializable=materializable,
+                                        notes=tuple(notes),
+                                    )
+                                )
     return invocations
 
 
@@ -1092,6 +1123,10 @@ def collect_prepare_steps(invocations: list[ExperimentInvocation]) -> list[Prepa
             "Missing non-materializable schedule assets:\n" + "\n".join(f"  - {item}" for item in missing_external)
         )
     return list(unique_steps.values())
+
+
+def count_unique_prepare_steps(invocations: list[ExperimentInvocation]) -> int:
+    return len({step.key for invocation in invocations for step in invocation.prepare_steps})
 
 
 def _expected_schedule_implementation_version(schedule_family: str) -> int | None:
@@ -1326,6 +1361,7 @@ def main() -> None:
     if not invocations:
         print("No pending invocations.")
         return
+    print(f"[summary] invocations={len(invocations)} unique_prepare_steps={count_unique_prepare_steps(invocations)}")
 
     if args.execute and not args.distributed_child and args.shard_count == 1 and execution_config.prepare_schedules_first:
         prepare_steps = collect_prepare_steps(invocations)

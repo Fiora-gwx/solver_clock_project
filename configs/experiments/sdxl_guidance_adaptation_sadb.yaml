@@ -1,0 +1,21 @@
+name: sdxl_guidance_adaptation_sadb
+backend: diffusers
+base_config:
+  prompt_asset: diffusers_practical_prompts
+  seeds: [0, 1, 2]
+  num_gpus: 4
+  prepare_schedules_first: true
+  materialize_schedules: true
+models:
+  - sdxl
+solvers:
+  - dpm_solver_pp
+schedules:
+  - base
+  - AYS
+  - SADB
+schedule_clock_configs:
+  SADB: configs/clocks/SADB_diffusers_sd_medium.yaml
+guidance_scales: [3.0, 5.0, 7.5, 10.0]
+eval_nfes: [10]
+metrics: [clipscore, imagereward]

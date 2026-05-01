@@ -209,6 +209,31 @@ def test_build_invocations_expands_labeled_sadb_clock_variants() -> None:
     assert any("/medium/" in str(invocation.schedule_dir) for invocation in invocations)
 
 
+def test_build_invocations_partitions_diffusers_guidance_scale_schedules() -> None:
+    args = _build_args()
+    config = {
+        "name": "sdxl_guidance_partition",
+        "backend": "diffusers",
+        "models": ["sdxl"],
+        "solvers": ["dpm_solver_pp"],
+        "schedules": ["base", "SADB"],
+        "nfes": [10],
+        "seeds": [0],
+        "guidance_scales": [3.0, 5.0],
+        "schedule_clock_configs": {
+            "SADB": "configs/clocks/SADB_diffusers_sd_medium.yaml",
+        },
+    }
+    execution = resolve_execution_config(config, args)
+    invocations = build_invocations(args, config, execution_config=execution)
+    assert len(invocations) == 4
+    sadb_invocations = [invocation for invocation in invocations if ":SADB:" in invocation.label]
+    assert len(sadb_invocations) == 2
+    assert any("cfg_3" in str(invocation.schedule_dir) for invocation in sadb_invocations)
+    assert any("cfg_5" in str(invocation.schedule_dir) for invocation in sadb_invocations)
+    assert all("cfg_" in str(invocation.output_dir) for invocation in invocations)
+
+
 def test_build_invocations_rejects_custom_schedules_for_dpm_solver() -> None:
     args = _build_args()
     pndm_config = {

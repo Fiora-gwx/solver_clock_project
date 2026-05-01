@@ -15,6 +15,7 @@ SUMMARY_FIELDNAMES: tuple[str, ...] = (
     "schedule",
     "nfe",
     "seed",
+    "guidance_scale",
     "num_samples",
     "fid",
     "clip_score",
@@ -29,6 +30,7 @@ RESULT_ID_FIELDS: tuple[str, ...] = (
     "schedule",
     "nfe",
     "seed",
+    "guidance_scale",
 )
 
 

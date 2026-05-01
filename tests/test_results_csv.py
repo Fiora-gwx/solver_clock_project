@@ -94,3 +94,25 @@ def test_append_result_row_replaces_existing_identity_row(tmp_path) -> None:
 
     assert len(rows) == 1
     assert rows[0]["fid"] == "3.5"
+
+
+def test_append_result_row_keeps_guidance_scales_distinct(tmp_path) -> None:
+    csv_path = tmp_path / "results.csv"
+    base_row = {
+        "backend": "diffusers",
+        "dataset": "",
+        "model_asset": "hf_sdxl_base_10",
+        "solver": "dpm_solver_pp",
+        "schedule": "base",
+        "nfe": 10,
+        "seed": 0,
+        "num_samples": 100,
+    }
+    append_result_row(csv_path, {**base_row, "guidance_scale": 3.0})
+    append_result_row(csv_path, {**base_row, "guidance_scale": 5.0})
+
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 2
+    assert {row["guidance_scale"] for row in rows} == {"3.0", "5.0"}
