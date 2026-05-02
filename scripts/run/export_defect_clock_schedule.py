@@ -36,8 +36,16 @@ from src.clock.defect_balanced import (
     collect_step_refinement_stats,
 )
 from src.clock.profile import ClockProfile, build_reparameterized_bundle, export_clock_sweep, slice_profile_interval
+from src.clock.transforms import (
+    build_lambda_table,
+    lambda_to_sigma,
+    lambda_to_sigma_derivative,
+    lambda_to_timestep,
+    sigma_to_lambda,
+)
 from src.utils.assets import AssetManifest
 from src.utils.config import dump_json, ensure_dir, load_json, load_yaml, resolve_repo_path
+from src.utils.schedule_bundle import ScheduleBundle
 
 
 SCHEDULE_FAMILY = "SADB"
@@ -103,6 +111,20 @@ def load_clock_settings(path: str) -> dict[str, Any]:
     clock["model_output_type"] = model_output_type
     clock["q_min"] = float(clock.get("q_min", 1.05))
     clock["q_max"] = float(clock.get("q_max", 6.0))
+    coordinate_domain = str(clock.get("coordinate_domain", "lambda")).lower()
+    if coordinate_domain not in {"lambda", "sigma", "sigmas", "timestep", "timesteps"}:
+        raise ValueError("SADB expects clock.coordinate_domain to be one of: lambda, sigma, timestep.")
+    clock["coordinate_domain"] = {"sigmas": "sigma", "timesteps": "timestep"}.get(coordinate_domain, coordinate_domain)
+    clock["prior_schedule"] = str(clock.get("prior_schedule", "none")).lower()
+    clock["prior_blend"] = float(clock.get("prior_blend", 0.0))
+    clock["density_temperature"] = float(clock.get("density_temperature", 1.0))
+    clock["defect_reduce"] = str(clock.get("defect_reduce", "rms")).lower()
+    clock["defect_quantile"] = float(clock.get("defect_quantile", 0.75))
+    clock["q_shrinkage"] = float(clock.get("q_shrinkage", 0.0))
+    if "q_prior" in clock:
+        clock["q_prior"] = float(clock["q_prior"])
+    clock["sde_noise_kappa"] = float(clock.get("sde_noise_kappa", 0.0))
+    clock["sde_brownian_bridge"] = bool(clock.get("sde_brownian_bridge", False))
     return clock
 
 
@@ -157,6 +179,21 @@ def _diffusers_reference_time_grid(scheduler, *, effective_nfe: int, device: str
     scheduler.set_timesteps(int(effective_nfe), device=device)
     timesteps = scheduler.timesteps.detach().float().cpu().numpy()
     return np.concatenate([timesteps, np.asarray([0.0], dtype=np.float64)])
+
+
+def _diffusers_reference_sigma_grid(scheduler, *, effective_nfe: int, device: str = "cuda") -> np.ndarray:
+    scheduler.set_timesteps(int(effective_nfe), device=device)
+    sigmas = getattr(scheduler, "sigmas", None)
+    if sigmas is None:
+        raise RuntimeError(f"Scheduler {scheduler.__class__.__name__} does not expose sigmas.")
+    values = sigmas.detach().float().cpu().numpy() if isinstance(sigmas, torch.Tensor) else np.asarray(sigmas, dtype=np.float64)
+    if len(values) == int(effective_nfe):
+        values = np.concatenate([values, np.asarray([0.0], dtype=np.float64)])
+    if len(values) > int(effective_nfe) + 1:
+        values = values[: int(effective_nfe) + 1]
+    values = np.asarray(values, dtype=np.float64)
+    values[-1] = 0.0
+    return values
 
 
 def schedule_family_label() -> str:
@@ -225,9 +262,9 @@ def _step_size_stats(nodes: np.ndarray, reference_nodes: np.ndarray | None = Non
         max_neighbor = 1.0
     if reference_nodes is not None:
         reference_intervals = np.abs(np.diff(np.asarray(reference_nodes, dtype=np.float64)))
-        if reference_intervals.shape == intervals.shape:
-            valid = reference_intervals > 1.0e-12
-            max_over_base = float(np.max(intervals[valid] / reference_intervals[valid])) if np.any(valid) else 1.0
+        if reference_intervals.shape == intervals.shape and reference_intervals.size > 0:
+            base_dt = float(np.mean(reference_intervals))
+            max_over_base = float(np.max(intervals) / max(base_dt, 1.0e-12))
         else:
             max_over_base = 1.0
     else:
@@ -306,25 +343,42 @@ def limit_schedule_step_sizes(
     if max_neighbor_ratio <= 0.0:
         raise ValueError("max_neighbor_dt_ratio must be positive.")
 
-    def satisfies(candidate: np.ndarray) -> bool:
-        stats = _step_size_stats(candidate, reference)
-        return (
-            stats["max_dt_over_base_dt"] <= max_dt_factor + 1.0e-12
-            and stats["max_neighbor_dt_ratio"] <= max_neighbor_ratio + 1.0e-12
-        )
-
-    if satisfies(values):
+    intervals = np.abs(np.diff(values))
+    total = float(np.sum(intervals))
+    if total <= 1.0e-12:
         limited = values.copy()
     else:
-        lo, hi = 0.0, 1.0
-        for _ in range(60):
-            mid = 0.5 * (lo + hi)
-            candidate = (1.0 - mid) * values + mid * reference
-            if satisfies(candidate):
-                hi = mid
-            else:
-                lo = mid
-        limited = (1.0 - hi) * values + hi * reference
+        base_dt = float(np.mean(np.abs(np.diff(reference))))
+        max_dt = max_dt_factor * max(base_dt, 1.0e-12)
+        limited_intervals = np.maximum(intervals, 1.0e-12)
+        for _ in range(100):
+            previous = limited_intervals.copy()
+            limited_intervals = np.minimum(limited_intervals, max_dt)
+            if np.isfinite(max_neighbor_ratio) and len(limited_intervals) > 1:
+                for index in range(1, len(limited_intervals)):
+                    limited_intervals[index] = min(
+                        limited_intervals[index],
+                        max_neighbor_ratio * max(limited_intervals[index - 1], 1.0e-12),
+                    )
+                for index in range(len(limited_intervals) - 2, -1, -1):
+                    limited_intervals[index] = min(
+                        limited_intervals[index],
+                        max_neighbor_ratio * max(limited_intervals[index + 1], 1.0e-12),
+                    )
+            capped_total = float(np.sum(limited_intervals))
+            if capped_total <= 1.0e-12:
+                limited_intervals = np.full_like(limited_intervals, total / len(limited_intervals))
+                break
+            limited_intervals = limited_intervals * (total / capped_total)
+            if np.max(np.abs(limited_intervals - previous)) <= 1.0e-10:
+                break
+        if np.max(limited_intervals) > max_dt + 1.0e-8:
+            # If the requested limits are mutually infeasible after range preservation,
+            # fall back to the largest feasible uniform range-preserving schedule.
+            limited_intervals = np.full_like(limited_intervals, total / len(limited_intervals))
+        direction = 1.0 if values[-1] >= values[0] else -1.0
+        limited = values[0] + direction * np.concatenate([[0.0], np.cumsum(limited_intervals)])
+        limited[-1] = values[-1]
 
     post_stats = _step_size_stats(limited, reference)
     return limited, {
@@ -337,6 +391,85 @@ def limit_schedule_step_sizes(
         "pre_limit_max_dt_over_base_dt": pre_stats["max_dt_over_base_dt"],
         **post_stats,
     }
+
+
+def _interval_midpoints(values: np.ndarray) -> np.ndarray:
+    nodes = np.asarray(values, dtype=np.float64)
+    return 0.5 * (nodes[:-1] + nodes[1:])
+
+
+def _interval_sigma_profile(coordinate_grid: np.ndarray, *, coordinate_domain: str, sigma_transform) -> np.ndarray:
+    midpoints = _interval_midpoints(coordinate_grid)
+    if coordinate_domain == "lambda":
+        return np.asarray(sigma_transform(midpoints), dtype=np.float64)
+    return np.maximum(_interval_midpoints(coordinate_grid), 0.0)
+
+
+def _prior_alpha_from_nodes(profile_grid: np.ndarray, prior_nodes: np.ndarray, *, eps: float) -> np.ndarray:
+    grid = np.asarray(profile_grid, dtype=np.float64)
+    nodes = np.asarray(prior_nodes, dtype=np.float64)
+    if grid.ndim != 1 or nodes.ndim != 1 or len(grid) < 2 or len(nodes) < 2:
+        raise ValueError("profile_grid and prior_nodes must be 1D arrays with at least two points.")
+    grid_increasing = grid[0] <= grid[-1]
+    xp = grid if grid_increasing else grid[::-1]
+    prior = nodes if nodes[0] <= nodes[-1] else nodes[::-1]
+    intervals = np.maximum(np.diff(prior), float(eps))
+    interval_density = 1.0 / intervals
+    centers = 0.5 * (prior[:-1] + prior[1:])
+    if len(centers) == 1:
+        alpha = np.full_like(xp, float(interval_density[0]), dtype=np.float64)
+    else:
+        alpha = np.interp(xp, centers, interval_density, left=interval_density[0], right=interval_density[-1])
+    alpha = np.maximum(alpha, float(eps))
+    return alpha if grid_increasing else alpha[::-1]
+
+
+def _model_key_for_ays(model_asset: str) -> str | None:
+    mapping = {
+        "hf_stable_diffusion_15": "stable_diffusion_15",
+        "hf_sdxl_base_10": "sdxl",
+        "hf_deepfloyd_if_stage1": "deepfloyd_if_stage1",
+    }
+    return mapping.get(str(model_asset))
+
+
+def build_prior_alpha(
+    *,
+    manifest: AssetManifest,
+    model_asset: str,
+    prior_schedule: str,
+    profile_grid: np.ndarray,
+    coordinate_domain: str,
+    train_lambdas: np.ndarray | None,
+    train_sigmas: np.ndarray | None,
+    eps: float,
+) -> np.ndarray | None:
+    normalized = str(prior_schedule).lower()
+    if normalized in {"", "none"}:
+        return None
+    if normalized == "base":
+        return np.ones_like(np.asarray(profile_grid, dtype=np.float64))
+    if normalized not in {"ays", "ays_like"}:
+        raise ValueError("prior_schedule must be one of: ays, base, none.")
+    if coordinate_domain != "lambda":
+        raise ValueError("AYS prior blending is currently implemented for lambda coordinate schedules.")
+    if train_lambdas is None or train_sigmas is None:
+        raise ValueError("lambda tables are required to build an AYS prior in lambda coordinates.")
+    model_key = _model_key_for_ays(model_asset)
+    if model_key is None:
+        raise ValueError(f"No published AYS prior mapping is available for model asset `{model_asset}`.")
+    asset_key = f"ays_published_{model_key}_10step"
+    if not manifest.has(asset_key):
+        raise KeyError(f"Missing published AYS asset `{asset_key}` in manifest.")
+    bundle = ScheduleBundle.load(manifest.path(asset_key))
+    if bundle.sigma_grid is not None:
+        prior_sigmas = np.asarray(bundle.sigma_grid, dtype=np.float64)
+    elif bundle.sigmas is not None:
+        prior_sigmas = np.concatenate([np.asarray(bundle.sigmas, dtype=np.float64), np.asarray([0.0])])
+    else:
+        raise ValueError(f"Published AYS bundle `{asset_key}` does not contain sigmas.")
+    prior_lambdas = sigma_to_lambda(prior_sigmas, train_sigmas, train_lambdas)
+    return _prior_alpha_from_nodes(profile_grid, prior_lambdas, eps=eps)
 
 
 def _adaptive_s_schedule_meta(
@@ -413,6 +546,14 @@ def profile_cache_dir(
     coordinate_domain: str | None = None,
     estimator: str = DEFAULT_ESTIMATOR_NAME,
     physical_grid_mode: str | None = None,
+    defect_reduce: str | None = None,
+    defect_quantile: float | None = None,
+    q_prior: float | None = None,
+    q_shrinkage: float | None = None,
+    density_temperature: float | None = None,
+    prior_schedule: str | None = None,
+    prior_blend: float | None = None,
+    sde_noise_kappa: float | None = None,
 ) -> Path:
     parts = [backend, SCHEDULE_FAMILY, estimator]
     if dataset_name:
@@ -444,6 +585,22 @@ def profile_cache_dir(
         parts.append(f"model_output_{model_output_type}")
     if coordinate_domain:
         parts.append(f"domain_{coordinate_domain}")
+    if defect_reduce:
+        parts.append(f"reduce_{defect_reduce}")
+    if defect_quantile is not None:
+        parts.append(f"dq_{defect_quantile:g}")
+    if q_prior is not None:
+        parts.append(f"qprior_{q_prior:g}")
+    if q_shrinkage is not None:
+        parts.append(f"qshrink_{q_shrinkage:g}")
+    if density_temperature is not None:
+        parts.append(f"temp_{density_temperature:g}")
+    if prior_schedule and str(prior_schedule).lower() != "none":
+        parts.append(f"prior_{prior_schedule}")
+    if prior_blend is not None:
+        parts.append(f"pblend_{prior_blend:g}")
+    if sde_noise_kappa is not None:
+        parts.append(f"sdek_{sde_noise_kappa:g}")
     return cache_root.joinpath(*parts)
 
 
@@ -511,6 +668,15 @@ def _build_profile_meta(
     estimator: str = DEFAULT_ESTIMATOR_NAME,
     extra: dict[str, Any] | None = None,
     physical_grid_mode: str | None = None,
+    prior_schedule: str = "none",
+    prior_blend: float = 0.0,
+    density_temperature: float = 1.0,
+    q_prior: float | None = None,
+    q_shrinkage: float = 0.0,
+    defect_reduce: str = "rms",
+    defect_quantile: float = 0.75,
+    sde_noise_kappa: float = 0.0,
+    sde_brownian_bridge: bool = False,
 ) -> dict[str, Any]:
     meta = {
         "backend": backend,
@@ -531,6 +697,16 @@ def _build_profile_meta(
         "q_max": q_max,
         "model_output_type": model_output_type,
         "coordinate_domain": coordinate_domain,
+        "sadb_version": "v2",
+        "prior_schedule": prior_schedule,
+        "prior_blend": prior_blend,
+        "density_temperature": density_temperature,
+        "q_prior": q_prior,
+        "q_shrinkage": q_shrinkage,
+        "defect_reduce": defect_reduce,
+        "defect_quantile": defect_quantile,
+        "sde_noise_kappa": sde_noise_kappa,
+        "sde_brownian_bridge": sde_brownian_bridge,
         "calibration_method": (
             "velocity_curvature_pilot_trajectory"
             if estimator == VELOCITY_CURVATURE_ESTIMATOR_NAME
@@ -711,16 +887,38 @@ def build_or_load_diffusers_profile(
     if estimator == VELOCITY_CURVATURE_ESTIMATOR_NAME:
         raise ValueError("velocity_curvature calibration is currently implemented for backend=pndm only.")
     effective_model_output_type = "flow" if _diffusers_solver_uses_flow_prediction(target_solver) else str(clock_config["model_output_type"])
+    coordinate_domain = str(clock_config.get("coordinate_domain", "lambda"))
+    if _diffusers_solver_uses_flow_prediction(target_solver) and coordinate_domain == "lambda":
+        coordinate_domain = "sigma"
     physical_grid_size = int(clock_config.get("physical_grid_size", 65))
     physical_grid_mode = str(clock_config.get("physical_grid_mode", "scheduler_sigmas"))
     smoothing_window = int(clock_config.get("smoothing_window", 1))
     epsilon = float(clock_config.get("epsilon", 1.0e-12))
-    q_min = float(clock_config["q_min"])
-    q_max = float(clock_config["q_max"])
+    default_q_prior = 2.2 if "sde" in target_solver else 3.0
+    default_q_shrinkage = 0.6 if "sde" in target_solver else 0.5
+    if "sde" in target_solver:
+        q_min = float(clock_config.get("sde_q_min", 1.3))
+        q_max = float(clock_config.get("sde_q_max", 3.5))
+        q_prior = float(clock_config.get("sde_q_prior", default_q_prior))
+        q_shrinkage = float(clock_config.get("sde_q_shrinkage", default_q_shrinkage))
+    else:
+        q_min = float(clock_config.get("q_min", 1.5))
+        q_max = float(clock_config.get("q_max", 4.0))
+        q_prior = float(clock_config.get("q_prior", default_q_prior))
+        q_shrinkage = float(clock_config.get("q_shrinkage", default_q_shrinkage))
+    defect_reduce = str(clock_config.get("defect_reduce", "quantile"))
+    defect_quantile = float(clock_config.get("defect_quantile", 0.75))
+    prior_schedule = str(clock_config.get("prior_schedule", "none")).lower()
+    prior_blend = float(clock_config.get("prior_blend", 0.0))
+    density_temperature = float(clock_config.get("density_temperature", 1.0))
+    sde_noise_kappa = float(clock_config.get("sde_noise_kappa", 0.0 if "sde" not in target_solver else 0.3))
+    sde_brownian_bridge = bool(clock_config.get("sde_brownian_bridge", False))
     pilot_batch_size = int(clock_config.get("pilot_batch_size", 8))
     pilot_num_batches = int(clock_config.get("pilot_num_batches", 4))
     pilot_observation_microbatch = int(clock_config.get("pilot_observation_microbatch", 4))
     pilot_prompt_asset = str(clock_config.get("pilot_prompt_asset", args.prompt_asset))
+    if _diffusers_solver_uses_flow_prediction(target_solver) and prior_schedule in {"ays", "ays_like"}:
+        prior_schedule = "none"
     cache_root = resolve_repo_path(clock_config.get("cache_path", "outputs/cache/sadb_profiles"))
     cache_dir = profile_cache_dir(
         cache_root=cache_root,
@@ -745,7 +943,15 @@ def build_or_load_diffusers_profile(
         width=args.width,
         guidance_scale=args.guidance_scale,
         model_output_type=effective_model_output_type,
-        coordinate_domain="sigmas",
+        coordinate_domain=coordinate_domain,
+        defect_reduce=defect_reduce,
+        defect_quantile=defect_quantile,
+        q_prior=q_prior,
+        q_shrinkage=q_shrinkage,
+        density_temperature=density_temperature,
+        prior_schedule=prior_schedule,
+        prior_blend=prior_blend,
+        sde_noise_kappa=sde_noise_kappa,
     )
     profile_meta = _build_profile_meta(
         backend="diffusers",
@@ -763,7 +969,16 @@ def build_or_load_diffusers_profile(
         q_min=q_min,
         q_max=q_max,
         model_output_type=effective_model_output_type,
-        coordinate_domain="sigmas",
+        coordinate_domain=coordinate_domain,
+        prior_schedule=prior_schedule,
+        prior_blend=prior_blend,
+        density_temperature=density_temperature,
+        q_prior=q_prior,
+        q_shrinkage=q_shrinkage,
+        defect_reduce=defect_reduce,
+        defect_quantile=defect_quantile,
+        sde_noise_kappa=sde_noise_kappa,
+        sde_brownian_bridge=sde_brownian_bridge,
         extra={
             "pilot_prompt_asset": pilot_prompt_asset,
             "uses_evaluation_prompts": False,
@@ -780,12 +995,48 @@ def build_or_load_diffusers_profile(
     prompt_pool = [str(prompt) for prompt in prompts]
     pipeline = load_pipeline(manifest.path(model_asset), device="cuda", dtype_name=args.dtype)
     replace_scheduler(pipeline, calibration_solver)
-    physical_grid = build_defect_sigma_grid(
+    sigma_grid = build_defect_sigma_grid(
         pipeline,
         physical_grid_size=physical_grid_size,
         height=args.height,
         width=args.width,
         physical_grid_mode=physical_grid_mode,
+    )
+    train_timesteps = train_sigmas = train_lambdas = None
+    sigma_to_lambda_transform = None
+    lambda_to_sigma_transform = None
+    if coordinate_domain == "lambda":
+        train_timesteps, train_sigmas, train_lambdas = build_lambda_table(pipeline.scheduler)
+        sigma_to_lambda_transform = lambda values: sigma_to_lambda(values, train_sigmas, train_lambdas)
+        lambda_to_sigma_transform = lambda values: lambda_to_sigma(values, train_lambdas, train_sigmas)
+        physical_grid = sigma_to_lambda_transform(sigma_grid)
+    elif coordinate_domain == "sigma":
+        physical_grid = sigma_grid
+    elif coordinate_domain == "timestep":
+        if not hasattr(pipeline.scheduler, "alphas_cumprod"):
+            raise RuntimeError("timestep coordinate calibration requires alphas_cumprod.")
+        sigma_to_time = _build_diffusers_sigma_to_timestep_transform(pipeline.scheduler)
+        physical_grid = sigma_to_time(sigma_grid)
+    else:
+        raise ValueError(f"Unsupported diffusers coordinate_domain: {coordinate_domain}")
+    if np.any(np.diff(physical_grid) <= 0.0) and coordinate_domain == "lambda":
+        order = np.argsort(physical_grid)
+        physical_grid = physical_grid[order]
+        sigma_grid = sigma_grid[order]
+    prior_alpha = build_prior_alpha(
+        manifest=manifest,
+        model_asset=model_asset,
+        prior_schedule=prior_schedule,
+        profile_grid=physical_grid,
+        coordinate_domain=coordinate_domain,
+        train_lambdas=train_lambdas,
+        train_sigmas=train_sigmas,
+        eps=epsilon,
+    )
+    sigma_profile = _interval_sigma_profile(
+        physical_grid,
+        coordinate_domain=coordinate_domain,
+        sigma_transform=lambda_to_sigma_transform,
     )
     stats_batches = []
     with torch.inference_mode():
@@ -803,7 +1054,30 @@ def build_or_load_diffusers_profile(
                 width=args.width,
                 guidance_scale=args.guidance_scale,
             )
-            step_fn = build_velocity_stepper(batch.velocity_fn, calibration_solver)
+            velocity_fn = batch.velocity_fn
+            if coordinate_domain == "lambda":
+                assert train_lambdas is not None and train_sigmas is not None
+
+                def velocity_lambda(sample, lamb, sample_start=0, sample_stop=None, base_velocity=velocity_fn):
+                    sigma = lambda_to_sigma(
+                        np.asarray([float(lamb.detach().float().cpu().item() if torch.is_tensor(lamb) else lamb)]),
+                        train_lambdas,
+                        train_sigmas,
+                    )[0]
+                    dsigma = lambda_to_sigma_derivative(
+                        np.asarray([float(lamb.detach().float().cpu().item() if torch.is_tensor(lamb) else lamb)]),
+                        train_lambdas,
+                        train_sigmas,
+                    )[0]
+                    sigma_tensor = torch.as_tensor(float(sigma), device=sample.device, dtype=sample.dtype)
+                    try:
+                        sigma_velocity = base_velocity(sample, sigma_tensor, sample_start, sample_stop)
+                    except TypeError:
+                        sigma_velocity = base_velocity(sample, sigma_tensor)
+                    return sigma_velocity * float(dsigma)
+
+                velocity_fn = velocity_lambda
+            step_fn = build_velocity_stepper(velocity_fn, calibration_solver)
             stats_batches.append(
                 collect_step_refinement_stats(
                     initial_sample=batch.initial_latents,
@@ -830,6 +1104,18 @@ def build_or_load_diffusers_profile(
         stats,
         smoothing_window=smoothing_window,
         eps=epsilon,
+        defect_reduce=defect_reduce,
+        defect_quantile=defect_quantile,
+        q_prior=q_prior,
+        q_shrinkage=q_shrinkage,
+        q_min=q_min,
+        q_max=q_max,
+        density_temperature=density_temperature,
+        prior_alpha=prior_alpha,
+        prior_blend=prior_blend,
+        sigma_profile=sigma_profile,
+        solver_type="sde" if "sde" in target_solver else "ode",
+        sde_noise_kappa=sde_noise_kappa,
     )
     save_profile(cache_dir, artifacts, profile_meta)
     return artifacts.profile, cache_dir, profile_meta
@@ -1022,7 +1308,18 @@ def export_diffusers(args: argparse.Namespace) -> None:
         pipeline = load_pipeline(manifest.path(args.model_asset), device="cuda", dtype_name=args.dtype)
         replace_scheduler(pipeline, str(args.solver or "flow_euler"))
         target_scheduler = pipeline.scheduler
-        time_transform = _build_diffusers_sigma_to_timestep_transform(target_scheduler)
+        coordinate_domain = str(profile_meta.get("coordinate_domain", "sigma"))
+        train_timesteps = train_sigmas = train_lambdas = None
+        if coordinate_domain == "lambda":
+            train_timesteps, train_sigmas, train_lambdas = build_lambda_table(target_scheduler)
+            representation_transform = lambda values: lambda_to_sigma(values, train_lambdas, train_sigmas)
+            time_transform = lambda values: lambda_to_timestep(values, train_lambdas, train_timesteps)
+        elif coordinate_domain == "timestep":
+            representation_transform = _build_diffusers_timestep_to_sigma_transform(target_scheduler)
+            time_transform = lambda values: np.asarray(values, dtype=np.float64)
+        else:
+            representation_transform = None
+            time_transform = _build_diffusers_sigma_to_timestep_transform(target_scheduler)
         timestep_to_sigma = _build_diffusers_timestep_to_sigma_transform(target_scheduler)
         exported = []
         for effective_nfe in target_nfes:
@@ -1041,27 +1338,59 @@ def export_diffusers(args: argparse.Namespace) -> None:
                     "clock_model_output_type": str(clock_config["model_output_type"]),
                     "estimator": str(clock_config["estimator"]),
                     "physical_grid_mode": profile_meta.get("physical_grid_mode"),
+                    "sadb_version": "v2",
+                    "coordinate_domain": coordinate_domain,
+                    "prior_schedule": profile_meta.get("prior_schedule"),
+                    "prior_blend": profile_meta.get("prior_blend"),
+                    "density_temperature": profile_meta.get("density_temperature"),
+                    "q_prior": profile_meta.get("q_prior"),
+                    "q_shrinkage": profile_meta.get("q_shrinkage"),
+                    "q_min": profile_meta.get("q_min"),
+                    "q_max": profile_meta.get("q_max"),
+                    "defect_reduce": profile_meta.get("defect_reduce"),
+                    "defect_quantile": profile_meta.get("defect_quantile"),
+                    "sde_noise_kappa": profile_meta.get("sde_noise_kappa"),
+                    "sde_brownian_bridge": profile_meta.get("sde_brownian_bridge"),
                     "shared_profile_dir": str(cache_dir),
                     "shared_profile_meta": profile_meta,
                     "schedule_implementation_version": DEFECT_BALANCED_CLOCK_VERSION,
                 },
+                representation_transform=representation_transform,
                 time_transform=time_transform,
             )
             max_dt_factor = clock_config.get("max_dt_factor")
             max_neighbor_ratio = clock_config.get("max_neighbor_dt_ratio")
             if max_dt_factor is not None or max_neighbor_ratio is not None:
-                reference_time_grid = _diffusers_reference_time_grid(
-                    target_scheduler,
-                    effective_nfe=int(effective_nfe),
-                    device="cuda",
-                )
-                limited_time_grid, limiter_meta = limit_schedule_step_sizes(
-                    np.asarray(bundle.time_grid, dtype=np.float64),
-                    _limiter_reference_time_grid(reference_time_grid),
-                    max_dt_factor=None if max_dt_factor is None else float(max_dt_factor),
-                    max_neighbor_ratio=None if max_neighbor_ratio is None else float(max_neighbor_ratio),
-                )
-                limited_sigma_grid = timestep_to_sigma(limited_time_grid)
+                if coordinate_domain == "lambda":
+                    assert train_sigmas is not None and train_lambdas is not None and train_timesteps is not None
+                    reference_sigma_grid = _diffusers_reference_sigma_grid(
+                        target_scheduler,
+                        effective_nfe=int(effective_nfe),
+                        device="cuda",
+                    )
+                    reference_lambda_grid = sigma_to_lambda(reference_sigma_grid, train_sigmas, train_lambdas)
+                    lambda_grid = sigma_to_lambda(np.asarray(bundle.sigma_grid, dtype=np.float64), train_sigmas, train_lambdas)
+                    limited_lambda_grid, limiter_meta = limit_schedule_step_sizes(
+                        lambda_grid,
+                        _limiter_reference_time_grid(reference_lambda_grid),
+                        max_dt_factor=None if max_dt_factor is None else float(max_dt_factor),
+                        max_neighbor_ratio=None if max_neighbor_ratio is None else float(max_neighbor_ratio),
+                    )
+                    limited_sigma_grid = lambda_to_sigma(limited_lambda_grid, train_lambdas, train_sigmas)
+                    limited_time_grid = lambda_to_timestep(limited_lambda_grid, train_lambdas, train_timesteps)
+                else:
+                    reference_time_grid = _diffusers_reference_time_grid(
+                        target_scheduler,
+                        effective_nfe=int(effective_nfe),
+                        device="cuda",
+                    )
+                    limited_time_grid, limiter_meta = limit_schedule_step_sizes(
+                        np.asarray(bundle.time_grid, dtype=np.float64),
+                        _limiter_reference_time_grid(reference_time_grid),
+                        max_dt_factor=None if max_dt_factor is None else float(max_dt_factor),
+                        max_neighbor_ratio=None if max_neighbor_ratio is None else float(max_neighbor_ratio),
+                    )
+                    limited_sigma_grid = timestep_to_sigma(limited_time_grid)
                 limited_sigma_grid[-1] = 0.0
                 bundle = type(bundle)(
                     timesteps=limited_time_grid[:-1].copy(),
@@ -1124,6 +1453,19 @@ def export_diffusers(args: argparse.Namespace) -> None:
             "clock_model_output_type": str(clock_config["model_output_type"]),
             "estimator": str(clock_config["estimator"]),
             "physical_grid_mode": profile_meta.get("physical_grid_mode"),
+            "sadb_version": "v2",
+            "coordinate_domain": profile_meta.get("coordinate_domain"),
+            "prior_schedule": profile_meta.get("prior_schedule"),
+            "prior_blend": profile_meta.get("prior_blend"),
+            "density_temperature": profile_meta.get("density_temperature"),
+            "q_prior": profile_meta.get("q_prior"),
+            "q_shrinkage": profile_meta.get("q_shrinkage"),
+            "q_min": profile_meta.get("q_min"),
+            "q_max": profile_meta.get("q_max"),
+            "defect_reduce": profile_meta.get("defect_reduce"),
+            "defect_quantile": profile_meta.get("defect_quantile"),
+            "sde_noise_kappa": profile_meta.get("sde_noise_kappa"),
+            "sde_brownian_bridge": profile_meta.get("sde_brownian_bridge"),
             "shared_profile_dir": str(cache_dir),
             "shared_profile_meta": profile_meta,
             "schedule_implementation_version": DEFECT_BALANCED_CLOCK_VERSION,

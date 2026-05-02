@@ -10,7 +10,7 @@ from src.clock.profile import ClockProfile, build_clock_profile_from_alpha
 
 StepFn = Callable[[torch.Tensor, float, float, int, int], torch.Tensor]
 VelocityFn = Callable[..., torch.Tensor]
-DEFECT_BALANCED_CLOCK_VERSION = 4
+DEFECT_BALANCED_CLOCK_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,33 @@ class DefectBalancedProfileArtifacts:
     effective_order_profile: np.ndarray
     smoothed_effective_order_profile: np.ndarray
     interval_alpha_profile: np.ndarray
+
+
+def reduce_defect(
+    defect_array: np.ndarray,
+    *,
+    method: str = "quantile",
+    quantile: float = 0.75,
+    eps: float = 1.0e-12,
+) -> np.ndarray:
+    d = np.maximum(np.asarray(defect_array, dtype=np.float64), float(eps))
+    if d.ndim != 2:
+        raise ValueError("defect_array must have shape [num_trajectories, num_steps].")
+    normalized = str(method).lower().replace("-", "_")
+    if normalized == "rms":
+        return np.sqrt(np.mean(np.square(d), axis=0))
+    if normalized == "mean":
+        return np.mean(d, axis=0)
+    if normalized == "median":
+        return np.median(d, axis=0)
+    if normalized == "quantile":
+        q = float(quantile)
+        if not 0.0 <= q <= 1.0:
+            raise ValueError("defect_quantile must be in [0, 1].")
+        return np.quantile(d, q, axis=0)
+    if normalized == "max":
+        return np.max(d, axis=0)
+    raise ValueError(f"Unknown defect_reduce: {method}")
 
 
 def smooth_profile(values: np.ndarray, window: int) -> np.ndarray:
@@ -362,6 +389,18 @@ def build_defect_balanced_profile(
     *,
     smoothing_window: int = 1,
     eps: float = 1.0e-12,
+    defect_reduce: str = "rms",
+    defect_quantile: float = 0.75,
+    q_prior: float | None = None,
+    q_shrinkage: float = 0.0,
+    q_min: float = 1.05,
+    q_max: float = 6.0,
+    density_temperature: float = 1.0,
+    prior_alpha: np.ndarray | None = None,
+    prior_blend: float = 0.0,
+    sigma_profile: np.ndarray | None = None,
+    solver_type: str = "ode",
+    sde_noise_kappa: float = 0.0,
 ) -> DefectBalancedProfileArtifacts:
     grid = np.asarray(physical_grid, dtype=np.float64)
     if grid.ndim != 1 or len(grid) < 2:
@@ -376,16 +415,52 @@ def build_defect_balanced_profile(
         raise ValueError("effective_order must match defect_strength shape.")
 
     safe_eps = float(eps)
-    defect_profile = np.sqrt(np.mean(np.square(np.maximum(defect, safe_eps)), axis=0))
+    defect_profile = reduce_defect(defect, method=defect_reduce, quantile=defect_quantile, eps=safe_eps)
     effective_order_profile = np.mean(order, axis=0)
 
     smoothed_log_defect = smooth_profile(np.log(np.maximum(defect_profile, safe_eps)), smoothing_window)
-    smoothed_order = smooth_profile(effective_order_profile, smoothing_window)
+    smoothed_order_raw = smooth_profile(effective_order_profile, smoothing_window)
+    if q_prior is None:
+        q_prior = float(np.mean(smoothed_order_raw))
+    shrinkage = float(q_shrinkage)
+    if not 0.0 <= shrinkage <= 1.0:
+        raise ValueError("q_shrinkage must be in [0, 1].")
+    smoothed_order = (1.0 - shrinkage) * smoothed_order_raw + shrinkage * float(q_prior)
+    smoothed_order = np.clip(smoothed_order, float(q_min), float(q_max))
     smoothed_defect = np.exp(smoothed_log_defect)
+    if str(solver_type).lower() == "sde" and float(sde_noise_kappa) > 0.0:
+        if sigma_profile is None:
+            raise ValueError("sigma_profile is required when sde_noise_kappa is positive.")
+        sigma_values = np.asarray(sigma_profile, dtype=np.float64)
+        if sigma_values.shape != smoothed_defect.shape:
+            raise ValueError("sigma_profile must have one value per interval.")
+        drift = smoothed_defect / max(float(np.mean(smoothed_defect)), safe_eps)
+        noise = np.square(np.maximum(sigma_values, 0.0))
+        noise = noise / max(float(np.mean(noise)), safe_eps)
+        smoothed_defect = drift + float(sde_noise_kappa) * noise
+        smoothed_log_defect = np.log(np.maximum(smoothed_defect, safe_eps))
     q_profile = np.maximum(smoothed_order, 1.0 + safe_eps)
     q_minus_one = np.maximum(q_profile - 1.0, safe_eps)
     interval_alpha = np.exp((np.log(q_minus_one) + smoothed_log_defect) / q_profile)
     node_alpha = _interval_profile_to_nodes(np.maximum(interval_alpha, safe_eps))
+    temperature = float(density_temperature)
+    if temperature <= 0.0:
+        raise ValueError("density_temperature must be positive.")
+    if not np.isclose(temperature, 1.0):
+        log_alpha = np.log(np.maximum(node_alpha, safe_eps))
+        log_alpha = temperature * log_alpha + (1.0 - temperature) * float(np.mean(log_alpha))
+        node_alpha = np.exp(log_alpha)
+    blend = float(prior_blend)
+    if not 0.0 <= blend <= 1.0:
+        raise ValueError("prior_blend must be in [0, 1].")
+    if prior_alpha is not None and blend > 0.0:
+        prior = np.asarray(prior_alpha, dtype=np.float64)
+        if prior.shape != node_alpha.shape:
+            raise ValueError("prior_alpha must have the same shape as the node alpha profile.")
+        prior = np.maximum(prior, safe_eps)
+        prior = prior / max(float(np.mean(prior)), safe_eps)
+        current = node_alpha / max(float(np.mean(node_alpha)), safe_eps)
+        node_alpha = (1.0 - blend) * current + blend * prior
     profile = build_clock_profile_from_alpha(grid, node_alpha)
     return DefectBalancedProfileArtifacts(
         profile=profile,

@@ -9,6 +9,7 @@ from src.clock.defect_balanced import (
     collect_velocity_curvature_stats,
     estimate_refinement_order_and_defect,
     nonuniform_second_derivative,
+    reduce_defect,
 )
 from src.clock.profile import build_reparameterized_bundle
 from src.utils.schedule_bundle import ScheduleBundle
@@ -179,3 +180,52 @@ def test_defect_balanced_profile_uses_local_order_density_weight() -> None:
         dtype=np.float64,
     )
     assert np.allclose(artifacts.interval_alpha_profile, expected)
+
+
+def test_reduce_defect_quantile_matches_median_and_max() -> None:
+    defect = np.asarray([[1.0, 10.0], [3.0, 2.0], [5.0, 6.0]], dtype=np.float64)
+
+    assert np.allclose(reduce_defect(defect, method="quantile", quantile=0.5), reduce_defect(defect, method="median"))
+    assert np.allclose(reduce_defect(defect, method="quantile", quantile=1.0), reduce_defect(defect, method="max"))
+
+
+def test_q_shrinkage_can_force_constant_prior() -> None:
+    grid = np.linspace(0.0, 1.0, 5, dtype=np.float64)
+    stats = StepRefinementStats(
+        full_step_error=np.ones((2, 4), dtype=np.float64),
+        half_step_error=np.ones((2, 4), dtype=np.float64),
+        effective_order=np.asarray([[1.2, 2.0, 3.0, 4.0], [1.4, 2.2, 3.2, 4.2]], dtype=np.float64),
+        defect_strength=np.ones((2, 4), dtype=np.float64),
+    )
+
+    artifacts = build_defect_balanced_profile(
+        grid,
+        stats,
+        q_prior=2.5,
+        q_shrinkage=1.0,
+        q_min=1.0,
+        q_max=4.0,
+    )
+
+    assert np.allclose(artifacts.smoothed_effective_order_profile, 2.5)
+
+
+def test_prior_blend_one_uses_prior_alpha() -> None:
+    grid = np.linspace(0.0, 1.0, 5, dtype=np.float64)
+    prior_alpha = np.asarray([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float64)
+    stats = StepRefinementStats(
+        full_step_error=np.ones((2, 4), dtype=np.float64),
+        half_step_error=np.ones((2, 4), dtype=np.float64),
+        effective_order=np.full((2, 4), 3.0, dtype=np.float64),
+        defect_strength=np.ones((2, 4), dtype=np.float64),
+    )
+
+    artifacts = build_defect_balanced_profile(
+        grid,
+        stats,
+        prior_alpha=prior_alpha,
+        prior_blend=1.0,
+    )
+
+    expected = prior_alpha / np.mean(prior_alpha)
+    assert np.allclose(artifacts.profile.alpha_profile, expected)

@@ -2,7 +2,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from scripts.run.compact_metrics_csv import build_row_filter, canonical_schedule_label
-from scripts.run.export_defect_clock_schedule import _build_profile_meta, profile_cache_dir, schedule_family_label
+import numpy as np
+
+from scripts.run.export_defect_clock_schedule import (
+    _build_profile_meta,
+    limit_schedule_step_sizes,
+    profile_cache_dir,
+    schedule_family_label,
+)
 from scripts.run.run_experiment_config import (
     build_invocations,
     canonical_schedule_name,
@@ -108,6 +115,39 @@ def test_profile_cache_dir_records_step_refinement_clock() -> None:
     assert meta["estimator"] == "step_refinement"
     assert meta["calibration_solver"] == "heun2"
     assert meta["coordinate_domain"] == "sigmas"
+
+
+def test_step_limiter_does_not_collapse_to_reference_schedule() -> None:
+    reference = np.linspace(10.0, 0.0, 11, dtype=np.float64)
+    nodes = np.asarray([10.0, 8.7, 7.2, 6.3, 5.4, 4.5, 3.6, 2.2, 1.1, 0.35, 0.0], dtype=np.float64)
+
+    limited, meta = limit_schedule_step_sizes(
+        nodes,
+        reference,
+        max_dt_factor=1.5,
+        max_neighbor_ratio=1.8,
+    )
+
+    assert meta["step_limiter_enabled"]
+    assert np.isclose(limited[0], nodes[0])
+    assert np.isclose(limited[-1], nodes[-1])
+    assert not np.allclose(limited, reference)
+    assert np.max(np.abs(np.diff(limited))) <= 1.5 * np.mean(np.abs(np.diff(reference))) + 1.0e-8
+
+
+def test_step_limiter_preserves_nonuniform_schedule_after_timestep_snap() -> None:
+    reference = np.asarray([999.0, 899.0, 799.0, 699.0, 599.0, 500.0, 400.0, 300.0, 200.0, 100.0, 0.0])
+    nodes = np.asarray([999.0, 930.2, 849.4, 756.1, 648.3, 522.0, 376.5, 215.4, 80.3, 13.1, 0.0])
+
+    limited, _ = limit_schedule_step_sizes(
+        nodes,
+        reference,
+        max_dt_factor=1.5,
+        max_neighbor_ratio=1.8,
+    )
+    snapped = np.rint(limited[:-1])
+
+    assert not np.allclose(snapped, reference[:-1])
 
 
 def test_build_invocations_expands_sadb_schedules_for_pndm_and_diffusers() -> None:

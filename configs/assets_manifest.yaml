@@ -51,6 +51,9 @@ assets:
   diffusers_practical_prompts:
     type: prompts
     path: data/pndm/prompts/modern_diffusers_practical_prompts.json
+  diffusers_ablation_prompts:
+    type: prompts
+    path: data/pndm/prompts/modern_diffusers_ablation_prompts.json
   hf_stable_diffusion_15:
     type: diffusers_model
     path: checkpoints/hf/runwayml--stable-diffusion-v1-5
