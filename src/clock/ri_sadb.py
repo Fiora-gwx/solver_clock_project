@@ -46,6 +46,17 @@ class RISADBArtifacts:
     residual_parallel_profile: np.ndarray
 
 
+@dataclass(frozen=True)
+class ShortWindowDefectStats:
+    interval_arc_defect: np.ndarray
+    interval_weight: np.ndarray
+    window_len: int
+    refine_factor: int
+    q_prior: float
+    defect_source: str
+    status: str = "OK"
+
+
 def _flatten_inner(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().float().reshape(tensor.shape[0], -1)
 
@@ -240,6 +251,75 @@ def concatenate_ri_sadb_stats(items: Sequence[TrajectoryGeometryStats]) -> Traje
         curvature=np.concatenate([item.curvature for item in items], axis=0),
         residual_perp_norm=np.concatenate([item.residual_perp_norm for item in items], axis=0),
         residual_parallel_norm=np.concatenate([item.residual_parallel_norm for item in items], axis=0),
+    )
+
+
+def distribute_short_window_arc_defect(
+    *,
+    delta_s: np.ndarray,
+    window_residual: np.ndarray,
+    window_len: int = 4,
+    q_prior: float = 3.0,
+    refine_factor: int = 2,
+    eps: float = 1.0e-12,
+    defect_source: str = "target_stork_short_window",
+) -> ShortWindowDefectStats:
+    arc = np.maximum(np.asarray(delta_s, dtype=np.float64), float(eps))
+    residual = np.maximum(np.asarray(window_residual, dtype=np.float64), float(eps))
+    if arc.ndim != 2:
+        raise ValueError("delta_s must have shape [num_trajectories, num_intervals].")
+    if residual.shape != arc.shape:
+        raise ValueError("window_residual must have shape [num_trajectories, num_intervals].")
+    width = max(int(window_len), 1)
+    if width > arc.shape[1]:
+        width = arc.shape[1]
+    q_value = max(float(q_prior), 1.0 + float(eps))
+    rho = max(abs(1.0 - 2.0 ** (1.0 - q_value)), float(eps))
+
+    accumulated = np.zeros_like(arc, dtype=np.float64)
+    coverage = np.zeros_like(arc, dtype=np.float64)
+    for start in range(arc.shape[1]):
+        stop = min(start + width, arc.shape[1])
+        window_arc = np.maximum(np.sum(arc[:, start:stop], axis=1), float(eps))
+        window_error = residual[:, start]
+        window_defect = window_error / (np.power(window_arc + float(eps), q_value) * rho + float(eps))
+        weights = arc[:, start:stop] / (window_arc[:, None] + float(eps))
+        accumulated[:, start:stop] += weights * window_defect[:, None]
+        coverage[:, start:stop] += weights
+
+    interval_defect = accumulated / (coverage + float(eps))
+    return ShortWindowDefectStats(
+        interval_arc_defect=np.maximum(interval_defect, float(eps)),
+        interval_weight=coverage,
+        window_len=width,
+        refine_factor=int(refine_factor),
+        q_prior=q_value,
+        defect_source=defect_source,
+    )
+
+
+def replace_ri_sadb_arc_defect(
+    stats: TrajectoryGeometryStats,
+    arc_defect: np.ndarray,
+    *,
+    q_prior: float,
+    eps: float = 1.0e-12,
+) -> TrajectoryGeometryStats:
+    defect = np.maximum(np.asarray(arc_defect, dtype=np.float64), float(eps))
+    delta_s = np.maximum(np.asarray(stats.delta_s, dtype=np.float64), float(eps))
+    if defect.shape != delta_s.shape:
+        raise ValueError("arc_defect must match stats.delta_s shape.")
+    q = np.full_like(delta_s, max(float(q_prior), 1.0 + float(eps)), dtype=np.float64)
+    rho = np.maximum(np.abs(1.0 - np.power(2.0, 1.0 - q)), float(eps))
+    residual_perp = defect * (np.power(delta_s + float(eps), q) * rho + float(eps))
+    return TrajectoryGeometryStats(
+        full_step_error=np.asarray(stats.full_step_error, dtype=np.float64),
+        half_step_error=np.asarray(stats.half_step_error, dtype=np.float64),
+        effective_order=q,
+        delta_s=delta_s,
+        curvature=np.asarray(stats.curvature, dtype=np.float64),
+        residual_perp_norm=np.maximum(residual_perp, float(eps)),
+        residual_parallel_norm=np.full_like(delta_s, float(eps), dtype=np.float64),
     )
 
 
