@@ -51,6 +51,8 @@ def schedule_family(schedule: str) -> str:
         return "AYS"
     if lower == "sadb" or lower.startswith("sadb["):
         return normalized if normalized.startswith("SADB") else "SADB" + normalized[4:]
+    if lower == "ri_sadb" or lower.startswith("ri_sadb["):
+        return normalized if normalized.startswith("RI_SADB") else "RI_SADB" + normalized[7:]
     return normalized
 
 
@@ -80,7 +82,11 @@ def build_comparisons(schedules: set[str]) -> list[tuple[str, str]]:
     comparisons: list[tuple[str, str]] = []
     if "AYS" in schedules and "base" in schedules:
         comparisons.append(("AYS", "base"))
-    sadb_schedules = sorted(schedule for schedule in schedules if schedule == "SADB" or schedule.startswith("SADB["))
+    sadb_schedules = sorted(
+        schedule
+        for schedule in schedules
+        if schedule == "SADB" or schedule.startswith("SADB[") or schedule == "RI_SADB" or schedule.startswith("RI_SADB[")
+    )
     for sadb in sadb_schedules:
         if "base" in schedules:
             comparisons.append((sadb, "base"))

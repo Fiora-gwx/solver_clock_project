@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.clock.baseline import BASELINE_SCHEDULE_IMPLEMENTATION_VERSION
 from src.clock.defect_balanced import DEFECT_BALANCED_CLOCK_VERSION
+from src.clock.ri_sadb import RI_SADB_CLOCK_VERSION
 from src.utils.config import dump_json, load_json, load_yaml, repo_root, resolve_repo_path
 from src.utils.nfe_budget import normalize_solver_name, resolve_effective_nfe_plan
 from src.utils.runtime_env import build_subprocess_env, command_preview, get_runtime_env, run_in_runtime_env
@@ -174,6 +175,7 @@ def canonical_schedule_name(name: str) -> tuple[str, str]:
         "linear": ("linear", "linear"),
         "ays": ("ays", "ays_like"),
         "sadb": ("SADB", "SADB"),
+        "ri_sadb": ("RI_SADB", "RI_SADB"),
         "v_b": ("V_b", "V_b"),
         "a_a": ("A_a", "A_a"),
         "a_b": ("A_b", "A_b"),
@@ -235,6 +237,7 @@ def resolve_schedule_clock_configs(
 ) -> ClockConfigRefs:
     configs: ClockConfigRefs = {
         "SADB": ((None, default_clock_config_path),),
+        "RI_SADB": ((None, "configs/clocks/RI_SADB.yaml"),),
     }
     raw_mapping = experiment_config.get("schedule_clock_configs")
     if raw_mapping is None:
@@ -334,8 +337,8 @@ def cached_schedule_root(cache_root: Path, schedule_folder: str, backend: str, *
 
 def is_materializable_schedule(backend: str, schedule_name: str) -> bool:
     materializable = {
-        "pndm": {"linear", "SADB"},
-        "diffusers": {"linear", "SADB"},
+        "pndm": {"linear", "SADB", "RI_SADB"},
+        "diffusers": {"linear", "SADB", "RI_SADB"},
     }
     return schedule_name in materializable.get(backend, set())
 
@@ -358,7 +361,7 @@ def schedule_target_dir(root: Path, nfe: int) -> Path:
 
 
 def maybe_seeded_schedule_parts(parts: tuple[str, ...], *, schedule_name: str, seed: int, seed_count: int) -> tuple[str, ...]:
-    if schedule_name == "SADB" and seed_count > 1:
+    if schedule_name in {"SADB", "RI_SADB"} and seed_count > 1:
         return (*parts, f"seed_{int(seed)}")
     return parts
 
@@ -477,7 +480,7 @@ def build_pndm_prepare_steps(
             for nfe in target_nfes
         )
 
-    if schedule_name == "SADB":
+    if schedule_name in {"SADB", "RI_SADB"}:
         variant_parts = schedule_parts or pndm_schedule_parts(
             dataset_name=dataset_name,
             model_asset=model_asset,
@@ -578,7 +581,7 @@ def build_diffusers_prepare_steps(
             for nfe in target_nfes
         )
 
-    if schedule_name == "SADB":
+    if schedule_name in {"SADB", "RI_SADB"}:
         variant_parts = schedule_parts or extend_schedule_parts((model_key, solver), clock_label)
         root = cached_schedule_root(schedule_cache_root, schedule_folder, "diffusers", *variant_parts)
         return (
@@ -1139,6 +1142,7 @@ def _expected_schedule_implementation_version(schedule_family: str) -> int | Non
         "base": BASELINE_SCHEDULE_IMPLEMENTATION_VERSION,
         "linear": BASELINE_SCHEDULE_IMPLEMENTATION_VERSION,
         "SADB": DEFECT_BALANCED_CLOCK_VERSION,
+        "RI_SADB": RI_SADB_CLOCK_VERSION,
     }
     return versions.get(schedule_family)
 

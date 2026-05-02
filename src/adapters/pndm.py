@@ -19,6 +19,7 @@ from src.clock.defect_balanced import (
     estimate_refinement_order_and_defect,
     per_sample_l2_norm,
 )
+from src.clock.ri_sadb import TrajectoryGeometryStats, collect_ri_sadb_stats, concatenate_ri_sadb_stats
 from src.clock.calibration import ForwardNormCollector
 from src.utils.nfe_budget import resolve_effective_nfe_plan
 from src.utils.config import load_yaml, repo_root
@@ -1456,6 +1457,104 @@ def collect_solver_refinement_stats(
         effective_order=np.concatenate([item.effective_order for item in batches], axis=0),
         defect_strength=np.concatenate([item.defect_strength for item in batches], axis=0),
     )
+
+
+def collect_ri_sadb_calibration_stats(
+    *,
+    model: torch.nn.Module,
+    scheduler,
+    physical_grid: np.ndarray,
+    solver: str,
+    image_size: int,
+    batch_size: int,
+    num_batches: int,
+    seed: int,
+    observation_microbatch: int | None = None,
+    model_output_type: str = "epsilon",
+    sigma_floor: float = 1.0e-6,
+    coordinate_domain: str = "timesteps",
+    q_min: float = 1.05,
+    q_max: float = 6.0,
+    eps: float = 1.0e-12,
+) -> TrajectoryGeometryStats:
+    normalized_solver = normalize_solver_name(solver)
+    if normalized_solver in {"dpm_solver_lu", "dpm_solver_default", "dpm_solver_pp", "dpm_solverpp"}:
+        raise ValueError("RI-SADB calibration is disabled for PNDM DPMSolver custom schedules.")
+    if normalized_solver in STORK_PNDM_SOLVERS:
+        raise ValueError("RI-SADB vector calibration is not implemented for stateful PNDM STORK solvers.")
+
+    grid = np.asarray(physical_grid, dtype=np.float64)
+    if grid.ndim != 1 or len(grid) < 2:
+        raise ValueError("physical_grid must contain at least two points.")
+
+    normalized_domain = str(coordinate_domain).lower().strip()
+    if normalized_domain not in {"timesteps", "sigmas"}:
+        raise ValueError(f"Unsupported PNDM coordinate domain: {coordinate_domain}")
+
+    if normalized_domain == "timesteps":
+        sigma_grid = _interp_sigmas_for_timesteps(scheduler, grid)
+        sigma_grid[-1] = 0.0
+        time_from_coordinate = lambda value: float(value)
+        sigma_from_coordinate = lambda value: float(
+            _interp_sigmas_for_timesteps(scheduler, np.asarray([value], dtype=np.float64))[0]
+        )
+        velocity_fn = build_velocity_oracle(
+            model,
+            scheduler,
+            model_output_type=model_output_type,
+            sigma_floor=sigma_floor,
+        )
+    else:
+        sigma_grid = grid
+        time_from_coordinate = lambda value: float(
+            _interp_timesteps_for_sigmas(scheduler, np.asarray([value], dtype=np.float64))[0]
+        )
+        sigma_from_coordinate = lambda value: float(value)
+        velocity_fn = build_sigma_derivative_oracle(
+            model,
+            scheduler,
+            model_output_type=model_output_type,
+        )
+
+    if normalized_solver == "euler":
+        step_fn = build_velocity_stepper(velocity_fn, "euler")
+    elif normalized_solver == "heun2":
+        step_fn = build_velocity_stepper(velocity_fn, "heun2")
+    else:
+        step_fn = _build_native_scheduler_stepper(
+            model=model,
+            scheduler=scheduler,
+            time_from_coordinate=time_from_coordinate,
+            sigma_from_coordinate=sigma_from_coordinate,
+            coordinate_domain=normalized_domain,
+        )
+
+    device = next(model.parameters()).device
+    generator = torch.Generator(device=device).manual_seed(seed)
+    batches: list[TrajectoryGeometryStats] = []
+    with torch.inference_mode():
+        for _ in range(num_batches):
+            sample = torch.randn(
+                (batch_size, model.in_channels, image_size, image_size),
+                generator=generator,
+                device=device,
+            ) * float(sigma_grid[0])
+            batches.append(
+                collect_ri_sadb_stats(
+                    initial_sample=sample,
+                    physical_grid=grid,
+                    velocity_fn=velocity_fn,
+                    step_fn=step_fn,
+                    observation_microbatch=observation_microbatch,
+                    q_min=q_min,
+                    q_max=q_max,
+                    eps=eps,
+                )
+            )
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    return concatenate_ri_sadb_stats(batches)
 
 
 def collect_velocity_curvature_calibration_stats(

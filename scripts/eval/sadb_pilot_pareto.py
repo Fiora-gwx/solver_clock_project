@@ -47,12 +47,16 @@ def schedule_family(schedule: str) -> str:
         return "AYS"
     if lower == "sadb" or lower.startswith("sadb["):
         return normalized if normalized.startswith("SADB") else "SADB" + normalized[4:]
+    if lower == "ri_sadb" or lower.startswith("ri_sadb["):
+        return normalized if normalized.startswith("RI_SADB") else "RI_SADB" + normalized[7:]
     return normalized
 
 
 def variant_label(schedule: str) -> str:
     if schedule.startswith("SADB[") and schedule.endswith("]"):
         return schedule.removeprefix("SADB[").removesuffix("]")
+    if schedule.startswith("RI_SADB[") and schedule.endswith("]"):
+        return schedule.removeprefix("RI_SADB[").removesuffix("]")
     return schedule
 
 
@@ -141,7 +145,11 @@ def main() -> None:
         model_asset, solver, nfe = key
         base_rows = {pair_key(row): row for row in schedules.get("base", [])}
         ays_rows = {pair_key(row): row for row in schedules.get("AYS", [])}
-        for schedule in sorted(item for item in schedules if item == "SADB" or item.startswith("SADB[")):
+        for schedule in sorted(
+            item
+            for item in schedules
+            if item == "SADB" or item.startswith("SADB[") or item == "RI_SADB" or item.startswith("RI_SADB[")
+        ):
             sadb_rows = schedules[schedule]
             sadb_by_key = {pair_key(row): row for row in sadb_rows}
             costs = [cost for row in sadb_rows if (cost := calibration_cost_from_meta(row)) is not None]

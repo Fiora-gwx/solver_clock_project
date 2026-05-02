@@ -20,6 +20,7 @@ from src.adapters.pndm import (
     build_pndm_native_coordinate_grid,
     build_pndm_sigma_grid,
     build_scheduler,
+    collect_ri_sadb_calibration_stats,
     collect_velocity_curvature_calibration_stats,
     collect_solver_refinement_stats,
     load_model,
@@ -35,7 +36,15 @@ from src.clock.defect_balanced import (
     build_velocity_stepper,
     collect_step_refinement_stats,
 )
-from src.clock.profile import ClockProfile, build_reparameterized_bundle, export_clock_sweep, slice_profile_interval
+from src.clock.ri_sadb import (
+    RI_SADB_CLOCK_VERSION,
+    RI_SADB_FORMULA_VERSION,
+    RISADBArtifacts,
+    build_ri_sadb_profile,
+    collect_ri_sadb_stats,
+    concatenate_ri_sadb_stats,
+)
+from src.clock.profile import ClockProfile, build_reparameterized_bundle, slice_profile_interval
 from src.clock.transforms import (
     build_lambda_table,
     lambda_to_sigma,
@@ -45,12 +54,15 @@ from src.clock.transforms import (
 )
 from src.utils.assets import AssetManifest
 from src.utils.config import dump_json, ensure_dir, load_json, load_yaml, resolve_repo_path
+from src.utils.nfe_budget import resolve_effective_nfe_plan
 from src.utils.schedule_bundle import ScheduleBundle
 
 
 SCHEDULE_FAMILY = "SADB"
+RI_SADB_SCHEDULE_FAMILY = "RI_SADB"
 DEFAULT_ESTIMATOR_NAME = "step_refinement"
 VELOCITY_CURVATURE_ESTIMATOR_NAME = "velocity_curvature"
+RI_SADB_ESTIMATOR_NAME = "ri_sadb"
 PROFILE_ARRAY_FILES = (
     "physical_grid.npy",
     "alpha_profile.npy",
@@ -95,15 +107,25 @@ def load_clock_settings(path: str) -> dict[str, Any]:
     clock = payload.get("clock", {})
     if not isinstance(clock, dict):
         raise TypeError("clock config must contain a `clock` mapping.")
-    if str(clock.get("family", "")).upper() != SCHEDULE_FAMILY:
-        raise ValueError(f"Defect-clock exporter expects `clock.family: {SCHEDULE_FAMILY}`.")
-    estimator = str(clock.get("estimator", DEFAULT_ESTIMATOR_NAME)).lower().replace("-", "_")
-    if estimator in {"curvature", "velocity_curvature", "velocity_curvature_q3"}:
-        estimator = VELOCITY_CURVATURE_ESTIMATOR_NAME
-    if estimator not in {DEFAULT_ESTIMATOR_NAME, VELOCITY_CURVATURE_ESTIMATOR_NAME}:
-        raise ValueError(
-            "SADB expects clock.estimator to be one of: step_refinement, velocity_curvature."
-        )
+    family = str(clock.get("family", SCHEDULE_FAMILY)).upper().replace("-", "_")
+    if family not in {SCHEDULE_FAMILY, RI_SADB_SCHEDULE_FAMILY}:
+        raise ValueError(f"Defect-clock exporter expects `clock.family` to be one of: SADB, RI_SADB.")
+    clock["family"] = family
+    if family == RI_SADB_SCHEDULE_FAMILY:
+        estimator = RI_SADB_ESTIMATOR_NAME
+        clock["eta"] = float(clock.get("eta", 0.25))
+        clock["beta"] = float(clock.get("beta", 0.0))
+        clock["ell_scale"] = str(clock.get("ell_scale", "step"))
+        clock["ri_agg"] = str(clock.get("ri_agg", "mean"))
+        clock["calibration_mode"] = str(clock.get("calibration_mode", "ri_sadb"))
+    else:
+        estimator = str(clock.get("estimator", DEFAULT_ESTIMATOR_NAME)).lower().replace("-", "_")
+        if estimator in {"curvature", "velocity_curvature", "velocity_curvature_q3"}:
+            estimator = VELOCITY_CURVATURE_ESTIMATOR_NAME
+        if estimator not in {DEFAULT_ESTIMATOR_NAME, VELOCITY_CURVATURE_ESTIMATOR_NAME}:
+            raise ValueError(
+                "SADB expects clock.estimator to be one of: step_refinement, velocity_curvature."
+            )
     clock["estimator"] = estimator
     model_output_type = str(clock.get("model_output_type", "epsilon")).lower()
     if model_output_type not in {"epsilon", "v_prediction", "flow"}:
@@ -196,8 +218,10 @@ def _diffusers_reference_sigma_grid(scheduler, *, effective_nfe: int, device: st
     return values
 
 
-def schedule_family_label() -> str:
-    return SCHEDULE_FAMILY
+def schedule_family_label(clock_config: dict[str, Any] | None = None) -> str:
+    if clock_config is None:
+        return SCHEDULE_FAMILY
+    return str(clock_config.get("family", SCHEDULE_FAMILY))
 
 
 def build_pndm_physical_grid(
@@ -524,6 +548,7 @@ def resolve_calibration_solver(clock_config: dict[str, Any], target_solver: str)
 def profile_cache_dir(
     *,
     cache_root: Path,
+    schedule_family: str = SCHEDULE_FAMILY,
     backend: str,
     dataset_name: str | None,
     model_asset: str,
@@ -554,8 +579,14 @@ def profile_cache_dir(
     prior_schedule: str | None = None,
     prior_blend: float | None = None,
     sde_noise_kappa: float | None = None,
+    target_nfe: int | None = None,
+    target_steps: int | None = None,
+    eta: float | None = None,
+    beta: float | None = None,
+    ell_scale: str | None = None,
+    ri_agg: str | None = None,
 ) -> Path:
-    parts = [backend, SCHEDULE_FAMILY, estimator]
+    parts = [backend, str(schedule_family), estimator]
     if dataset_name:
         parts.append(dataset_name)
     parts.extend(
@@ -601,10 +632,22 @@ def profile_cache_dir(
         parts.append(f"pblend_{prior_blend:g}")
     if sde_noise_kappa is not None:
         parts.append(f"sdek_{sde_noise_kappa:g}")
+    if target_nfe is not None:
+        parts.append(f"nfe_{int(target_nfe)}")
+    if target_steps is not None:
+        parts.append(f"steps_{int(target_steps)}")
+    if eta is not None:
+        parts.append(f"eta_{float(eta):g}")
+    if beta is not None:
+        parts.append(f"beta_{float(beta):g}")
+    if ell_scale:
+        parts.append(f"ell_{ell_scale}")
+    if ri_agg:
+        parts.append(f"riagg_{ri_agg}")
     return cache_root.joinpath(*parts)
 
 
-def save_profile(output_dir: Path, artifacts: DefectBalancedProfileArtifacts, meta: dict[str, Any]) -> None:
+def save_profile(output_dir: Path, artifacts: DefectBalancedProfileArtifacts | RISADBArtifacts, meta: dict[str, Any]) -> None:
     ensure_dir(output_dir)
     np.save(output_dir / "physical_grid.npy", artifacts.profile.physical_grid)
     np.save(output_dir / "alpha_profile.npy", artifacts.profile.alpha_profile)
@@ -615,6 +658,10 @@ def save_profile(output_dir: Path, artifacts: DefectBalancedProfileArtifacts, me
     np.save(output_dir / "effective_order_profile.npy", artifacts.effective_order_profile)
     np.save(output_dir / "smoothed_effective_order_profile.npy", artifacts.smoothed_effective_order_profile)
     np.save(output_dir / "interval_alpha_profile.npy", artifacts.interval_alpha_profile)
+    if isinstance(artifacts, RISADBArtifacts):
+        np.save(output_dir / "geometry_profile.npy", artifacts.geometry_profile)
+        np.save(output_dir / "residual_perp_profile.npy", artifacts.residual_perp_profile)
+        np.save(output_dir / "residual_parallel_profile.npy", artifacts.residual_parallel_profile)
     dump_json(meta, output_dir / "meta.json")
 
 
@@ -651,6 +698,8 @@ def load_cached_profile_if_current(input_dir: Path, expected_meta: dict[str, Any
 
 def _build_profile_meta(
     *,
+    schedule_family: str = SCHEDULE_FAMILY,
+    schedule_implementation_version: int | None = None,
     backend: str,
     model_asset: str,
     solver: str,
@@ -677,12 +726,22 @@ def _build_profile_meta(
     defect_quantile: float = 0.75,
     sde_noise_kappa: float = 0.0,
     sde_brownian_bridge: bool = False,
+    target_nfe: int | None = None,
+    target_steps: int | None = None,
+    eta: float | None = None,
+    beta: float | None = None,
+    ell_scale: str | None = None,
+    ri_agg: str | None = None,
 ) -> dict[str, Any]:
+    if schedule_implementation_version is None:
+        schedule_implementation_version = (
+            RI_SADB_CLOCK_VERSION if schedule_family == RI_SADB_SCHEDULE_FAMILY else DEFECT_BALANCED_CLOCK_VERSION
+        )
     meta = {
         "backend": backend,
         "model_asset": model_asset,
-        "schedule_family": SCHEDULE_FAMILY,
-        "schedule_implementation_version": DEFECT_BALANCED_CLOCK_VERSION,
+        "schedule_family": schedule_family,
+        "schedule_implementation_version": schedule_implementation_version,
         "estimator": estimator,
         "solver": solver,
         "calibration_solver": calibration_solver,
@@ -708,11 +767,27 @@ def _build_profile_meta(
         "sde_noise_kappa": sde_noise_kappa,
         "sde_brownian_bridge": sde_brownian_bridge,
         "calibration_method": (
-            "velocity_curvature_pilot_trajectory"
-            if estimator == VELOCITY_CURVATURE_ESTIMATOR_NAME
-            else "solver_step_refinement_full_half_quarter"
+            "ri_sadb_projected_residual_geometry"
+            if estimator == RI_SADB_ESTIMATOR_NAME
+            else (
+                "velocity_curvature_pilot_trajectory"
+                if estimator == VELOCITY_CURVATURE_ESTIMATOR_NAME
+                else "solver_step_refinement_full_half_quarter"
+            )
         ),
     }
+    if schedule_family == RI_SADB_SCHEDULE_FAMILY:
+        meta.update(
+            {
+                "eta": eta,
+                "beta": beta,
+                "ell_scale": ell_scale,
+                "ri_agg": ri_agg,
+                "ri_formula_version": RI_SADB_FORMULA_VERSION,
+                "target_nfe": target_nfe,
+                "target_steps": target_steps,
+            }
+        )
     if extra:
         meta.update(extra)
     return meta
@@ -723,6 +798,7 @@ def build_or_load_pndm_profile(
     manifest: AssetManifest,
     args: argparse.Namespace,
     clock_config: dict[str, Any],
+    target_nfe: int | None = None,
 ) -> tuple[ClockProfile, Path, dict[str, Any]]:
     dataset_config = load_yaml(args.dataset_config)
     model_asset = args.model_asset or dataset_config["default_model_asset"]
@@ -731,7 +807,13 @@ def build_or_load_pndm_profile(
     schedule_cfg = native_config["Schedule"]
     target_solver = str(args.solver or "euler")
     calibration_solver = resolve_calibration_solver(clock_config, target_solver)
+    schedule_family = str(clock_config.get("family", SCHEDULE_FAMILY))
     estimator = str(clock_config["estimator"])
+    target_steps = None
+    if schedule_family == RI_SADB_SCHEDULE_FAMILY:
+        if target_nfe is None:
+            raise ValueError("RI_SADB profile export requires a concrete target_nfe.")
+        target_steps = resolve_effective_nfe_plan(target_solver, int(target_nfe)).solver_steps
     coordinate_domain = preferred_calibration_domain(calibration_solver)
     physical_grid_size = int(clock_config.get("physical_grid_size", 65))
     smoothing_window = int(clock_config.get("smoothing_window", 1))
@@ -745,6 +827,7 @@ def build_or_load_pndm_profile(
     cache_root = resolve_repo_path(clock_config.get("cache_path", "outputs/cache/sadb_profiles"))
     cache_dir = profile_cache_dir(
         cache_root=cache_root,
+        schedule_family=schedule_family,
         backend="pndm",
         dataset_name=str(dataset_config["name"]),
         model_asset=str(model_asset),
@@ -763,6 +846,12 @@ def build_or_load_pndm_profile(
         seed=args.seed,
         model_output_type=str(clock_config["model_output_type"]),
         coordinate_domain=coordinate_domain,
+        target_nfe=target_nfe if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        target_steps=target_steps,
+        eta=clock_config.get("eta") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        beta=clock_config.get("beta") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        ell_scale=clock_config.get("ell_scale") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        ri_agg=clock_config.get("ri_agg") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
     )
     extra_meta = {
         "dataset": dataset_config["name"],
@@ -782,6 +871,7 @@ def build_or_load_pndm_profile(
             }
         )
     profile_meta = _build_profile_meta(
+        schedule_family=schedule_family,
         backend="pndm",
         model_asset=str(model_asset),
         solver=target_solver,
@@ -798,6 +888,12 @@ def build_or_load_pndm_profile(
         q_max=q_max,
         model_output_type=str(clock_config["model_output_type"]),
         coordinate_domain=coordinate_domain,
+        target_nfe=target_nfe if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        target_steps=target_steps,
+        eta=clock_config.get("eta") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        beta=clock_config.get("beta") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        ell_scale=clock_config.get("ell_scale") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        ri_agg=clock_config.get("ri_agg") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
         extra=extra_meta,
     )
     cached_profile = load_cached_profile_if_current(cache_dir, profile_meta)
@@ -817,7 +913,25 @@ def build_or_load_pndm_profile(
         diffusion_step=int(schedule_cfg["diffusion_step"]),
         physical_grid_size=physical_grid_size,
     )
-    if estimator == VELOCITY_CURVATURE_ESTIMATOR_NAME:
+    if estimator == RI_SADB_ESTIMATOR_NAME:
+        stats = collect_ri_sadb_calibration_stats(
+            model=model,
+            scheduler=scheduler,
+            physical_grid=physical_grid,
+            solver=calibration_solver,
+            image_size=int(dataset_config["image_size"]),
+            batch_size=pilot_batch_size,
+            num_batches=pilot_num_batches,
+            seed=args.seed,
+            observation_microbatch=pilot_observation_microbatch,
+            model_output_type=str(clock_config["model_output_type"]),
+            sigma_floor=epsilon,
+            coordinate_domain=coordinate_domain,
+            q_min=q_min,
+            q_max=q_max,
+            eps=epsilon,
+        )
+    elif estimator == VELOCITY_CURVATURE_ESTIMATOR_NAME:
         stats = collect_velocity_curvature_calibration_stats(
             model=model,
             scheduler=scheduler,
@@ -856,12 +970,28 @@ def build_or_load_pndm_profile(
             eps=epsilon,
         )
 
-    artifacts = build_defect_balanced_profile(
-        physical_grid,
-        stats,
-        smoothing_window=smoothing_window,
-        eps=epsilon,
-    )
+    if estimator == RI_SADB_ESTIMATOR_NAME:
+        assert target_steps is not None
+        artifacts = build_ri_sadb_profile(
+            physical_grid,
+            stats,
+            target_steps=target_steps,
+            eta=float(clock_config["eta"]),
+            beta=float(clock_config["beta"]),
+            ell_scale=str(clock_config["ell_scale"]),
+            ri_agg=str(clock_config["ri_agg"]),
+            eps=epsilon,
+            q_min=q_min,
+            q_max=q_max,
+            smoothing_window=smoothing_window,
+        )
+    else:
+        artifacts = build_defect_balanced_profile(
+            physical_grid,
+            stats,
+            smoothing_window=smoothing_window,
+            eps=epsilon,
+        )
     save_profile(cache_dir, artifacts, profile_meta)
     return artifacts.profile, cache_dir, profile_meta
 
@@ -871,6 +1001,7 @@ def build_or_load_diffusers_profile(
     manifest: AssetManifest,
     args: argparse.Namespace,
     clock_config: dict[str, Any],
+    target_nfe: int | None = None,
 ) -> tuple[ClockProfile, Path, dict[str, Any]]:
     from src.adapters.diffusers import (
         build_defect_sigma_grid,
@@ -883,9 +1014,15 @@ def build_or_load_diffusers_profile(
     model_asset = str(args.model_asset)
     target_solver = normalize_diffusers_solver(str(args.solver or "flow_euler"))
     calibration_solver = normalize_diffusers_solver(resolve_calibration_solver(clock_config, target_solver))
+    schedule_family = str(clock_config.get("family", SCHEDULE_FAMILY))
     estimator = str(clock_config["estimator"])
     if estimator == VELOCITY_CURVATURE_ESTIMATOR_NAME:
         raise ValueError("velocity_curvature calibration is currently implemented for backend=pndm only.")
+    target_steps = None
+    if schedule_family == RI_SADB_SCHEDULE_FAMILY:
+        if target_nfe is None:
+            raise ValueError("RI_SADB profile export requires a concrete target_nfe.")
+        target_steps = resolve_effective_nfe_plan(target_solver, int(target_nfe)).solver_steps
     effective_model_output_type = "flow" if _diffusers_solver_uses_flow_prediction(target_solver) else str(clock_config["model_output_type"])
     coordinate_domain = str(clock_config.get("coordinate_domain", "lambda"))
     if _diffusers_solver_uses_flow_prediction(target_solver) and coordinate_domain == "lambda":
@@ -922,6 +1059,7 @@ def build_or_load_diffusers_profile(
     cache_root = resolve_repo_path(clock_config.get("cache_path", "outputs/cache/sadb_profiles"))
     cache_dir = profile_cache_dir(
         cache_root=cache_root,
+        schedule_family=schedule_family,
         backend="diffusers",
         dataset_name=None,
         model_asset=model_asset,
@@ -952,8 +1090,15 @@ def build_or_load_diffusers_profile(
         prior_schedule=prior_schedule,
         prior_blend=prior_blend,
         sde_noise_kappa=sde_noise_kappa,
+        target_nfe=target_nfe if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        target_steps=target_steps,
+        eta=clock_config.get("eta") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        beta=clock_config.get("beta") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        ell_scale=clock_config.get("ell_scale") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        ri_agg=clock_config.get("ri_agg") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
     )
     profile_meta = _build_profile_meta(
+        schedule_family=schedule_family,
         backend="diffusers",
         model_asset=model_asset,
         solver=target_solver,
@@ -979,6 +1124,12 @@ def build_or_load_diffusers_profile(
         defect_quantile=defect_quantile,
         sde_noise_kappa=sde_noise_kappa,
         sde_brownian_bridge=sde_brownian_bridge,
+        target_nfe=target_nfe if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        target_steps=target_steps,
+        eta=clock_config.get("eta") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        beta=clock_config.get("beta") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        ell_scale=clock_config.get("ell_scale") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+        ri_agg=clock_config.get("ri_agg") if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
         extra={
             "pilot_prompt_asset": pilot_prompt_asset,
             "uses_evaluation_prompts": False,
@@ -1078,45 +1229,76 @@ def build_or_load_diffusers_profile(
 
                 velocity_fn = velocity_lambda
             step_fn = build_velocity_stepper(velocity_fn, calibration_solver)
-            stats_batches.append(
-                collect_step_refinement_stats(
-                    initial_sample=batch.initial_latents,
-                    physical_grid=physical_grid,
-                    step_fn=step_fn,
-                    observation_microbatch=pilot_observation_microbatch,
-                    q_min=q_min,
-                    q_max=q_max,
-                    eps=epsilon,
+            if estimator == RI_SADB_ESTIMATOR_NAME:
+                stats_batches.append(
+                    collect_ri_sadb_stats(
+                        initial_sample=batch.initial_latents,
+                        physical_grid=physical_grid,
+                        velocity_fn=velocity_fn,
+                        step_fn=step_fn,
+                        observation_microbatch=pilot_observation_microbatch,
+                        q_min=q_min,
+                        q_max=q_max,
+                        eps=epsilon,
+                    )
                 )
-            )
+            else:
+                stats_batches.append(
+                    collect_step_refinement_stats(
+                        initial_sample=batch.initial_latents,
+                        physical_grid=physical_grid,
+                        step_fn=step_fn,
+                        observation_microbatch=pilot_observation_microbatch,
+                        q_min=q_min,
+                        q_max=q_max,
+                        eps=epsilon,
+                    )
+                )
             device = get_pipeline_device(pipeline)
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-    stats = StepRefinementStats(
-        full_step_error=np.concatenate([item.full_step_error for item in stats_batches], axis=0),
-        half_step_error=np.concatenate([item.half_step_error for item in stats_batches], axis=0),
-        effective_order=np.concatenate([item.effective_order for item in stats_batches], axis=0),
-        defect_strength=np.concatenate([item.defect_strength for item in stats_batches], axis=0),
-    )
-    artifacts = build_defect_balanced_profile(
-        physical_grid,
-        stats,
-        smoothing_window=smoothing_window,
-        eps=epsilon,
-        defect_reduce=defect_reduce,
-        defect_quantile=defect_quantile,
-        q_prior=q_prior,
-        q_shrinkage=q_shrinkage,
-        q_min=q_min,
-        q_max=q_max,
-        density_temperature=density_temperature,
-        prior_alpha=prior_alpha,
-        prior_blend=prior_blend,
-        sigma_profile=sigma_profile,
-        solver_type="sde" if "sde" in target_solver else "ode",
-        sde_noise_kappa=sde_noise_kappa,
-    )
+    if estimator == RI_SADB_ESTIMATOR_NAME:
+        assert target_steps is not None
+        stats = concatenate_ri_sadb_stats(stats_batches)
+        artifacts = build_ri_sadb_profile(
+            physical_grid,
+            stats,
+            target_steps=target_steps,
+            eta=float(clock_config["eta"]),
+            beta=float(clock_config["beta"]),
+            ell_scale=str(clock_config["ell_scale"]),
+            ri_agg=str(clock_config["ri_agg"]),
+            eps=epsilon,
+            q_min=q_min,
+            q_max=q_max,
+            smoothing_window=smoothing_window,
+        )
+    else:
+        stats = StepRefinementStats(
+            full_step_error=np.concatenate([item.full_step_error for item in stats_batches], axis=0),
+            half_step_error=np.concatenate([item.half_step_error for item in stats_batches], axis=0),
+            effective_order=np.concatenate([item.effective_order for item in stats_batches], axis=0),
+            defect_strength=np.concatenate([item.defect_strength for item in stats_batches], axis=0),
+        )
+        artifacts = build_defect_balanced_profile(
+            physical_grid,
+            stats,
+            smoothing_window=smoothing_window,
+            eps=epsilon,
+            defect_reduce=defect_reduce,
+            defect_quantile=defect_quantile,
+            q_prior=q_prior,
+            q_shrinkage=q_shrinkage,
+            q_min=q_min,
+            q_max=q_max,
+            density_temperature=density_temperature,
+            prior_alpha=prior_alpha,
+            prior_blend=prior_blend,
+            sigma_profile=sigma_profile,
+            solver_type="sde" if "sde" in target_solver else "ode",
+            sde_noise_kappa=sde_noise_kappa,
+        )
     save_profile(cache_dir, artifacts, profile_meta)
     return artifacts.profile, cache_dir, profile_meta
 
@@ -1129,27 +1311,50 @@ def export_pndm(args: argparse.Namespace) -> None:
     target_nfes = parse_target_nfes(args.target_nfes, list(clock_config.get("target_nfes", [])))
     target_solver = str(args.solver or "euler")
     calibration_solver = resolve_calibration_solver(clock_config, target_solver)
+    schedule_family = str(clock_config.get("family", SCHEDULE_FAMILY))
     representation = preferred_schedule_representation(target_solver)
     coordinate_domain = preferred_calibration_domain(calibration_solver)
-    profile, cache_dir, profile_meta = build_or_load_pndm_profile(
-        manifest=manifest,
-        args=args,
-        clock_config=clock_config,
-    )
-    export_meta = {
-        "backend": "pndm",
-        "dataset": dataset_config["name"],
-        "model_asset": model_asset,
-        "solver": target_solver,
-        "calibration_solver": calibration_solver,
-        "coordinate_domain": coordinate_domain,
-        "clock_config": args.clock_config,
-        "clock_model_output_type": str(profile_meta.get("model_output_type", "flow")),
-        "estimator": str(clock_config["estimator"]),
-        "shared_profile_dir": str(cache_dir),
-        "shared_profile_meta": profile_meta,
-        "schedule_implementation_version": DEFECT_BALANCED_CLOCK_VERSION,
-    }
+    shared_profile: ClockProfile | None = None
+    shared_cache_dir: Path | None = None
+    shared_profile_meta: dict[str, Any] | None = None
+    if schedule_family != RI_SADB_SCHEDULE_FAMILY:
+        shared_profile, shared_cache_dir, shared_profile_meta = build_or_load_pndm_profile(
+            manifest=manifest,
+            args=args,
+            clock_config=clock_config,
+        )
+
+    def profile_for_nfe(effective_nfe: int) -> tuple[ClockProfile, Path, dict[str, Any]]:
+        if schedule_family == RI_SADB_SCHEDULE_FAMILY:
+            return build_or_load_pndm_profile(
+                manifest=manifest,
+                args=args,
+                clock_config=clock_config,
+                target_nfe=int(effective_nfe),
+            )
+        assert shared_profile is not None and shared_cache_dir is not None and shared_profile_meta is not None
+        return shared_profile, shared_cache_dir, shared_profile_meta
+
+    def export_meta_for(cache_dir: Path, profile_meta: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "backend": "pndm",
+            "dataset": dataset_config["name"],
+            "model_asset": model_asset,
+            "solver": target_solver,
+            "calibration_solver": calibration_solver,
+            "coordinate_domain": coordinate_domain,
+            "clock_config": args.clock_config,
+            "clock_model_output_type": str(profile_meta.get("model_output_type", "flow")),
+            "estimator": str(clock_config["estimator"]),
+            "shared_profile_dir": str(cache_dir),
+            "shared_profile_meta": profile_meta,
+            "schedule_implementation_version": int(profile_meta.get("schedule_implementation_version", DEFECT_BALANCED_CLOCK_VERSION)),
+            "eta": profile_meta.get("eta"),
+            "beta": profile_meta.get("beta"),
+            "ell_scale": profile_meta.get("ell_scale"),
+            "ri_agg": profile_meta.get("ri_agg"),
+            "ri_formula_version": profile_meta.get("ri_formula_version"),
+        }
     if representation == "sigmas":
         native_config = load_native_config(dataset_config["native_config"])
         schedule_cfg = native_config["Schedule"]
@@ -1166,6 +1371,8 @@ def export_pndm(args: argparse.Namespace) -> None:
         )
         output_root = Path(args.output_root)
         for effective_nfe in target_nfes:
+            profile, cache_dir, profile_meta = profile_for_nfe(int(effective_nfe))
+            export_meta = export_meta_for(cache_dir, profile_meta)
             active_profile = profile
             if coordinate_domain == "sigmas":
                 native_coordinate_grid = build_pndm_native_coordinate_grid(
@@ -1184,7 +1391,7 @@ def export_pndm(args: argparse.Namespace) -> None:
                 effective_nfe=int(effective_nfe),
                 solver_name=target_solver,
                 representation=representation,
-                schedule_family=SCHEDULE_FAMILY,
+                schedule_family=schedule_family,
                 meta={
                     **export_meta,
                     "native_coordinate_start": float(active_profile.physical_grid[0]),
@@ -1256,12 +1463,14 @@ def export_pndm(args: argparse.Namespace) -> None:
     )
     output_root = Path(args.output_root)
     for effective_nfe in target_nfes:
+        profile, cache_dir, profile_meta = profile_for_nfe(int(effective_nfe))
+        export_meta = export_meta_for(cache_dir, profile_meta)
         bundle = build_reparameterized_bundle(
             profile,
             effective_nfe=int(effective_nfe),
             solver_name=target_solver,
             representation=representation,
-            schedule_family=SCHEDULE_FAMILY,
+            schedule_family=schedule_family,
             meta=export_meta,
             representation_transform=timestep_transform,
             time_transform=timestep_transform,
@@ -1295,11 +1504,21 @@ def export_diffusers(args: argparse.Namespace) -> None:
     manifest = AssetManifest(args.manifest)
     clock_config = load_clock_settings(args.clock_config)
     target_nfes = parse_target_nfes(args.target_nfes, list(clock_config.get("target_nfes", [])))
-    profile, cache_dir, profile_meta = build_or_load_diffusers_profile(
-        manifest=manifest,
-        args=args,
-        clock_config=clock_config,
-    )
+    schedule_family = str(clock_config.get("family", SCHEDULE_FAMILY))
+    profile_cache: dict[int, tuple[ClockProfile, Path, dict[str, Any]]] = {}
+
+    def profile_for_nfe(effective_nfe: int) -> tuple[ClockProfile, Path, dict[str, Any]]:
+        cache_key = int(effective_nfe) if schedule_family == RI_SADB_SCHEDULE_FAMILY else -1
+        if cache_key not in profile_cache:
+            profile_cache[cache_key] = build_or_load_diffusers_profile(
+                manifest=manifest,
+                args=args,
+                clock_config=clock_config,
+                target_nfe=int(effective_nfe) if schedule_family == RI_SADB_SCHEDULE_FAMILY else None,
+            )
+        return profile_cache[cache_key]
+
+    profile, cache_dir, profile_meta = profile_for_nfe(int(target_nfes[0]))
     time_transform = None
     target_scheduler = None
     if not _diffusers_solver_uses_flow_prediction(str(args.solver or "flow_euler")):
@@ -1323,12 +1542,13 @@ def export_diffusers(args: argparse.Namespace) -> None:
         timestep_to_sigma = _build_diffusers_timestep_to_sigma_transform(target_scheduler)
         exported = []
         for effective_nfe in target_nfes:
+            profile, cache_dir, profile_meta = profile_for_nfe(int(effective_nfe))
             bundle = build_reparameterized_bundle(
                 profile,
                 effective_nfe=int(effective_nfe),
                 solver_name=str(args.solver or "flow_euler"),
                 representation="sigmas",
-                schedule_family=SCHEDULE_FAMILY,
+                schedule_family=schedule_family,
                 meta={
                     "backend": "diffusers",
                     "model_asset": args.model_asset,
@@ -1353,7 +1573,12 @@ def export_diffusers(args: argparse.Namespace) -> None:
                     "sde_brownian_bridge": profile_meta.get("sde_brownian_bridge"),
                     "shared_profile_dir": str(cache_dir),
                     "shared_profile_meta": profile_meta,
-                    "schedule_implementation_version": DEFECT_BALANCED_CLOCK_VERSION,
+                    "schedule_implementation_version": int(profile_meta.get("schedule_implementation_version", DEFECT_BALANCED_CLOCK_VERSION)),
+                    "eta": profile_meta.get("eta"),
+                    "beta": profile_meta.get("beta"),
+                    "ell_scale": profile_meta.get("ell_scale"),
+                    "ri_agg": profile_meta.get("ri_agg"),
+                    "ri_formula_version": profile_meta.get("ri_formula_version"),
                 },
                 representation_transform=representation_transform,
                 time_transform=time_transform,
@@ -1437,41 +1662,49 @@ def export_diffusers(args: argparse.Namespace) -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return
-    export_clock_sweep(
-        profile,
-        target_nfes,
-        output_root=args.output_root,
-        solver_name=str(args.solver or "flow_euler"),
-        representation="sigmas",
-        schedule_family=SCHEDULE_FAMILY,
-        meta={
-            "backend": "diffusers",
-            "model_asset": args.model_asset,
-            "solver": args.solver or "flow_euler",
-            "calibration_solver": profile_meta["calibration_solver"],
-            "clock_config": args.clock_config,
-            "clock_model_output_type": str(clock_config["model_output_type"]),
-            "estimator": str(clock_config["estimator"]),
-            "physical_grid_mode": profile_meta.get("physical_grid_mode"),
-            "sadb_version": "v2",
-            "coordinate_domain": profile_meta.get("coordinate_domain"),
-            "prior_schedule": profile_meta.get("prior_schedule"),
-            "prior_blend": profile_meta.get("prior_blend"),
-            "density_temperature": profile_meta.get("density_temperature"),
-            "q_prior": profile_meta.get("q_prior"),
-            "q_shrinkage": profile_meta.get("q_shrinkage"),
-            "q_min": profile_meta.get("q_min"),
-            "q_max": profile_meta.get("q_max"),
-            "defect_reduce": profile_meta.get("defect_reduce"),
-            "defect_quantile": profile_meta.get("defect_quantile"),
-            "sde_noise_kappa": profile_meta.get("sde_noise_kappa"),
-            "sde_brownian_bridge": profile_meta.get("sde_brownian_bridge"),
-            "shared_profile_dir": str(cache_dir),
-            "shared_profile_meta": profile_meta,
-            "schedule_implementation_version": DEFECT_BALANCED_CLOCK_VERSION,
-        },
-        time_transform=time_transform,
-    )
+    output_root = Path(args.output_root)
+    for effective_nfe in target_nfes:
+        profile, cache_dir, profile_meta = profile_for_nfe(int(effective_nfe))
+        bundle = build_reparameterized_bundle(
+            profile,
+            effective_nfe=int(effective_nfe),
+            solver_name=str(args.solver or "flow_euler"),
+            representation="sigmas",
+            schedule_family=schedule_family,
+            meta={
+                "backend": "diffusers",
+                "model_asset": args.model_asset,
+                "solver": args.solver or "flow_euler",
+                "calibration_solver": profile_meta["calibration_solver"],
+                "clock_config": args.clock_config,
+                "clock_model_output_type": str(clock_config["model_output_type"]),
+                "estimator": str(clock_config["estimator"]),
+                "physical_grid_mode": profile_meta.get("physical_grid_mode"),
+                "sadb_version": "v2",
+                "coordinate_domain": profile_meta.get("coordinate_domain"),
+                "prior_schedule": profile_meta.get("prior_schedule"),
+                "prior_blend": profile_meta.get("prior_blend"),
+                "density_temperature": profile_meta.get("density_temperature"),
+                "q_prior": profile_meta.get("q_prior"),
+                "q_shrinkage": profile_meta.get("q_shrinkage"),
+                "q_min": profile_meta.get("q_min"),
+                "q_max": profile_meta.get("q_max"),
+                "defect_reduce": profile_meta.get("defect_reduce"),
+                "defect_quantile": profile_meta.get("defect_quantile"),
+                "sde_noise_kappa": profile_meta.get("sde_noise_kappa"),
+                "sde_brownian_bridge": profile_meta.get("sde_brownian_bridge"),
+                "shared_profile_dir": str(cache_dir),
+                "shared_profile_meta": profile_meta,
+                "schedule_implementation_version": int(profile_meta.get("schedule_implementation_version", DEFECT_BALANCED_CLOCK_VERSION)),
+                "eta": profile_meta.get("eta"),
+                "beta": profile_meta.get("beta"),
+                "ell_scale": profile_meta.get("ell_scale"),
+                "ri_agg": profile_meta.get("ri_agg"),
+                "ri_formula_version": profile_meta.get("ri_formula_version"),
+            },
+            time_transform=time_transform,
+        )
+        bundle.save(output_root / f"nfe_{int(effective_nfe):03d}")
 
 
 def main() -> None:

@@ -42,7 +42,9 @@ def _build_args() -> SimpleNamespace:
 
 def test_canonical_schedule_name_accepts_only_sadb_clock_alias() -> None:
     assert canonical_schedule_name("SADB") == ("SADB", "SADB")
+    assert canonical_schedule_name("RI_SADB") == ("RI_SADB", "RI_SADB")
     assert canonical_schedule_label("sadb") == "SADB"
+    assert canonical_schedule_label("ri_sadb") == "RI_SADB"
     try:
         canonical_schedule_name("LCS-1")
     except ValueError as error:
@@ -54,6 +56,8 @@ def test_canonical_schedule_name_accepts_only_sadb_clock_alias() -> None:
 def test_materializable_schedule_registry_includes_sadb() -> None:
     assert is_materializable_schedule("pndm", "SADB")
     assert is_materializable_schedule("diffusers", "SADB")
+    assert is_materializable_schedule("pndm", "RI_SADB")
+    assert is_materializable_schedule("diffusers", "RI_SADB")
     assert not is_materializable_schedule("pndm", "LCS-1")
     assert not is_materializable_schedule("diffusers", "LCS-1")
 
@@ -70,6 +74,69 @@ def test_compact_metrics_filter_accepts_sadb_rows(tmp_path) -> None:
     keep_row = build_row_filter(config_path)
     assert keep_row({"solver": "euler", "schedule": "SADB"})
     assert not keep_row({"solver": "euler", "schedule": "LCS-1"})
+
+
+def test_profile_cache_dir_records_ri_sadb_parameters() -> None:
+    cache_root = Path("outputs/cache/sadb_profiles")
+    cache_dir = profile_cache_dir(
+        cache_root=cache_root,
+        schedule_family="RI_SADB",
+        backend="pndm",
+        dataset_name="cifar10",
+        model_asset="model_a",
+        solver="euler",
+        calibration_solver="euler",
+        estimator="ri_sadb",
+        physical_grid_size=17,
+        pilot_batch_size=4,
+        pilot_num_batches=1,
+        pilot_observation_microbatch=2,
+        smoothing_window=1,
+        epsilon=1.0e-12,
+        q_min=1.05,
+        q_max=6.0,
+        seed=0,
+        model_output_type="epsilon",
+        coordinate_domain="timesteps",
+        target_nfe=10,
+        target_steps=10,
+        eta=0.25,
+        beta=0.0,
+        ell_scale="step",
+        ri_agg="mean",
+    )
+    meta = _build_profile_meta(
+        schedule_family="RI_SADB",
+        backend="pndm",
+        model_asset="model_a",
+        solver="euler",
+        calibration_solver="euler",
+        estimator="ri_sadb",
+        physical_grid_size=17,
+        pilot_batch_size=4,
+        pilot_num_batches=1,
+        pilot_observation_microbatch=2,
+        epsilon=1.0e-12,
+        smoothing_window=1,
+        q_min=1.05,
+        q_max=6.0,
+        model_output_type="epsilon",
+        coordinate_domain="timesteps",
+        target_nfe=10,
+        target_steps=10,
+        eta=0.25,
+        beta=0.0,
+        ell_scale="step",
+        ri_agg="mean",
+    )
+
+    assert "RI_SADB" in str(cache_dir)
+    assert "eta_0.25" in str(cache_dir)
+    assert "beta_0" in str(cache_dir)
+    assert meta["schedule_family"] == "RI_SADB"
+    assert meta["eta"] == 0.25
+    assert meta["beta"] == 0.0
+    assert meta["ri_formula_version"] == 1
 
 
 def test_profile_cache_dir_records_step_refinement_clock() -> None:
@@ -180,6 +247,28 @@ def test_build_invocations_expands_sadb_schedules_for_pndm_and_diffusers() -> No
     assert len(diffusers_invocations) == 1
     assert any("export_defect_clock_schedule.py" in step.arguments[0] for step in diffusers_invocations[0].prepare_steps)
     assert any("SADB" in str(invocation.schedule_dir) for invocation in diffusers_invocations)
+
+
+def test_build_invocations_expands_ri_sadb_schedule_for_pndm() -> None:
+    args = _build_args()
+    pndm_config = {
+        "name": "ri_sadb_test_pndm",
+        "backend": "pndm",
+        "dataset": "cifar10",
+        "solvers": ["euler"],
+        "schedules": ["RI_SADB"],
+        "nfes": [10],
+        "schedule_clock_configs": {
+            "RI_SADB": "configs/clocks/RI_SADB_cifar10_smoke.yaml",
+        },
+    }
+    execution = resolve_execution_config(pndm_config, args)
+    invocations = build_invocations(args, pndm_config, execution_config=execution)
+    assert len(invocations) == 1
+    assert invocations[0].materializable
+    assert any("export_defect_clock_schedule.py" in step.arguments[0] for step in invocations[0].prepare_steps)
+    assert "RI_SADB" in str(invocations[0].schedule_dir)
+    assert ":RI_SADB:" in invocations[0].label
 
 
 def test_build_invocations_expands_diffusers_seeds_and_published_ays() -> None:

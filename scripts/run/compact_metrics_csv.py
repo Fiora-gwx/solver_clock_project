@@ -29,6 +29,7 @@ def canonical_schedule_label(name: str) -> str:
         "linear": "linear",
         "ays": "ays",
         "sadb": "SADB",
+        "ri_sadb": "RI_SADB",
         "v_b": "V_b",
         "a_a": "A_a",
         "a_b": "A_b",
