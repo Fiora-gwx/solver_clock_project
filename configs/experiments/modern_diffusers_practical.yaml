@@ -17,9 +17,9 @@ solvers:
   - flow_stork4_3rd
 schedules:
   - base
-  - SADB
+  - FP_CLOCK
 solver_schedules:
-  flow_euler: [base, SADB]
+  flow_euler: [base, FP_CLOCK]
   flow_dpm_solver: [base]
   flow_stork4_1st: [base]
   flow_stork4_2nd: [base]

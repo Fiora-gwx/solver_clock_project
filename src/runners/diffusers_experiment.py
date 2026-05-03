@@ -42,6 +42,8 @@ def run_diffusers_experiment(
     solver_steps = int(bundle.meta.get("solver_steps", execution_plan.solver_steps)) if bundle else execution_plan.solver_steps
     step_methods = list(bundle.meta.get("step_methods", execution_plan.step_methods)) if bundle else list(execution_plan.step_methods)
     execution_backend = str(bundle.meta.get("execution_backend", execution_plan.execution_backend)) if bundle else execution_plan.execution_backend
+    bundle_meta = bundle.meta if bundle else {}
+    clock_label = schedule_name.split("[", 1)[1].rstrip("]") if "[" in schedule_name and schedule_name.endswith("]") else ""
     image_dir = run_generation(
         pipeline=pipeline,
         prompts=prompts,
@@ -56,12 +58,18 @@ def run_diffusers_experiment(
     result = {
         "backend": "diffusers",
         "dataset": "",
+        "model": model_asset_key,
         "model_asset": model_asset_key,
         "solver": solver_name,
         "schedule": schedule_name,
+        "clock_label": clock_label,
+        "clock_family": str(bundle_meta.get("schedule_family", schedule_name)),
+        "estimator": str(bundle_meta.get("estimator", "")),
         "nfe": num_inference_steps,
         "seed": seed,
         "num_samples": len(prompts),
+        "metric_name": "",
+        "metric_value": None,
         "fid": None,
         "clip_score": None,
         "image_reward": None,
@@ -77,6 +85,8 @@ def run_diffusers_experiment(
         "prompt_asset": prompt_asset_or_path,
         "schedule_dir": schedule_dir or "",
         "output_dir": str(image_dir),
+        "status": "OK",
+        "error": "",
     }
     write_run_manifest(Path(output_dir) / "run_manifest.json", result)
     append_result_row(summary_csv, result)

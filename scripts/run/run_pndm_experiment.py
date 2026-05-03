@@ -23,10 +23,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--summary-csv", default="outputs/metrics/pndm_summary.csv")
+    parser.add_argument("--summary-csv", default="outputs/manual/metrics/pndm_summary.csv")
     parser.add_argument("--schedule-name", default="base")
     parser.add_argument("--schedule-dir")
     parser.add_argument("--compute-fid", action="store_true", default=False)
+    parser.add_argument("--reference-fid-asset")
     parser.add_argument("--discard-samples", action="store_true", default=False)
     parser.add_argument("--preview-samples", type=int, default=0)
     return parser.parse_args()
@@ -48,6 +49,7 @@ def main() -> None:
         schedule_name=args.schedule_name,
         schedule_dir=args.schedule_dir,
         compute_fid_score=args.compute_fid,
+        reference_fid_asset_key=args.reference_fid_asset,
         save_samples=not args.discard_samples,
         preview_samples=args.preview_samples,
     )

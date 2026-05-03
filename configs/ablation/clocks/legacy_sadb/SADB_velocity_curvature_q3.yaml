@@ -1,0 +1,27 @@
+clock:
+  family: LEGACY_SADB
+  estimator: velocity_curvature
+  calibration_solver: heun2
+  model_output_type: epsilon
+
+  physical_grid_size: 65
+  pilot_batch_size: 8
+  pilot_num_batches: 16
+  pilot_observation_microbatch: 4
+
+  smoothing_window: 3
+  epsilon: 1.0e-12
+  q_min: 1.05
+  q_max: 6.0
+
+  velocity_curvature_q_const: 3.0
+  velocity_curvature_pilot_solver: heun2
+  velocity_curvature_pilot_pieces: 4
+  velocity_curvature_defect_clip_quantile: 0.95
+
+
+  adaptive_s: true
+  adaptive_s_max: 100
+  adaptive_s_reference: base_dt
+
+  target_nfes: [5, 7, 11]

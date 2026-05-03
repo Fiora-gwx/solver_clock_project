@@ -1,0 +1,23 @@
+name: sd15_sdxl_sadb_pilot_ablation
+backend: diffusers
+base_config:
+  prompt_asset: diffusers_practical_prompts
+  seeds: [0, 1, 2]
+  num_gpus: 4
+  prepare_schedules_first: true
+  materialize_schedules: true
+models:
+  - stable_diffusion_15
+  - sdxl
+solvers:
+  - dpm_solver_pp
+  - sde_dpm_solver_pp
+schedules:
+  - LEGACY_SADB
+schedule_clock_configs:
+  LEGACY_SADB:
+    small: configs/ablation/clocks/legacy_sadb/SADB_diffusers_sd_small.yaml
+    medium: configs/ablation/clocks/legacy_sadb/SADB_diffusers_sd_medium.yaml
+    large: configs/ablation/clocks/legacy_sadb/SADB_diffusers_sd_large.yaml
+eval_nfes: [10]
+metrics: [clipscore, imagereward]

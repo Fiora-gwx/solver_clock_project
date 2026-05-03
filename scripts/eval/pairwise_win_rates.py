@@ -49,10 +49,10 @@ def schedule_family(schedule: str) -> str:
         return "base"
     if lower in {"ays", "ays_like"}:
         return "AYS"
-    if lower == "sadb" or lower.startswith("sadb["):
-        return normalized if normalized.startswith("SADB") else "SADB" + normalized[4:]
-    if lower == "ri_sadb" or lower.startswith("ri_sadb["):
-        return normalized if normalized.startswith("RI_SADB") else "RI_SADB" + normalized[7:]
+    if lower == "legacy_sadb" or lower.startswith("legacy_sadb["):
+        return normalized if normalized.startswith("LEGACY_SADB") else "LEGACY_SADB" + normalized[11:]
+    if lower == "fp_clock" or lower.startswith("fp_clock["):
+        return normalized if normalized.startswith("FP_CLOCK") else "FP_CLOCK" + normalized[8:]
     return normalized
 
 
@@ -82,16 +82,19 @@ def build_comparisons(schedules: set[str]) -> list[tuple[str, str]]:
     comparisons: list[tuple[str, str]] = []
     if "AYS" in schedules and "base" in schedules:
         comparisons.append(("AYS", "base"))
-    sadb_schedules = sorted(
+    adaptive_schedules = sorted(
         schedule
         for schedule in schedules
-        if schedule == "SADB" or schedule.startswith("SADB[") or schedule == "RI_SADB" or schedule.startswith("RI_SADB[")
+        if schedule == "LEGACY_SADB"
+        or schedule.startswith("LEGACY_SADB[")
+        or schedule == "FP_CLOCK"
+        or schedule.startswith("FP_CLOCK[")
     )
-    for sadb in sadb_schedules:
+    for schedule in adaptive_schedules:
         if "base" in schedules:
-            comparisons.append((sadb, "base"))
+            comparisons.append((schedule, "base"))
         if "AYS" in schedules:
-            comparisons.append((sadb, "AYS"))
+            comparisons.append((schedule, "AYS"))
     return comparisons
 
 

@@ -6,13 +6,16 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import torch
 
 from src.clock.calibration import ForwardNormCollector
+from src.clock.fp_clock import FPTrajectoryStats, collect_trajectory_window_stats, concatenate_fp_clock_stats
+from src.clock.solver_registry import get_solver_native_spec
 from src.utils.config import repo_root
+from src.utils.nfe_budget import resolve_effective_nfe_plan
 from src.utils.schedule_bundle import ScheduleBundle
 
 
@@ -113,6 +116,8 @@ def compute_dynamic_mu(pipeline, *, height: int, width: int) -> float:
 
 def _pipeline_kind(pipeline) -> str:
     name = pipeline.__class__.__name__.lower()
+    if name == "ifpipeline":
+        return "deepfloyd_if"
     if "flux" in name:
         return "flux"
     if "stablediffusion3" in name:
@@ -724,6 +729,88 @@ def _prepare_sdxl_defect_batch(
     return DiffusersDefectBatch(initial_latents=latents.detach(), sigma_max=sigma_max, velocity_fn=velocity_fn)
 
 
+def _prepare_deepfloyd_if_defect_batch(
+    pipeline,
+    *,
+    prompt: str | list[str],
+    batch_size: int,
+    generator: torch.Generator,
+    height: int,
+    width: int,
+    guidance_scale: float,
+) -> DiffusersDefectBatch:
+    device = get_pipeline_device(pipeline)
+    do_cfg = guidance_scale > 1.0
+    prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(
+        prompt,
+        do_classifier_free_guidance=do_cfg,
+        num_images_per_prompt=1,
+        device=device,
+        negative_prompt=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        clean_caption=True,
+    )
+    positive_prompt_embeds = prompt_embeds.to(device)
+    negative_prompt_embeds = None if negative_prompt_embeds is None else negative_prompt_embeds.to(device)
+    latents = pipeline.prepare_intermediate_images(
+        batch_size,
+        pipeline.unet.config.in_channels,
+        height,
+        width,
+        positive_prompt_embeds.dtype,
+        device,
+        generator,
+    )
+    sigma_max = float(build_defect_sigma_grid(pipeline, physical_grid_size=3, height=height, width=width)[0])
+
+    def velocity_fn(
+        current_latents: torch.Tensor,
+        sigma: torch.Tensor,
+        batch_start: int = 0,
+        batch_stop: int | None = None,
+    ) -> torch.Tensor:
+        batch = current_latents.shape[0]
+        timestep_value = _vp_timestep_from_sigma(pipeline.scheduler, sigma)
+        latent_model_input = torch.cat([current_latents] * 2) if do_cfg else current_latents
+        timestep = torch.full(
+            (latent_model_input.shape[0],),
+            timestep_value,
+            device=current_latents.device,
+            dtype=torch.float32,
+        )
+        latent_model_input = pipeline.scheduler.scale_model_input(latent_model_input, timestep)
+        if do_cfg:
+            if negative_prompt_embeds is None:
+                raise RuntimeError("DeepFloyd IF CFG requested but negative prompt embeddings are unavailable.")
+            active_prompt_embeds = torch.cat(
+                [
+                    _slice_batch_tensor(negative_prompt_embeds, batch, batch_start),
+                    _slice_batch_tensor(positive_prompt_embeds, batch, batch_start),
+                ],
+                dim=0,
+            )
+        else:
+            active_prompt_embeds = _slice_batch_tensor(positive_prompt_embeds, batch, batch_start)
+        noise_pred = pipeline.unet(
+            latent_model_input,
+            timestep,
+            encoder_hidden_states=active_prompt_embeds,
+            cross_attention_kwargs=None,
+            return_dict=False,
+        )[0]
+        if do_cfg:
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred_uncond, _ = noise_pred_uncond.split(current_latents.shape[1], dim=1)
+            noise_pred_text, predicted_variance = noise_pred_text.split(current_latents.shape[1], dim=1)
+            guided = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            return torch.cat([guided, predicted_variance], dim=1)
+        noise_pred, _ = noise_pred.split(current_latents.shape[1], dim=1)
+        return noise_pred
+
+    return DiffusersDefectBatch(initial_latents=latents.detach(), sigma_max=sigma_max, velocity_fn=velocity_fn)
+
+
 def prepare_defect_batch(
     pipeline,
     *,
@@ -787,7 +874,244 @@ def prepare_defect_batch(
             width=width,
             guidance_scale=guidance_scale,
         )
+    if kind == "deepfloyd_if":
+        return _prepare_deepfloyd_if_defect_batch(
+            pipeline,
+            prompt=prompt,
+            batch_size=batch_size,
+            generator=generator,
+            height=height,
+            width=width,
+            guidance_scale=guidance_scale,
+        )
     raise ValueError(f"Unsupported diffusers pipeline for defect calibration: {pipeline.__class__.__name__}")
+
+
+def _reset_scheduler_history(scheduler) -> None:
+    solver_order = int(getattr(getattr(scheduler, "config", None), "solver_order", 1))
+    for name, value in {
+        "model_outputs": [None] * solver_order,
+        "timestep_list": [None] * solver_order,
+        "lower_order_nums": 0,
+        "last_sample": None,
+        "_step_index": None,
+        "_begin_index": None,
+        "noise_predictions": [],
+        "velocity_predictions": [],
+    }.items():
+        if hasattr(scheduler, name):
+            setattr(scheduler, name, value)
+
+
+def _configured_coordinate_nodes(
+    scheduler,
+    *,
+    coordinate_domain: str,
+) -> np.ndarray:
+    normalized = str(coordinate_domain).lower().strip()
+    if normalized == "sigma":
+        normalized = "sigmas"
+    if normalized == "timestep":
+        normalized = "timesteps"
+    if normalized == "sigmas":
+        sigmas = _scheduler_sigma_values(scheduler).numpy().astype(np.float64)
+        step_count = len(getattr(scheduler, "timesteps", []))
+        if len(sigmas) > step_count + 1:
+            sigmas = sigmas[: step_count + 1]
+        if len(sigmas) == step_count:
+            sigmas = np.concatenate([sigmas, np.asarray([0.0], dtype=np.float64)])
+        return sigmas
+    if normalized == "timesteps":
+        timesteps = scheduler.timesteps.detach().cpu().float().numpy()
+        return np.concatenate([timesteps.astype(np.float64), np.asarray([0.0], dtype=np.float64)])
+    raise ValueError(f"Unsupported diffusers trajectory coordinate domain: {coordinate_domain}")
+
+
+def _collapse_adjacent_trajectory_nodes(
+    coordinate_nodes: np.ndarray,
+    states: list[torch.Tensor],
+    *,
+    eps: float,
+) -> tuple[np.ndarray, torch.Tensor]:
+    nodes = np.asarray(coordinate_nodes, dtype=np.float64)
+    if len(nodes) != len(states):
+        raise ValueError("coordinate node count must match recorded trajectory state count.")
+    collapsed_nodes: list[float] = []
+    collapsed_states: list[torch.Tensor] = []
+    for node, state in zip(nodes.tolist(), states):
+        if collapsed_nodes and abs(float(node) - collapsed_nodes[-1]) <= float(eps):
+            collapsed_nodes[-1] = float(node)
+            collapsed_states[-1] = state
+            continue
+        collapsed_nodes.append(float(node))
+        collapsed_states.append(state)
+    if len(collapsed_nodes) < 2:
+        raise RuntimeError("Recorded diffusers trajectory collapsed to fewer than two coordinate nodes.")
+    return np.asarray(collapsed_nodes, dtype=np.float64), torch.stack(collapsed_states, dim=0)
+
+
+def _run_diffusers_base_trajectory(
+    *,
+    pipeline,
+    defect_batch: DiffusersDefectBatch,
+    solver: str,
+    effective_nfe: int,
+    initial_sample: torch.Tensor,
+    coordinate_domain: str,
+    batch_start: int,
+    batch_stop: int,
+    height: int,
+    width: int,
+    generator_seed: int,
+    eps: float,
+) -> tuple[np.ndarray, torch.Tensor]:
+    device = initial_sample.device
+    plan = resolve_effective_nfe_plan(solver, int(effective_nfe))
+    scheduler_kwargs = _scheduler_mu_kwargs(pipeline, height=height, width=width)
+    pipeline.scheduler.set_timesteps(plan.solver_steps, device=device, **scheduler_kwargs)
+    _reset_scheduler_history(pipeline.scheduler)
+    coordinate_nodes = _configured_coordinate_nodes(
+        pipeline.scheduler,
+        coordinate_domain=coordinate_domain,
+    )
+    sigmas = _scheduler_sigma_values(pipeline.scheduler).to(device=device, dtype=initial_sample.dtype)
+    states = [initial_sample.detach().clone()]
+    sample = initial_sample.detach().clone()
+    step_parameters = set(inspect.signature(pipeline.scheduler.step).parameters.keys())
+    step_generator = torch.Generator(device=device).manual_seed(int(generator_seed))
+    with torch.inference_mode():
+        for index, timestep in enumerate(pipeline.scheduler.timesteps):
+            sigma = sigmas[min(index, len(sigmas) - 1)].to(device=device, dtype=sample.dtype)
+            model_output = defect_batch.velocity_fn(sample, sigma, batch_start, batch_stop)
+            kwargs: dict[str, Any] = {}
+            if "generator" in step_parameters:
+                kwargs["generator"] = step_generator
+            step_output = pipeline.scheduler.step(model_output, timestep, sample, **kwargs)
+            sample = step_output.prev_sample if hasattr(step_output, "prev_sample") else step_output[0]
+            states.append(sample.detach().clone())
+    return _collapse_adjacent_trajectory_nodes(coordinate_nodes, states, eps=eps)
+
+
+def collect_diffusers_trajectory_window_stats(
+    *,
+    pipeline,
+    prompt_pool: Sequence[str],
+    batch_size: int,
+    num_batches: int,
+    seed: int,
+    height: int,
+    width: int,
+    guidance_scale: float,
+    solver: str,
+    multires_nfes: Sequence[int] = (16, 32, 64),
+    window_size: int | None = None,
+    observation_microbatch: int | None = None,
+    coordinate_domain: str | None = None,
+    q_min: float = 1.05,
+    q_max: float = 6.0,
+    eps: float = 1.0e-12,
+) -> tuple[np.ndarray, FPTrajectoryStats, dict[str, object]]:
+    spec = get_solver_native_spec("diffusers", solver)
+    if not spec.supports_base_trajectory_recording:
+        raise ValueError(f"Diffusers solver `{solver}` does not support trajectory-window FP calibration: {spec.notes}")
+    nfes = tuple(int(value) for value in multires_nfes)
+    if len(nfes) != 3 or nfes[1] != 2 * nfes[0] or nfes[2] != 2 * nfes[1]:
+        raise ValueError("trajectory-window FP calibration expects multires_nfes=[N,2N,4N].")
+    active_domain = str(coordinate_domain or spec.native_coordinate).lower().strip()
+    if active_domain == "sigma":
+        active_domain = "sigmas"
+    if active_domain == "timestep":
+        active_domain = "timesteps"
+    if active_domain not in {"sigmas", "timesteps"}:
+        raise ValueError(f"Unsupported diffusers trajectory coordinate domain: {active_domain}")
+    active_window = int(window_size or spec.recommended_window_len)
+    if active_window < int(spec.solver_order):
+        raise ValueError("window_size must be at least the solver order/history length.")
+
+    batches: list[FPTrajectoryStats] = []
+    details: list[dict[str, object]] = []
+    coarse_grid_reference: np.ndarray | None = None
+    prompt_values = [str(prompt) for prompt in prompt_pool]
+    if not prompt_values:
+        raise ValueError("prompt_pool must be non-empty.")
+
+    with torch.inference_mode():
+        for batch_index in range(num_batches):
+            prompt_batch = [
+                prompt_values[(batch_index * batch_size + item_index) % len(prompt_values)]
+                for item_index in range(batch_size)
+            ]
+            defect_batch = prepare_defect_batch(
+                pipeline,
+                prompt=prompt_batch,
+                batch_size=batch_size,
+                seed=seed + batch_index,
+                height=height,
+                width=width,
+                guidance_scale=guidance_scale,
+            )
+            micro = observation_microbatch if observation_microbatch and observation_microbatch > 0 else batch_size
+            micro = min(int(micro), batch_size)
+            for start in range(0, batch_size, micro):
+                stop = min(start + micro, batch_size)
+                sample_slice = defect_batch.initial_latents[start:stop]
+                trajectories = [
+                    _run_diffusers_base_trajectory(
+                        pipeline=pipeline,
+                        defect_batch=defect_batch,
+                        solver=solver,
+                        effective_nfe=nfe,
+                        initial_sample=sample_slice,
+                        coordinate_domain=active_domain,
+                        batch_start=start,
+                        batch_stop=stop,
+                        height=height,
+                        width=width,
+                        generator_seed=seed + 1009 * batch_index + nfe,
+                        eps=eps,
+                    )
+                    for nfe in nfes
+                ]
+                stats, window_details = collect_trajectory_window_stats(
+                    coarse_grid=trajectories[0][0],
+                    coarse_states=trajectories[0][1],
+                    mid_grid=trajectories[1][0],
+                    mid_states=trajectories[1][1],
+                    fine_grid=trajectories[2][0],
+                    fine_states=trajectories[2][1],
+                    window_size=active_window,
+                    q_min=q_min,
+                    q_max=q_max,
+                    eps=eps,
+                )
+                if coarse_grid_reference is None:
+                    coarse_grid_reference = trajectories[0][0]
+                elif not np.allclose(coarse_grid_reference, trajectories[0][0], rtol=0.0, atol=max(float(eps), 1.0e-8)):
+                    raise RuntimeError("Official-base coarse grids changed across diffusers trajectory-window batches.")
+                batches.append(stats)
+                details.append(
+                    {
+                        "window_size": int(window_details.window_size),
+                        "mean_window_residual_perp_norm": float(np.mean(window_details.window_residual_perp_norm)),
+                        "mean_window_delta_s": float(np.mean(window_details.window_delta_s)),
+                        "mean_window_effective_order": float(np.mean(window_details.window_effective_order)),
+                    }
+                )
+            device = get_pipeline_device(pipeline)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    if coarse_grid_reference is None:
+        raise RuntimeError("No diffusers trajectory-window calibration batches were collected.")
+    stats = concatenate_fp_clock_stats(batches)
+    detail_meta = {
+        "window_size": active_window,
+        "solver_order": int(spec.solver_order),
+        "coordinate_domain": active_domain,
+        "multires_nfes": list(nfes),
+        "trajectory_window_batch_summaries": details,
+    }
+    return coarse_grid_reference, stats, detail_meta
 
 
 def replace_scheduler(pipeline, solver_name: str):

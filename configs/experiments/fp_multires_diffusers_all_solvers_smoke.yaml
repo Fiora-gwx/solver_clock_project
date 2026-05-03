@@ -1,0 +1,81 @@
+name: fp_multires_diffusers_all_solvers_smoke
+backend: diffusers
+metrics_root: outputs/metrics
+
+base_config:
+  prompt_asset: diffusers_smoke_prompts
+  seed: 0
+  num_gpus: 4
+  prepare_schedules_first: false
+  materialize_schedules: true
+  continue_on_error: true
+  metrics: [clipscore, imagereward]
+  clock_config: configs/clocks/FP_CLOCK_trajectory_window_smoke.yaml
+
+models:
+  - sd35_medium
+  - flux_dev
+  - lumina_image_2
+  - stable_diffusion_15
+  - sdxl
+  - deepfloyd_if_stage1
+
+solvers:
+  # flow_heun is omitted here because the existing NFE contract only supports
+  # odd effective NFE for vendor Heun, while this smoke is fixed at NFE 6/10.
+  - flow_euler
+  - flow_dpm_solver
+  - flow_unipc
+  - flow_stork4_1st
+  - flow_stork4_2nd
+  - flow_stork4_3rd
+  - euler
+  - dpm_solver_pp
+  - sde_dpm_solver_pp
+
+model_solvers:
+  sd35_medium:
+    - flow_euler
+    - flow_dpm_solver
+    - flow_unipc
+    - flow_stork4_1st
+    - flow_stork4_2nd
+    - flow_stork4_3rd
+  flux_dev:
+    - flow_euler
+    - flow_dpm_solver
+    - flow_unipc
+    - flow_stork4_1st
+    - flow_stork4_2nd
+    - flow_stork4_3rd
+  lumina_image_2:
+    - flow_euler
+    - flow_dpm_solver
+    - flow_unipc
+    - flow_stork4_1st
+    - flow_stork4_2nd
+    - flow_stork4_3rd
+  stable_diffusion_15:
+    - euler
+    - dpm_solver_pp
+    - sde_dpm_solver_pp
+  sdxl:
+    - euler
+    - dpm_solver_pp
+    - sde_dpm_solver_pp
+  deepfloyd_if_stage1:
+    - euler
+    - dpm_solver_pp
+    - sde_dpm_solver_pp
+
+schedules:
+  - base
+  - FP_CLOCK[trajectory_window]
+
+schedule_clock_configs:
+  FP_CLOCK:
+    variants:
+      trajectory_window: configs/clocks/FP_CLOCK_trajectory_window_smoke.yaml
+
+seeds: [0]
+eval_nfes: [6, 10]

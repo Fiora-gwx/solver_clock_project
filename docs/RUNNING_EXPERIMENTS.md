@@ -21,15 +21,14 @@ Experiment behavior should live in the YAML, not in ad-hoc shell orchestration. 
 - `prepare_schedules_first`: precompute reusable schedule bundles before sampling
 - `schedule_cache_root` (optional): override the default per-experiment cache location
 - `save_samples`: when `false`, keep only metrics/manifests and discard generated sample images after metric computation
-- `schedule_clock_configs`: override the default materializable clock config for `SADB`
+- `schedule_clock_configs`: override materializable clock configs for `FP_CLOCK` or the retained `LEGACY_SADB` comparison
 
-If `schedule_cache_root` is omitted, materialized bundles are stored under:
+If `schedule_cache_root` is omitted, materialized bundles are stored under the experiment directory:
 
-- `outputs/experiment_records/<experiment_name>/schedules`
+- `outputs/<experiment_name>/schedules`
 
 The launcher always checks whether a requested materializable bundle already exists in that cache. If it exists, it is reused; if it does not, it is built first and recorded in
-`outputs/experiment_records/<experiment_name>/schedule_cache_manifest.json`. After that, all configured GPUs are used
-for sampling.
+`outputs/<experiment_name>/schedule_cache_manifest.json`. Samples, metrics, logs, and generated clock profile caches are also kept under `outputs/<experiment_name>/`.
 
 Current STORK scope:
 
@@ -55,7 +54,7 @@ Dry-run only:
 
 ```bash
 /home/gwx/miniconda3/envs/sc-diff/bin/python scripts/run/run_experiment_config.py \
-  --experiment-config configs/experiments/cifar10_partial.yaml
+  --experiment-config configs/experiments/fp_clock_cifar10_smoke.yaml
 ```
 
 This prints the exact commands that will run, and which conda env each command will use.
@@ -66,7 +65,7 @@ Example: run the CIFAR-10 partial sweep and auto-generate missing reusable bundl
 
 ```bash
 /home/gwx/miniconda3/envs/sc-diff/bin/python scripts/run/run_experiment_config.py \
-  --experiment-config configs/experiments/cifar10_partial.yaml \
+  --experiment-config configs/experiments/fp_clock_cifar10_smoke.yaml \
   --execute \
   --materialize-schedules
 ```
@@ -74,13 +73,13 @@ Example: run the CIFAR-10 partial sweep and auto-generate missing reusable bundl
 Notes:
 
 - `base` does not require a schedule bundle.
-- `linear` and `SADB` are materializable schedules. They are checked in the per-experiment cache first, then generated only if missing.
-- Old V-a/LCS schedules are removed from the launcher; use `SADB` for solver-aware step-refinement calibration.
+- `linear`, `FP_CLOCK`, and the retained `LEGACY_SADB` comparison are materializable schedules. They are checked in the per-experiment cache first, then generated only if missing.
+- Old V-a/LCS/RI schedules are removed from the launcher; `FP_CLOCK` is the main target-solver residual clock, and `LEGACY_SADB` is retained for ablations.
 - PNDM DPMSolver runs are base-only; the lambda-domain custom clock path is disabled.
-- Modern diffusers `SADB` is enabled for `flow_euler` in the practical config; flow DPM/STORK entries remain base-only until their native custom-step refinement path is validated.
+- Modern diffusers `FP_CLOCK` is enabled for `flow_euler` in the practical config; flow DPM/STORK entries remain base-only until their native custom-step refinement path is validated.
 - `AYS` is treated as an external asset only. Use the published bundles recorded in
   `configs/reference_schedules/ays_published_10step.yaml` and `schedules/ays_like/published/...`.
-- The `V_b` / `A_a` / `A_b` families are still treated as external assets.
+- Retired SADB/V-series/RI configs live under `configs/ablation/`; they are not active launcher families.
 
 ## 4. Useful Slices
 
@@ -88,22 +87,22 @@ CIFAR-10 partial sweep:
 
 ```bash
 /home/gwx/miniconda3/envs/sc-diff/bin/python scripts/run/run_experiment_config.py \
-  --experiment-config configs/experiments/cifar10_partial.yaml \
+  --experiment-config configs/experiments/fp_clock_cifar10_smoke.yaml \
   --limit 3
 ```
 
-CIFAR-10 mainline:
+CIFAR-10 FP_CLOCK mainline:
 
 ```bash
 /home/gwx/miniconda3/envs/sc-diff/bin/python scripts/run/run_experiment_config.py \
-  --experiment-config configs/experiments/cifar10_mainline.yaml
+  --experiment-config configs/experiments/cifar10_mainline_fp_clock.yaml
 ```
 
-CIFAR-10 partial:
+CIFAR-10 FP_CLOCK smoke:
 
 ```bash
 /home/gwx/miniconda3/envs/sc-diff/bin/python scripts/run/run_experiment_config.py \
-  --experiment-config configs/experiments/cifar10_partial.yaml \
+  --experiment-config configs/experiments/fp_clock_cifar10_smoke.yaml \
   --execute \
   --materialize-schedules
 ```
@@ -117,11 +116,12 @@ Modern diffusers practical:
 
 ## Outputs
 
-- samples: `outputs/samples/<experiment_name>/...`
-- metrics: `outputs/metrics/<experiment_name>.csv`
+- samples: `outputs/<experiment_name>/samples/...`
+- metrics: `outputs/<experiment_name>/metrics/<experiment_name>.csv`
 - per-run manifest: `run_manifest.json` inside each output directory
-- schedule cache: `outputs/experiment_records/<experiment_name>/schedules`
-- schedule cache record: `outputs/experiment_records/<experiment_name>/schedule_cache_manifest.json`
+- schedules: `outputs/<experiment_name>/schedules`
+- schedule cache record: `outputs/<experiment_name>/schedule_cache_manifest.json`
+- prepare and dispatch logs: `outputs/<experiment_name>/logs`
 
 ## Current Execution Policy
 

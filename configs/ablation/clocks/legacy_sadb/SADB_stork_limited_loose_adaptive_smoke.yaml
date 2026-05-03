@@ -1,0 +1,20 @@
+clock:
+  family: LEGACY_SADB
+  calibration_solver: target
+  model_output_type: epsilon
+  physical_grid_size: 65
+  pilot_batch_size: 8
+  pilot_num_batches: 16
+  pilot_observation_microbatch: 4
+  pilot_prompt_asset: diffusers_smoke_prompts
+  smoothing_window: 3
+  epsilon: 1.0e-12
+  q_min: 1.05
+  q_max: 6.0
+  warmup_steps: 1
+  max_dt_factor: 2.5
+  max_neighbor_dt_ratio: 4.0
+  adaptive_s: true
+  adaptive_s_max: 100
+  adaptive_s_reference: base_dt
+  target_nfes: [7]

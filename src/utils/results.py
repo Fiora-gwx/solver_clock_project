@@ -11,16 +11,26 @@ from .config import dump_json, resolve_repo_path
 SUMMARY_FIELDNAMES: tuple[str, ...] = (
     "backend",
     "dataset",
+    "model",
     "model_asset",
     "solver",
     "schedule",
+    "clock_label",
+    "clock_family",
+    "estimator",
     "nfe",
     "seed",
     "guidance_scale",
     "num_samples",
+    "metric_name",
+    "metric_value",
     "fid",
     "clip_score",
     "image_reward",
+    "status",
+    "error",
+    "schedule_dir",
+    "output_dir",
 )
 
 RESULT_ID_FIELDS: tuple[str, ...] = (

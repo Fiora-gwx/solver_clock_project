@@ -65,6 +65,7 @@ def run_pndm_experiment(
     schedule_name: str = "base",
     schedule_dir: str | None = None,
     compute_fid_score: bool = False,
+    reference_fid_asset_key: str | None = None,
     save_samples: bool = True,
     preview_samples: int = 0,
 ) -> dict[str, Any]:
@@ -94,6 +95,8 @@ def run_pndm_experiment(
     solver_steps = int(bundle.meta.get("solver_steps", execution_plan.solver_steps)) if bundle else execution_plan.solver_steps
     step_methods = list(bundle.meta.get("step_methods", execution_plan.step_methods)) if bundle else list(execution_plan.step_methods)
     execution_backend = str(bundle.meta.get("execution_backend", execution_plan.execution_backend)) if bundle else execution_plan.execution_backend
+    bundle_meta = bundle.meta if bundle else {}
+    clock_label = schedule_name.split("[", 1)[1].rstrip("]") if "[" in schedule_name and schedule_name.endswith("]") else ""
     persisted_output_dir = Path(output_dir)
     persisted_output_dir.mkdir(parents=True, exist_ok=True)
     clear_preview_images(persisted_output_dir)
@@ -129,7 +132,7 @@ def run_pndm_experiment(
             )
             fid_value = None
             if compute_fid_score:
-                fid_asset_key = dataset_config["default_fid_asset"]
+                fid_asset_key = reference_fid_asset_key or dataset_config["default_fid_asset"]
                 fid_value = compute_fid(image_dir, manifest.path(fid_asset_key))
             preview_samples_persisted, preview_dir = persist_preview_images(
                 image_dir,
@@ -139,9 +142,13 @@ def run_pndm_experiment(
             result = {
                 "backend": "pndm",
                 "dataset": dataset_config["name"],
+                "model": model_asset_key,
                 "model_asset": model_asset_key,
                 "solver": solver_name,
                 "schedule": schedule_name,
+                "clock_label": clock_label,
+                "clock_family": str(bundle_meta.get("schedule_family", schedule_name)),
+                "estimator": str(bundle_meta.get("estimator", "")),
                 "nfe": num_inference_steps,
                 "seed": seed,
                 "effective_nfe": num_inference_steps,
@@ -149,12 +156,17 @@ def run_pndm_experiment(
                 "step_methods": step_methods,
                 "execution_backend": execution_backend,
                 "num_samples": num_samples,
+                "metric_name": "fid" if fid_value is not None else "",
+                "metric_value": fid_value,
                 "fid": fid_value,
+                "fid_reference": reference_fid_asset_key or dataset_config.get("default_fid_asset", ""),
                 "clip_score": None,
                 "image_reward": None,
                 "schedule_dir": schedule_dir or "",
                 "output_dir": str(persisted_output_dir),
                 "samples_persisted": False,
+                "status": "OK",
+                "error": "",
             }
             manifest_payload = dict(result)
             manifest_payload["transient_samples_dir"] = transient_samples_dir
@@ -167,15 +179,19 @@ def run_pndm_experiment(
 
     fid_value: float | None = None
     if compute_fid_score:
-        fid_asset_key = dataset_config["default_fid_asset"]
+        fid_asset_key = reference_fid_asset_key or dataset_config["default_fid_asset"]
         fid_value = compute_fid(image_dir, manifest.path(fid_asset_key))
 
     result = {
         "backend": "pndm",
         "dataset": dataset_config["name"],
+        "model": model_asset_key,
         "model_asset": model_asset_key,
         "solver": solver_name,
         "schedule": schedule_name,
+        "clock_label": clock_label,
+        "clock_family": str(bundle_meta.get("schedule_family", schedule_name)),
+        "estimator": str(bundle_meta.get("estimator", "")),
         "nfe": num_inference_steps,
         "seed": seed,
         "effective_nfe": num_inference_steps,
@@ -183,12 +199,17 @@ def run_pndm_experiment(
         "step_methods": step_methods,
         "execution_backend": execution_backend,
         "num_samples": num_samples,
+        "metric_name": "fid" if fid_value is not None else "",
+        "metric_value": fid_value,
         "fid": fid_value,
+        "fid_reference": reference_fid_asset_key or dataset_config.get("default_fid_asset", ""),
         "clip_score": None,
         "image_reward": None,
         "schedule_dir": schedule_dir or "",
         "output_dir": str(persisted_output_dir),
         "samples_persisted": True,
+        "status": "OK",
+        "error": "",
     }
     manifest_payload = dict(result)
     manifest_payload["preview_samples_requested"] = preview_samples

@@ -1,0 +1,44 @@
+name: cifar10_mainline_fp_clock
+backend: pndm
+
+base_config:
+  dataset: cifar10
+  metrics: [fid]
+  num_gpus: 4
+  gpu_ids: [0, 1, 2, 3]
+  prepare_schedules_first: true
+  materialize_schedules: true
+  save_samples: false
+  preview_samples: 8
+  num_samples: 50000
+  clock_config: configs/clocks/FP_CLOCK.yaml
+
+model_assets:
+  - pndm_model_ddim_cifar10
+  - pndm_model_pf_cifar10
+  - pndm_model_pf_deep_cifar10
+
+solvers:
+  - euler
+  - deis
+  - heun2
+  - stork4_1st
+  - stork4_2nd
+
+schedules:
+  - base
+  - LEGACY_SADB
+  - FP_CLOCK
+
+solver_schedules:
+  euler: [base, LEGACY_SADB, FP_CLOCK]
+  heun2: [base, LEGACY_SADB, FP_CLOCK]
+  deis: [base]
+  stork4_1st: [base, LEGACY_SADB]
+  stork4_2nd: [base, LEGACY_SADB]
+
+schedule_clock_configs:
+  LEGACY_SADB: configs/clocks/LEGACY_SADB.yaml
+  FP_CLOCK: configs/clocks/FP_CLOCK.yaml
+
+eval_nfes: [5, 7, 9, 11, 15, 23, 31]

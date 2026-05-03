@@ -15,9 +15,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.clock.baseline import BASELINE_SCHEDULE_IMPLEMENTATION_VERSION
 from src.clock.defect_balanced import DEFECT_BALANCED_CLOCK_VERSION
-from src.clock.ri_sadb import RI_SADB_CLOCK_VERSION
+from src.clock.fp_clock import FP_CLOCK_VERSION
 from src.utils.config import dump_json, load_json, load_yaml, repo_root, resolve_repo_path
 from src.utils.nfe_budget import normalize_solver_name, resolve_effective_nfe_plan
+from src.utils.results import append_result_row
 from src.utils.runtime_env import build_subprocess_env, command_preview, get_runtime_env, run_in_runtime_env
 
 
@@ -49,6 +50,7 @@ class ExecutionConfig:
     prepare_gpu: int
     materialize_schedules: bool
     skip_existing: bool
+    continue_on_error: bool
     log_dir_root: Path
     schedule_cache_root: Path
 
@@ -69,10 +71,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", default="configs/assets_manifest.yaml")
     parser.add_argument("--runtime-config", default="configs/runtime_envs.yaml")
     parser.add_argument("--models-config", default="configs/models/modern_diffusers.yaml")
-    parser.add_argument("--clock-config", default="configs/clocks/SADB.yaml")
+    parser.add_argument("--clock-config", default="configs/clocks/FP_CLOCK.yaml")
     parser.add_argument("--ays-config", default="configs/clocks/AYS.yaml")
-    parser.add_argument("--outputs-root", default="outputs/samples")
-    parser.add_argument("--metrics-root", default="outputs/metrics")
+    parser.add_argument("--outputs-root", default="outputs")
+    parser.add_argument(
+        "--metrics-root",
+        default="",
+        help="Deprecated override for metrics output. Defaults to <outputs-root>/<experiment>/metrics.",
+    )
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--execute", action="store_true", default=False)
     parser.add_argument("--materialize-schedules", action="store_true", default=False)
@@ -168,21 +174,49 @@ def should_partition_by_guidance(experiment_config: Mapping[str, Any], guidance_
     return "guidance_scales" in experiment_config or "guidance_scale" in experiment_config or len(guidance_scales) > 1
 
 
+def experiment_output_root(args: argparse.Namespace, experiment_config: Mapping[str, Any]) -> Path:
+    return Path(str(getattr(args, "outputs_root", "") or "outputs")) / str(experiment_config["name"])
+
+
+def experiment_samples_root(args: argparse.Namespace, experiment_config: Mapping[str, Any]) -> Path:
+    return experiment_output_root(args, experiment_config) / "samples"
+
+
+def experiment_metrics_root(args: argparse.Namespace, experiment_config: Mapping[str, Any]) -> Path:
+    metrics_root = str(getattr(args, "metrics_root", "") or "")
+    if metrics_root:
+        return Path(metrics_root)
+    configured = str(experiment_config.get("metrics_root", "") or "")
+    if configured:
+        return Path(configured)
+    return experiment_output_root(args, experiment_config) / "metrics"
+
+
 def canonical_schedule_name(name: str) -> tuple[str, str]:
     normalized = name.lower().replace("-", "_")
     mapping = {
         "base": ("base", "base"),
         "linear": ("linear", "linear"),
         "ays": ("ays", "ays_like"),
-        "sadb": ("SADB", "SADB"),
-        "ri_sadb": ("RI_SADB", "RI_SADB"),
-        "v_b": ("V_b", "V_b"),
-        "a_a": ("A_a", "A_a"),
-        "a_b": ("A_b", "A_b"),
+        "legacy_sadb": ("LEGACY_SADB", "LEGACY_SADB"),
+        "fp_clock": ("FP_CLOCK", "FP_CLOCK"),
     }
     if normalized not in mapping:
         raise ValueError(f"Unsupported schedule name: {name}")
     return mapping[normalized]
+
+
+def parse_schedule_spec(name: str) -> tuple[str, str, str | None]:
+    """Return canonical schedule, output folder, and optional clock variant label."""
+    raw = str(name).strip()
+    if raw.endswith("]") and "[" in raw:
+        base_name, variant_label = raw[:-1].rsplit("[", 1)
+        if not base_name or not variant_label:
+            raise ValueError(f"Invalid schedule variant selector: {name}")
+        schedule_name, schedule_folder = canonical_schedule_name(base_name)
+        return schedule_name, schedule_folder, variant_label
+    schedule_name, schedule_folder = canonical_schedule_name(raw)
+    return schedule_name, schedule_folder, None
 
 
 def resolve_solver_schedule_overrides(
@@ -219,9 +253,10 @@ def validate_pndm_dpm_schedules_are_base_only(
         if normalize_solver_name(solver) not in dpm_solvers:
             continue
         custom_schedules = [
-            canonical_schedule_name(schedule_name)[0]
+            parsed_name
             for schedule_name in schedules
-            if canonical_schedule_name(schedule_name)[0] != "base"
+            for parsed_name in [parse_schedule_spec(schedule_name)[0]]
+            if parsed_name != "base"
         ]
         if custom_schedules:
             raise ValueError(
@@ -236,8 +271,8 @@ def resolve_schedule_clock_configs(
     default_clock_config_path: str,
 ) -> ClockConfigRefs:
     configs: ClockConfigRefs = {
-        "SADB": ((None, default_clock_config_path),),
-        "RI_SADB": ((None, "configs/clocks/RI_SADB.yaml"),),
+        "FP_CLOCK": ((None, "configs/clocks/FP_CLOCK.yaml"),),
+        "LEGACY_SADB": ((None, "configs/clocks/LEGACY_SADB.yaml"),),
     }
     raw_mapping = experiment_config.get("schedule_clock_configs")
     if raw_mapping is None:
@@ -292,13 +327,25 @@ def active_clock_variants_for_schedule(
     schedule_name: str,
     *,
     schedule_clock_configs: ClockConfigRefs,
+    requested_label: str | None = None,
 ) -> tuple[ClockVariant, ...]:
     if schedule_name in schedule_clock_configs:
-        return tuple(
+        variants = tuple(
             ClockVariant(label=label, config_path=config_path, config=load_yaml(config_path))
             for label, config_path in schedule_clock_configs[schedule_name]
         )
-    return (ClockVariant(label=None, config_path="", config={}),)
+    else:
+        variants = (ClockVariant(label=None, config_path="", config={}),)
+    if requested_label is None:
+        return variants
+    selected = tuple(variant for variant in variants if variant.label == requested_label)
+    if not selected:
+        available = ", ".join(str(variant.label) for variant in variants)
+        raise ValueError(
+            f"Schedule `{schedule_name}` requested clock variant `{requested_label}`, "
+            f"but available variants are: {available or '<none>'}."
+        )
+    return selected
 
 
 def schedule_display_name(schedule_name: str, clock_label: str | None) -> str:
@@ -337,8 +384,8 @@ def cached_schedule_root(cache_root: Path, schedule_folder: str, backend: str, *
 
 def is_materializable_schedule(backend: str, schedule_name: str) -> bool:
     materializable = {
-        "pndm": {"linear", "SADB", "RI_SADB"},
-        "diffusers": {"linear", "SADB", "RI_SADB"},
+        "pndm": {"linear", "LEGACY_SADB", "FP_CLOCK"},
+        "diffusers": {"linear", "LEGACY_SADB", "FP_CLOCK"},
     }
     return schedule_name in materializable.get(backend, set())
 
@@ -361,7 +408,7 @@ def schedule_target_dir(root: Path, nfe: int) -> Path:
 
 
 def maybe_seeded_schedule_parts(parts: tuple[str, ...], *, schedule_name: str, seed: int, seed_count: int) -> tuple[str, ...]:
-    if schedule_name in {"SADB", "RI_SADB"} and seed_count > 1:
+    if schedule_name in {"LEGACY_SADB", "FP_CLOCK"} and seed_count > 1:
         return (*parts, f"seed_{int(seed)}")
     return parts
 
@@ -395,6 +442,46 @@ def infer_batch_size(experiment_config: Mapping[str, Any], dataset_config: Mappi
     if name.startswith("smoke"):
         return int(dataset_config.get("smoke_batch_size", dataset_config.get("default_batch_size", 16)))
     return int(dataset_config.get("default_batch_size", dataset_config.get("smoke_batch_size", 16)))
+
+
+def pndm_model_assets_for_dataset(
+    experiment_config: Mapping[str, Any],
+    *,
+    dataset_name: str,
+    dataset_config: Mapping[str, Any],
+) -> list[str]:
+    raw_mapping = experiment_config.get("dataset_model_assets")
+    if raw_mapping is not None:
+        if not isinstance(raw_mapping, Mapping):
+            raise TypeError("`dataset_model_assets` must be a mapping from dataset name to model asset list.")
+        raw_assets = raw_mapping.get(dataset_name)
+        if raw_assets is None:
+            raw_assets = [dataset_config["default_model_asset"]]
+        if isinstance(raw_assets, str):
+            return [raw_assets]
+        if not isinstance(raw_assets, (list, tuple)) or not raw_assets:
+            raise TypeError(f"`dataset_model_assets.{dataset_name}` must be a non-empty list.")
+        return [str(item) for item in raw_assets]
+    return [str(item) for item in (experiment_config.get("model_assets") or [dataset_config["default_model_asset"]])]
+
+
+def diffusers_solvers_for_model(
+    experiment_config: Mapping[str, Any],
+    *,
+    model_key: str,
+    default_solvers: list[str],
+) -> list[str]:
+    raw_mapping = experiment_config.get("model_solvers")
+    if raw_mapping is None:
+        return default_solvers
+    if not isinstance(raw_mapping, Mapping):
+        raise TypeError("`model_solvers` must be a mapping from model key to solver list.")
+    raw_solvers = raw_mapping.get(model_key, default_solvers)
+    if isinstance(raw_solvers, str):
+        return [raw_solvers]
+    if not isinstance(raw_solvers, (list, tuple)) or not raw_solvers:
+        raise TypeError(f"`model_solvers.{model_key}` must be a non-empty list.")
+    return [str(item) for item in raw_solvers]
 
 
 def validate_effective_nfes(solvers: list[str], target_nfes: list[int]) -> None:
@@ -480,7 +567,7 @@ def build_pndm_prepare_steps(
             for nfe in target_nfes
         )
 
-    if schedule_name in {"SADB", "RI_SADB"}:
+    if schedule_name in {"LEGACY_SADB", "FP_CLOCK"}:
         variant_parts = schedule_parts or pndm_schedule_parts(
             dataset_name=dataset_name,
             model_asset=model_asset,
@@ -515,6 +602,8 @@ def build_pndm_prepare_steps(
                     ",".join(str(nfe) for nfe in target_nfes),
                     "--output-root",
                     str(root),
+                    "--profile-cache-root",
+                    str(schedule_cache_root / "_profile_cache"),
                 ),
             ),
         )
@@ -581,7 +670,7 @@ def build_diffusers_prepare_steps(
             for nfe in target_nfes
         )
 
-    if schedule_name in {"SADB", "RI_SADB"}:
+    if schedule_name in {"LEGACY_SADB", "FP_CLOCK"}:
         variant_parts = schedule_parts or extend_schedule_parts((model_key, solver), clock_label)
         root = cached_schedule_root(schedule_cache_root, schedule_folder, "diffusers", *variant_parts)
         return (
@@ -617,6 +706,8 @@ def build_diffusers_prepare_steps(
                     ",".join(str(nfe) for nfe in target_nfes),
                     "--output-root",
                     str(root),
+                    "--profile-cache-root",
+                    str(schedule_cache_root / "_profile_cache"),
                 ),
             ),
         )
@@ -644,7 +735,6 @@ def build_pndm_invocations(
         solvers=solvers,
         default_schedules=list(schedules),
     )
-    validate_pndm_dpm_schedules_are_base_only(solver_schedule_overrides)
     summary_csv = Path(metrics_root) / f"{experiment_config['name']}.csv"
     seeds = experiment_seeds(experiment_config)
     save_samples = bool(experiment_config.get("save_samples", True))
@@ -660,7 +750,11 @@ def build_pndm_invocations(
     for dataset_name in dataset_names:
         dataset_config_path = Path("configs/datasets") / f"{dataset_name}.yaml"
         dataset_config = load_yaml(dataset_config_path)
-        model_assets = experiment_config.get("model_assets") or [dataset_config["default_model_asset"]]
+        model_assets = pndm_model_assets_for_dataset(
+            experiment_config,
+            dataset_name=dataset_name,
+            dataset_config=dataset_config,
+        )
         num_samples = infer_num_samples(experiment_config, dataset_config)
         batch_size = infer_batch_size(experiment_config, dataset_config)
         compute_fid = wants_metric(experiment_config, "fid")
@@ -670,10 +764,11 @@ def build_pndm_invocations(
             for solver in solvers:
                 active_schedules = solver_schedule_overrides[solver]
                 for raw_schedule in active_schedules:
-                    schedule_name, schedule_folder = canonical_schedule_name(str(raw_schedule))
+                    schedule_name, schedule_folder, requested_clock_label = parse_schedule_spec(str(raw_schedule))
                     active_clock_variants = active_clock_variants_for_schedule(
                         schedule_name,
                         schedule_clock_configs=schedule_clock_configs,
+                        requested_label=requested_clock_label,
                     )
 
                     for clock_variant in active_clock_variants:
@@ -686,7 +781,7 @@ def build_pndm_invocations(
                                 and normalize_solver_name(item) == "heun2"
                             )
                             and any(
-                                canonical_schedule_name(candidate)[0] == "ays"
+                                parse_schedule_spec(candidate)[0] == "ays"
                                 for candidate in solver_schedule_overrides[item]
                             )
                         )
@@ -747,9 +842,7 @@ def build_pndm_invocations(
                                         "schedule_missing_materializable" if materializable else "schedule_missing_external_asset"
                                     )
 
-                                output_dir = Path(outputs_root) / experiment_config["name"] / "pndm" / dataset_name / str(
-                                    model_asset
-                                ) / solver / schedule_name
+                                output_dir = Path(outputs_root) / "pndm" / dataset_name / str(model_asset) / solver / schedule_name
                                 if clock_variant.label is not None:
                                     output_dir = output_dir / clock_variant.label
                                 if len(seeds) > 1:
@@ -841,13 +934,19 @@ def build_diffusers_invocations(
 
         for guidance_scale in guidance_scales:
             guidance_parts = (format_guidance_part(guidance_scale),) if partition_by_guidance else ()
-            for solver in solvers:
+            model_solvers = diffusers_solvers_for_model(
+                experiment_config,
+                model_key=model_key,
+                default_solvers=solvers,
+            )
+            for solver in model_solvers:
                 active_schedules = solver_schedule_overrides[solver]
                 for raw_schedule in active_schedules:
-                    schedule_name, schedule_folder = canonical_schedule_name(str(raw_schedule))
+                    schedule_name, schedule_folder, requested_clock_label = parse_schedule_spec(str(raw_schedule))
                     active_clock_variants = active_clock_variants_for_schedule(
                         schedule_name,
                         schedule_clock_configs=schedule_clock_configs,
+                        requested_label=requested_clock_label,
                     )
 
                     for clock_variant in active_clock_variants:
@@ -904,7 +1003,7 @@ def build_diffusers_invocations(
                                         "schedule_missing_materializable" if materializable else "schedule_missing_external_asset"
                                     )
 
-                                output_dir = Path(outputs_root) / experiment_config["name"] / "diffusers" / model_key / solver
+                                output_dir = Path(outputs_root) / "diffusers" / model_key / solver
                                 if partition_by_guidance:
                                     output_dir = output_dir / format_guidance_part(guidance_scale)
                                 output_dir = output_dir / schedule_name
@@ -978,6 +1077,8 @@ def build_invocations(
     ays_config_path = str(experiment_config.get("ays_config", args.ays_config))
     models_config_path = str(experiment_config.get("models_config", args.models_config))
     backend = experiment_config["backend"]
+    samples_root = experiment_samples_root(args, experiment_config)
+    metrics_root = experiment_metrics_root(args, experiment_config)
     if backend == "pndm":
         return build_pndm_invocations(
             experiment_config,
@@ -985,8 +1086,8 @@ def build_invocations(
             ays_config_path=ays_config_path,
             schedule_clock_configs=schedule_clock_configs,
             schedule_cache_root=execution_config.schedule_cache_root,
-            outputs_root=args.outputs_root,
-            metrics_root=args.metrics_root,
+            outputs_root=str(samples_root),
+            metrics_root=str(metrics_root),
         )
     if backend == "diffusers":
         return build_diffusers_invocations(
@@ -995,8 +1096,8 @@ def build_invocations(
             schedule_clock_configs=schedule_clock_configs,
             models_config_path=models_config_path,
             schedule_cache_root=execution_config.schedule_cache_root,
-            outputs_root=args.outputs_root,
-            metrics_root=args.metrics_root,
+            outputs_root=str(samples_root),
+            metrics_root=str(metrics_root),
             dtype_name=args.dtype,
         )
     raise ValueError(f"Unsupported backend in experiment config: {backend}")
@@ -1034,13 +1135,15 @@ def resolve_execution_config(experiment_config: Mapping[str, Any], args: argpars
         or args.materialize_schedules
     )
     skip_existing = bool(raw_execution.get("skip_existing", experiment_config.get("skip_existing", False)) or args.skip_existing)
-    log_dir_root = Path(raw_execution.get("log_dir_root", experiment_config.get("log_dir_root", "outputs/logs")))
+    continue_on_error = bool(raw_execution.get("continue_on_error", experiment_config.get("continue_on_error", False)))
+    experiment_root = experiment_output_root(args, experiment_config)
+    log_dir_root = Path(raw_execution.get("log_dir_root", experiment_config.get("log_dir_root", experiment_root / "logs")))
     schedule_cache_root = Path(
         raw_execution.get(
             "schedule_cache_root",
             experiment_config.get(
                 "schedule_cache_root",
-                Path("outputs/experiment_records") / str(experiment_config["name"]) / "schedules",
+                experiment_root / "schedules",
             ),
         )
     )
@@ -1052,6 +1155,7 @@ def resolve_execution_config(experiment_config: Mapping[str, Any], args: argpars
         prepare_gpu=prepare_gpu,
         materialize_schedules=materialize_schedules,
         skip_existing=skip_existing,
+        continue_on_error=continue_on_error,
         log_dir_root=log_dir_root,
         schedule_cache_root=schedule_cache_root,
     )
@@ -1141,8 +1245,8 @@ def _expected_schedule_implementation_version(schedule_family: str) -> int | Non
     versions = {
         "base": BASELINE_SCHEDULE_IMPLEMENTATION_VERSION,
         "linear": BASELINE_SCHEDULE_IMPLEMENTATION_VERSION,
-        "SADB": DEFECT_BALANCED_CLOCK_VERSION,
-        "RI_SADB": RI_SADB_CLOCK_VERSION,
+        "LEGACY_SADB": DEFECT_BALANCED_CLOCK_VERSION,
+        "FP_CLOCK": FP_CLOCK_VERSION,
     }
     return versions.get(schedule_family)
 
@@ -1288,41 +1392,124 @@ def print_invocations(invocations: list[ExperimentInvocation], runtime_config: s
             print(f"  notes: {', '.join(invocation.notes)}")
 
 
+def _argument_value(arguments: tuple[str, ...], flag: str, default: str = "") -> str:
+    try:
+        index = arguments.index(flag)
+    except ValueError:
+        return default
+    value_index = index + 1
+    if value_index >= len(arguments):
+        return default
+    return str(arguments[value_index])
+
+
+def _clock_fields(schedule_name: str) -> tuple[str, str, str]:
+    clock_label = ""
+    if schedule_name.endswith("]") and "[" in schedule_name:
+        base_name, clock_label = schedule_name[:-1].split("[", 1)
+    else:
+        base_name = schedule_name
+    if base_name == "FP_CLOCK":
+        return clock_label, "FP_CLOCK", "trajectory_window" if clock_label == "trajectory_window" else ""
+    if base_name == "LEGACY_SADB":
+        return clock_label, "LEGACY_SADB", ""
+    return clock_label, base_name, ""
+
+
+def _compact_error(exc: BaseException) -> str:
+    message = " ".join(str(exc).split())
+    if len(message) > 1200:
+        return message[:1197] + "..."
+    return message
+
+
+def append_failure_row(invocation: ExperimentInvocation, error: BaseException) -> None:
+    arguments = invocation.run_arguments
+    summary_csv = _argument_value(arguments, "--summary-csv")
+    if not summary_csv:
+        return
+    schedule_name = _argument_value(arguments, "--schedule-name", "")
+    clock_label, clock_family, estimator = _clock_fields(schedule_name)
+    dataset = ""
+    if invocation.runtime_backend == "pndm":
+        dataset = Path(_argument_value(arguments, "--dataset-config", "")).stem
+    model_asset = _argument_value(arguments, "--model-asset", "")
+    row = {
+        "backend": invocation.runtime_backend,
+        "dataset": dataset,
+        "model": model_asset,
+        "model_asset": model_asset,
+        "solver": _argument_value(arguments, "--solver", ""),
+        "schedule": schedule_name,
+        "clock_label": clock_label,
+        "clock_family": clock_family,
+        "estimator": estimator,
+        "nfe": _argument_value(arguments, "--nfe", ""),
+        "seed": _argument_value(arguments, "--seed", ""),
+        "guidance_scale": _argument_value(arguments, "--guidance-scale", ""),
+        "num_samples": _argument_value(arguments, "--num-samples", ""),
+        "metric_name": "fid" if "--compute-fid" in arguments else "",
+        "metric_value": "",
+        "fid": "",
+        "clip_score": "",
+        "image_reward": "",
+        "status": "FAILED",
+        "error": _compact_error(error),
+        "schedule_dir": "" if invocation.schedule_dir is None else str(invocation.schedule_dir),
+        "output_dir": _argument_value(arguments, "--output-dir", ""),
+    }
+    append_result_row(summary_csv, row)
+
+
 def execute_invocations(
     invocations: list[ExperimentInvocation],
     *,
     runtime_config: str,
     materialize_schedules: bool,
+    continue_on_error: bool = False,
 ) -> None:
     completed_prepare_keys: set[str] = set()
+    failed_prepare_errors: dict[str, str] = {}
     for invocation in invocations:
         runtime_env = get_runtime_env(invocation.runtime_backend, runtime_config)
-        if invocation.schedule_dir is not None and not resolve_repo_path(invocation.schedule_dir).exists():
-            if invocation.materializable and materialize_schedules:
-                for step in invocation.prepare_steps:
-                    if step.key in completed_prepare_keys:
-                        continue
-                    print(f"[prepare] {invocation.label}")
-                    print(f"  {command_preview(runtime_env, step.arguments)}")
-                    run_in_runtime_env(runtime_env, step.arguments)
-                    completed_prepare_keys.add(step.key)
-                if not resolve_repo_path(invocation.schedule_dir).exists():
+        try:
+            if invocation.schedule_dir is not None and not resolve_repo_path(invocation.schedule_dir).exists():
+                if invocation.materializable and materialize_schedules:
+                    for step in invocation.prepare_steps:
+                        if step.key in completed_prepare_keys:
+                            continue
+                        if step.key in failed_prepare_errors:
+                            raise RuntimeError(f"Previous prepare failed for {step.key}: {failed_prepare_errors[step.key]}")
+                        print(f"[prepare] {invocation.label}")
+                        print(f"  {command_preview(runtime_env, step.arguments)}")
+                        try:
+                            run_in_runtime_env(runtime_env, step.arguments)
+                        except Exception as exc:
+                            failed_prepare_errors[step.key] = _compact_error(exc)
+                            raise
+                        completed_prepare_keys.add(step.key)
+                    if not resolve_repo_path(invocation.schedule_dir).exists():
+                        raise FileNotFoundError(
+                            f"Schedule generation did not produce the expected bundle for {invocation.label}: {invocation.schedule_dir}"
+                        )
+                elif invocation.materializable:
                     raise FileNotFoundError(
-                        f"Schedule generation did not produce the expected bundle for {invocation.label}: {invocation.schedule_dir}"
+                        f"Missing materializable schedule for {invocation.label}: {invocation.schedule_dir}. "
+                        "Enable config execution.materialize_schedules or pass --materialize-schedules."
                     )
-            elif invocation.materializable:
-                raise FileNotFoundError(
-                    f"Missing materializable schedule for {invocation.label}: {invocation.schedule_dir}. "
-                    "Enable config execution.materialize_schedules or pass --materialize-schedules."
-                )
-            else:
-                raise FileNotFoundError(
-                    f"Missing external schedule asset for {invocation.label}: {invocation.schedule_dir}."
-                )
+                else:
+                    raise FileNotFoundError(
+                        f"Missing external schedule asset for {invocation.label}: {invocation.schedule_dir}."
+                    )
 
-        print(f"[run] {invocation.label}")
-        print(f"  {command_preview(runtime_env, invocation.run_arguments)}")
-        run_in_runtime_env(runtime_env, invocation.run_arguments)
+            print(f"[run] {invocation.label}")
+            print(f"  {command_preview(runtime_env, invocation.run_arguments)}")
+            run_in_runtime_env(runtime_env, invocation.run_arguments)
+        except Exception as exc:
+            if not continue_on_error:
+                raise
+            append_failure_row(invocation, exc)
+            print(f"[failed] {invocation.label}: {_compact_error(exc)}")
 
 
 def metric_script_names(experiment_config: Mapping[str, Any]) -> list[str]:
@@ -1348,8 +1535,8 @@ def run_scoring_phase(
 
     runtime_env = get_runtime_env("diffusers", args.runtime_config)
     experiment_name = str(experiment_config["name"])
-    outputs_root = Path(args.outputs_root) / experiment_name
-    metrics_root = Path(args.metrics_root)
+    outputs_root = experiment_samples_root(args, experiment_config)
+    metrics_root = experiment_metrics_root(args, experiment_config)
     detail_csv = metrics_root / f"{experiment_name}_detail.csv"
     aggregate_csv = metrics_root / f"{experiment_name}_aggregate.csv"
     pairwise_csv = metrics_root / f"{experiment_name}_pairwise.csv"
@@ -1377,7 +1564,13 @@ def run_scoring_phase(
     )
     print(f"[score] metrics={metrics} gpu={gpu_id}")
     print(f"  {command_preview(runtime_env, score_args)}")
-    run_in_runtime_env(runtime_env, score_args, env_overrides={"CUDA_VISIBLE_DEVICES": str(gpu_id)})
+    try:
+        run_in_runtime_env(runtime_env, score_args, env_overrides={"CUDA_VISIBLE_DEVICES": str(gpu_id)})
+    except Exception as exc:
+        if not execution_config.continue_on_error:
+            raise
+        print(f"[score-failed] {_compact_error(exc)}")
+        return
 
     pairwise_metrics = []
     if "clipscore" in metrics:
@@ -1395,7 +1588,12 @@ def run_scoring_phase(
     )
     print("[pairwise]")
     print(f"  {command_preview(runtime_env, pairwise_args)}")
-    run_in_runtime_env(runtime_env, pairwise_args)
+    try:
+        run_in_runtime_env(runtime_env, pairwise_args)
+    except Exception as exc:
+        if not execution_config.continue_on_error:
+            raise
+        print(f"[pairwise-failed] {_compact_error(exc)}")
 
 
 def build_child_command(args: argparse.Namespace, *, shard_count: int, shard_index: int, skip_existing: bool) -> list[str]:
@@ -1416,8 +1614,6 @@ def build_child_command(args: argparse.Namespace, *, shard_count: int, shard_ind
         args.ays_config,
         "--outputs-root",
         args.outputs_root,
-        "--metrics-root",
-        args.metrics_root,
         "--dtype",
         args.dtype,
         "--execute",
@@ -1428,6 +1624,8 @@ def build_child_command(args: argparse.Namespace, *, shard_count: int, shard_ind
         "--shard-index",
         str(shard_index),
     ]
+    if getattr(args, "metrics_root", ""):
+        command.extend(["--metrics-root", args.metrics_root])
     if args.limit is not None:
         command.extend(["--limit", str(args.limit)])
     if skip_existing:
@@ -1540,6 +1738,7 @@ def main() -> None:
             invocations,
             runtime_config=args.runtime_config,
             materialize_schedules=execution_config.materialize_schedules and not execution_config.prepare_schedules_first,
+            continue_on_error=execution_config.continue_on_error,
         )
         if not args.distributed_child and args.shard_count == 1:
             write_schedule_cache_record(

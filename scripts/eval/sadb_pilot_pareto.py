@@ -22,7 +22,7 @@ GROUP_KEYS = ("model_asset", "solver", "nfe")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build a SADB pilot-cost Pareto CSV from scoring details.")
+    parser = argparse.ArgumentParser(description="Build a clock pilot-cost Pareto CSV from scoring details.")
     parser.add_argument("--input-csv", action="append", required=True, help="One or more detail scoring CSVs.")
     parser.add_argument("--output-csv", required=True)
     parser.add_argument("--metric", default="image_reward")
@@ -45,18 +45,18 @@ def schedule_family(schedule: str) -> str:
         return "base"
     if lower in {"ays", "ays_like"}:
         return "AYS"
-    if lower == "sadb" or lower.startswith("sadb["):
-        return normalized if normalized.startswith("SADB") else "SADB" + normalized[4:]
-    if lower == "ri_sadb" or lower.startswith("ri_sadb["):
-        return normalized if normalized.startswith("RI_SADB") else "RI_SADB" + normalized[7:]
+    if lower == "legacy_sadb" or lower.startswith("legacy_sadb["):
+        return normalized if normalized.startswith("LEGACY_SADB") else "LEGACY_SADB" + normalized[11:]
+    if lower == "fp_clock" or lower.startswith("fp_clock["):
+        return normalized if normalized.startswith("FP_CLOCK") else "FP_CLOCK" + normalized[8:]
     return normalized
 
 
 def variant_label(schedule: str) -> str:
-    if schedule.startswith("SADB[") and schedule.endswith("]"):
-        return schedule.removeprefix("SADB[").removesuffix("]")
-    if schedule.startswith("RI_SADB[") and schedule.endswith("]"):
-        return schedule.removeprefix("RI_SADB[").removesuffix("]")
+    if schedule.startswith("LEGACY_SADB[") and schedule.endswith("]"):
+        return schedule.removeprefix("LEGACY_SADB[").removesuffix("]")
+    if schedule.startswith("FP_CLOCK[") and schedule.endswith("]"):
+        return schedule.removeprefix("FP_CLOCK[").removesuffix("]")
     return schedule
 
 
@@ -148,14 +148,17 @@ def main() -> None:
         for schedule in sorted(
             item
             for item in schedules
-            if item == "SADB" or item.startswith("SADB[") or item == "RI_SADB" or item.startswith("RI_SADB[")
+            if item == "LEGACY_SADB"
+            or item.startswith("LEGACY_SADB[")
+            or item == "FP_CLOCK"
+            or item.startswith("FP_CLOCK[")
         ):
-            sadb_rows = schedules[schedule]
-            sadb_by_key = {pair_key(row): row for row in sadb_rows}
-            costs = [cost for row in sadb_rows if (cost := calibration_cost_from_meta(row)) is not None]
-            metric_mean = mean_metric(sadb_rows, args.metric)
-            base_win_rate = win_rate_against(left_rows=sadb_by_key, right_rows=base_rows, metric=args.metric) if base_rows else None
-            ays_win_rate = win_rate_against(left_rows=sadb_by_key, right_rows=ays_rows, metric=args.metric) if ays_rows else None
+            clock_rows = schedules[schedule]
+            clock_by_key = {pair_key(row): row for row in clock_rows}
+            costs = [cost for row in clock_rows if (cost := calibration_cost_from_meta(row)) is not None]
+            metric_mean = mean_metric(clock_rows, args.metric)
+            base_win_rate = win_rate_against(left_rows=clock_by_key, right_rows=base_rows, metric=args.metric) if base_rows else None
+            ays_win_rate = win_rate_against(left_rows=clock_by_key, right_rows=ays_rows, metric=args.metric) if ays_rows else None
             output_rows.append(
                 {
                     "model_asset": model_asset,
@@ -165,8 +168,8 @@ def main() -> None:
                     "variant": variant_label(schedule),
                     "calibration_cost": statistics.median(costs) if costs else "",
                     f"{args.metric}_mean": blank_if_none(metric_mean),
-                    "sadb_vs_base_win_rate": blank_if_none(base_win_rate),
-                    "sadb_vs_ays_win_rate": blank_if_none(ays_win_rate),
+                    "clock_vs_base_win_rate": blank_if_none(base_win_rate),
+                    "clock_vs_ays_win_rate": blank_if_none(ays_win_rate),
                 }
             )
 
@@ -178,8 +181,8 @@ def main() -> None:
         "variant",
         "calibration_cost",
         f"{args.metric}_mean",
-        "sadb_vs_base_win_rate",
-        "sadb_vs_ays_win_rate",
+        "clock_vs_base_win_rate",
+        "clock_vs_ays_win_rate",
     ]
     output_path = resolve_repo_path(args.output_csv)
     output_path.parent.mkdir(parents=True, exist_ok=True)

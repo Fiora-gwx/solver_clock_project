@@ -1,0 +1,24 @@
+name: sd15_sdxl_practical_ri_eta0
+backend: diffusers
+base_config:
+  prompt_asset: diffusers_practical_prompts
+  seeds: [0, 1, 2]
+  num_gpus: 4
+  gpu_ids: [0, 1, 2, 3]
+  prepare_schedules_first: true
+  materialize_schedules: true
+models:
+  - stable_diffusion_15
+  - sdxl
+solvers:
+  - dpm_solver_pp
+  - sde_dpm_solver_pp
+schedules:
+  - base
+  - "RI_SADB[eta0_euler]"
+schedule_clock_configs:
+  RI_SADB:
+    eta0_euler:
+      path: configs/ablation/clocks/RI_SADB_diffusers_sd_practical_eta0.yaml
+eval_nfes: [10]
+metrics: [clipscore, imagereward]

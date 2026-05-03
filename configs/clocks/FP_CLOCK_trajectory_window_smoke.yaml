@@ -1,0 +1,18 @@
+clock:
+  family: FP_CLOCK
+  estimator: trajectory_window
+  calibration_mode: fp_clock
+  calibration_solver: target
+  model_output_type: epsilon
+  physical_grid_mode: official_base
+  multires_nfes: [16, 32, 64]
+  pilot_batch_size: 2
+  pilot_num_batches: 1
+  pilot_observation_microbatch: 1
+  smoothing_window: 1
+  epsilon: 1.0e-12
+  q_min: 1.05
+  q_max: 6.0
+  target_nfes: [6, 10]
+  heun_omitted: true
+  heun_omitted_reason: "even-NFE smoke uses NFE 6/10; current vendor Heun contract only supports odd effective NFE"

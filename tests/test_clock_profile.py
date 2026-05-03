@@ -28,7 +28,7 @@ def test_materialized_bundle_matches_solver_steps() -> None:
         effective_nfe=5,
         solver_name="heun2",
         representation="timesteps",
-        schedule_family="SADB",
+        schedule_family="LEGACY_SADB",
     )
     assert bundle.timesteps is not None
     assert bundle.time_grid is not None
@@ -49,7 +49,7 @@ def test_sigma_bundle_can_materialize_from_sigma_nodes_with_separate_time_grid()
         effective_nfe=5,
         solver_name="heun2",
         representation="sigmas",
-        schedule_family="SADB",
+        schedule_family="LEGACY_SADB",
         time_transform=lambda values: values * 100.0,
     )
 

@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nfe", type=int, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--summary-csv", default="outputs/metrics/diffusers_summary.csv")
+    parser.add_argument("--summary-csv", default="outputs/manual/metrics/diffusers_summary.csv")
     parser.add_argument("--schedule-name", default="base")
     parser.add_argument("--schedule-dir")
     parser.add_argument("--dtype", default="bfloat16")

@@ -1,0 +1,18 @@
+clock:
+  family: RI_SADB
+  calibration_mode: ri_sadb
+  calibration_solver: euler
+  model_output_type: epsilon
+  physical_grid_size: 65
+  pilot_batch_size: 8
+  pilot_num_batches: 4
+  pilot_observation_microbatch: 4
+  smoothing_window: 1
+  epsilon: 1.0e-12
+  q_min: 1.05
+  q_max: 6.0
+  eta: 0.0
+  beta: 0.0
+  ell_scale: step
+  ri_agg: mean
+  target_nfes: [5, 7, 9, 11, 15, 23, 31]

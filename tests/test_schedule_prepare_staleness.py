@@ -4,12 +4,13 @@ from tempfile import TemporaryDirectory
 from scripts.run.run_experiment_config import ExperimentInvocation, PrepareStep, collect_prepare_steps
 from src.clock.baseline import BASELINE_SCHEDULE_IMPLEMENTATION_VERSION
 from src.clock.defect_balanced import DEFECT_BALANCED_CLOCK_VERSION
+from src.clock.fp_clock import FP_CLOCK_VERSION
 from src.utils.config import dump_json
 
 
-def _build_sadb_invocation(schedule_dir: Path, prepare_root: Path) -> ExperimentInvocation:
+def _build_fp_clock_invocation(schedule_dir: Path, prepare_root: Path) -> ExperimentInvocation:
     step = PrepareStep(
-        key="SADB:pndm:test_solver",
+        key="FP_CLOCK:pndm:test_solver",
         runtime_backend="pndm",
         arguments=("scripts/run/export_defect_clock_schedule.py",),
         output_path=prepare_root,
@@ -57,26 +58,26 @@ def test_collect_prepare_steps_skips_current_baseline_bundle() -> None:
         assert collect_prepare_steps([invocation]) == []
 
 
-def test_collect_prepare_steps_skips_current_sadb_bundle() -> None:
+def test_collect_prepare_steps_skips_current_legacy_sadb_bundle() -> None:
     with TemporaryDirectory() as temp_dir:
         schedule_dir = Path(temp_dir) / "schedule" / "nfe_006"
         schedule_dir.mkdir(parents=True)
         dump_json(
             {
-                "schedule_family": "SADB",
+                "schedule_family": "LEGACY_SADB",
                 "schedule_implementation_version": DEFECT_BALANCED_CLOCK_VERSION,
             },
             schedule_dir / "meta.json",
         )
 
         step = PrepareStep(
-            key="SADB:pndm:test_solver",
+            key="LEGACY_SADB:pndm:test_solver",
             runtime_backend="pndm",
             arguments=("scripts/run/export_defect_clock_schedule.py",),
             output_path=schedule_dir.parent,
         )
         invocation = ExperimentInvocation(
-            label="test_sadb",
+            label="test_legacy_sadb",
             runtime_backend="pndm",
             run_arguments=tuple(),
             prepare_steps=(step,),
@@ -85,6 +86,22 @@ def test_collect_prepare_steps_skips_current_sadb_bundle() -> None:
             materializable=True,
             notes=tuple(),
         )
+        assert collect_prepare_steps([invocation]) == []
+
+
+def test_collect_prepare_steps_skips_current_fp_clock_bundle() -> None:
+    with TemporaryDirectory() as temp_dir:
+        schedule_dir = Path(temp_dir) / "schedule" / "nfe_006"
+        schedule_dir.mkdir(parents=True)
+        dump_json(
+            {
+                "schedule_family": "FP_CLOCK",
+                "schedule_implementation_version": FP_CLOCK_VERSION,
+            },
+            schedule_dir / "meta.json",
+        )
+
+        invocation = _build_fp_clock_invocation(schedule_dir, schedule_dir.parent)
         assert collect_prepare_steps([invocation]) == []
 
 def test_collect_prepare_steps_rebuilds_stale_baseline_bundle() -> None:

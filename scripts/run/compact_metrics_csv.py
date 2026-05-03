@@ -23,16 +23,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def canonical_schedule_label(name: str) -> str:
-    normalized = name.lower().replace("-", "_")
+    raw = str(name).strip()
+    if raw.endswith("]") and "[" in raw:
+        raw = raw[:-1].rsplit("[", 1)[0]
+    normalized = raw.lower().replace("-", "_")
     mapping = {
         "base": "base",
         "linear": "linear",
         "ays": "ays",
-        "sadb": "SADB",
-        "ri_sadb": "RI_SADB",
-        "v_b": "V_b",
-        "a_a": "A_a",
-        "a_b": "A_b",
+        "legacy_sadb": "LEGACY_SADB",
+        "fp_clock": "FP_CLOCK",
     }
     if normalized not in mapping:
         raise ValueError(f"Unsupported schedule name: {name}")

@@ -128,7 +128,7 @@ def test_velocity_curvature_profile_densifies_localized_curvature_and_saves_bund
         effective_nfe=7,
         solver_name="euler",
         representation="timesteps",
-        schedule_family="SADB",
+        schedule_family="LEGACY_SADB",
         meta={"estimator": "velocity_curvature"},
     )
     bundle.save(tmp_path)

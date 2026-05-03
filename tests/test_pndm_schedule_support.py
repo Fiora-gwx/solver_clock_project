@@ -241,23 +241,21 @@ def test_noise_stork_default_sigma_timestep_grid_is_consistent() -> None:
     assert np.max(np.abs(sigmas - sigma_from_t)) < 1.0e-6
 
 
-def test_dpm_solver_variants_reject_custom_offline_schedules() -> None:
+def test_dpm_solver_variants_accept_custom_offline_schedules() -> None:
     for solver_name in ("dpm_solver_lu", "dpm_solver_default"):
         scheduler = build_scheduler(solver_name)
         scheduler.set_timesteps(4, device=torch.device("cpu"))
 
         bundle = ScheduleBundle(timesteps=np.asarray([999.0, 700.0, 200.0], dtype=np.float64))
-        try:
-            _configure_scheduler_timesteps(
-                scheduler,
-                num_inference_steps=3,
-                device=torch.device("cpu"),
-                schedule_bundle=bundle,
-            )
-        except ValueError as error:
-            assert "DPMSolver" in str(error)
-        else:
-            raise AssertionError("DPMSolver custom offline schedules should be disabled.")
+        _configure_scheduler_timesteps(
+            scheduler,
+            num_inference_steps=3,
+            device=torch.device("cpu"),
+            schedule_bundle=bundle,
+        )
+
+        assert scheduler.num_inference_steps == 3
+        assert np.allclose(scheduler.timesteps.detach().cpu().numpy(), np.asarray([999, 700, 200]))
 
 
 def test_sigma_native_solvers_choose_expected_domains() -> None:
@@ -301,7 +299,7 @@ def test_native_lambda_coordinate_grid_is_disabled() -> None:
         raise AssertionError("lambda-domain coordinate grids should be disabled.")
 
 
-def test_dpm_solver_custom_sigma_grid_is_rejected() -> None:
+def test_dpm_solver_custom_sigma_grid_is_accepted() -> None:
     scheduler = build_scheduler("dpm_solver_lu")
     scheduler.set_timesteps(3, device=torch.device("cpu"))
     default_sigmas = scheduler.sigmas.detach().cpu().numpy().astype(np.float64)
@@ -313,17 +311,16 @@ def test_dpm_solver_custom_sigma_grid_is_rejected() -> None:
         sigmas=custom_sigma_grid[:-1],
         sigma_grid=custom_sigma_grid,
     )
-    try:
-        _configure_scheduler_timesteps(
-            scheduler,
-            num_inference_steps=3,
-            device=torch.device("cpu"),
-            schedule_bundle=bundle,
-        )
-    except ValueError as error:
-        assert "DPMSolver" in str(error)
-    else:
-        raise AssertionError("DPMSolver custom sigma-grid injection should be disabled.")
+    _configure_scheduler_timesteps(
+        scheduler,
+        num_inference_steps=3,
+        device=torch.device("cpu"),
+        schedule_bundle=bundle,
+    )
+
+    assert scheduler.num_inference_steps == 3
+    assert len(scheduler.sigmas) == 4
+    assert np.all(np.diff(scheduler.sigmas.detach().cpu().numpy()) < 0.0)
 
 
 def test_heun_resolves_custom_sigma_grid_directly() -> None:

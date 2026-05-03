@@ -1,0 +1,33 @@
+name: fp_clock_cifar10_smoke
+backend: pndm
+
+base_config:
+  dataset: cifar10
+  metrics: []
+  prepare_schedules_first: true
+  save_samples: true
+  preview_samples: 8
+  num_samples: 16
+  batch_size: 8
+  clock_config: configs/clocks/FP_CLOCK_smoke.yaml
+
+model_assets:
+  - pndm_model_ddim_cifar10
+
+solvers:
+  - euler
+
+schedules:
+  - base
+  - LEGACY_SADB
+  - FP_CLOCK
+
+solver_schedules:
+  euler: [base, LEGACY_SADB, FP_CLOCK]
+
+schedule_clock_configs:
+  LEGACY_SADB: configs/clocks/LEGACY_SADB.yaml
+  FP_CLOCK: configs/clocks/FP_CLOCK_smoke.yaml
+
+seeds: [0, 1]
+eval_nfes: [10]

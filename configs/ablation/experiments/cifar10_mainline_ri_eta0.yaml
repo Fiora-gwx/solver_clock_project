@@ -1,0 +1,50 @@
+name: cifar10_mainline_ri_eta0
+backend: pndm
+
+base_config:
+  dataset: cifar10
+  metrics: [fid]
+  num_gpus: 4
+  gpu_ids: [0, 1, 2, 3]
+  prepare_schedules_first: true
+  materialize_schedules: true
+  save_samples: false
+  preview_samples: 8
+  num_samples: 50000
+  clock_config: configs/ablation/clocks/legacy_sadb/SADB_stork_loose_adaptive.yaml
+
+model_assets:
+  - pndm_model_ddim_cifar10
+  - pndm_model_pf_cifar10
+  - pndm_model_pf_deep_cifar10
+
+solvers:
+  - euler
+  - deis
+  - heun2
+  - stork4_1st
+  - stork4_2nd
+
+schedules:
+  - base
+  - SADB
+  - RI_SADB
+
+solver_schedules:
+  euler: [base, SADB, "RI_SADB[eta0_target_euler]"]
+  heun2: [base, SADB, "RI_SADB[eta0_target_heun2]"]
+  deis: [base]
+  stork4_1st: [base, SADB, "RI_SADB[eta0_fixed_euler_proxy]"]
+  stork4_2nd: [base, SADB, "RI_SADB[eta0_fixed_euler_proxy]"]
+
+schedule_clock_configs:
+  SADB: configs/ablation/clocks/legacy_sadb/SADB_stork_loose_adaptive.yaml
+  RI_SADB:
+    eta0_target_euler:
+      path: configs/ablation/clocks/RI_SADB_cifar10_mainline_eta0_euler.yaml
+    eta0_target_heun2:
+      path: configs/ablation/clocks/RI_SADB_cifar10_mainline_eta0_heun2.yaml
+    eta0_fixed_euler_proxy:
+      path: configs/ablation/clocks/RI_SADB_cifar10_mainline_eta0_fixed_euler_proxy.yaml
+
+eval_nfes: [5, 7, 9, 11, 15, 23, 31]

@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/../.. && pwd)"
 RUNNER="/home/gwx/miniconda3/envs/sc-diff/bin/python"
 LAUNCHER="$ROOT_DIR/scripts/run/run_experiment_config.py"
 STAMP="$(date +%Y%m%d_%H%M%S)"
-LOG_DIR="$ROOT_DIR/outputs/logs/runnable_queue_${STAMP}"
+LOG_DIR="$ROOT_DIR/outputs/runnable_queue_${STAMP}/logs"
 
 mkdir -p "$LOG_DIR"
 
@@ -19,19 +19,9 @@ run_config() {
   return "${cmd_status}"
 }
 
-run_config cifar10_partial \
-  --experiment-config "$ROOT_DIR/configs/experiments/cifar10_partial.yaml" \
+run_config cifar10_mainline_fp_clock \
+  --experiment-config "$ROOT_DIR/configs/experiments/cifar10_mainline_fp_clock.yaml" \
   --execute \
   --materialize-schedules
 
-run_config cifar10_mainline \
-  --experiment-config "$ROOT_DIR/configs/experiments/cifar10_mainline.yaml" \
-  --execute \
-  --materialize-schedules
-
-run_config modern_diffusers_practical \
-  --experiment-config "$ROOT_DIR/configs/experiments/modern_diffusers_practical.yaml" \
-  --execute \
-  --materialize-schedules
-
-echo "$LOG_DIR" > "$ROOT_DIR/outputs/logs/latest_runnable_queue_path.txt"
+echo "$LOG_DIR" > "$ROOT_DIR/outputs/runnable_queue_${STAMP}/latest_runnable_queue_path.txt"

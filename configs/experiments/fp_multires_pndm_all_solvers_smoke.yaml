@@ -1,0 +1,56 @@
+name: fp_multires_pndm_all_solvers_smoke
+backend: pndm
+metrics_root: outputs/metrics
+
+base_config:
+  metrics: [fid]
+  num_gpus: 4
+  prepare_schedules_first: false
+  materialize_schedules: true
+  continue_on_error: true
+  save_samples: true
+  preview_samples: 4
+  num_samples: 8
+  batch_size: 8
+  clock_config: configs/clocks/FP_CLOCK_trajectory_window_smoke.yaml
+
+datasets:
+  - cifar10
+  - lsun_bedroom
+  - lsun_church
+
+dataset_model_assets:
+  cifar10:
+    - pndm_model_ddim_cifar10
+    - pndm_model_pf_cifar10
+    - pndm_model_pf_deep_cifar10
+  lsun_bedroom:
+    - pndm_model_ddim_lsun_bedroom
+  lsun_church:
+    - pndm_model_ddim_lsun_church
+
+solvers:
+  # heun2 is omitted here because the existing NFE contract only supports odd
+  # effective NFE for vendor Heun, while this smoke is fixed at NFE 6/10.
+  - euler
+  - ddim
+  - pndm
+  - deis
+  - dpm_solver_lu
+  - dpm_solver_default
+  - dpm_solver_pp
+  - unipc
+  - stork4_1st
+  - stork4_2nd
+
+schedules:
+  - base
+  - FP_CLOCK[trajectory_window]
+
+schedule_clock_configs:
+  FP_CLOCK:
+    variants:
+      trajectory_window: configs/clocks/FP_CLOCK_trajectory_window_smoke.yaml
+
+seeds: [0]
+eval_nfes: [6, 10]

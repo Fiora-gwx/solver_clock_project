@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from functools import wraps
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import torch
@@ -19,7 +19,13 @@ from src.clock.defect_balanced import (
     estimate_refinement_order_and_defect,
     per_sample_l2_norm,
 )
-from src.clock.ri_sadb import TrajectoryGeometryStats, collect_ri_sadb_stats, concatenate_ri_sadb_stats
+from src.clock.fp_clock import (
+    FPTrajectoryStats,
+    collect_fp_clock_stats,
+    collect_trajectory_window_stats,
+    concatenate_fp_clock_stats,
+)
+from src.clock.solver_registry import get_solver_native_spec
 from src.clock.calibration import ForwardNormCollector
 from src.utils.nfe_budget import resolve_effective_nfe_plan
 from src.utils.config import load_yaml, repo_root
@@ -557,12 +563,6 @@ def _configure_scheduler_timesteps(
     if schedule_bundle is None:
         scheduler.set_timesteps(num_inference_steps, device=device)
         return
-
-    if isinstance(scheduler, DPMSolverMultistepScheduler):
-        raise ValueError(
-            "Custom offline schedules for DPMSolver are disabled. "
-            "The deleted lambda-domain calibration path was not compatible with the clock construction."
-        )
 
     _apply_stork_runtime_options(scheduler, schedule_bundle)
 
@@ -1198,6 +1198,229 @@ def _build_stateful_stork_stepper(
     return step
 
 
+def _reset_scheduler_history(scheduler) -> None:
+    solver_order = int(getattr(getattr(scheduler, "config", None), "solver_order", 1))
+    for name, value in {
+        "model_outputs": [None] * solver_order,
+        "timestep_list": [None] * solver_order,
+        "lower_order_nums": 0,
+        "last_sample": None,
+        "_step_index": None,
+        "_begin_index": None,
+        "noise_predictions": [],
+        "velocity_predictions": [],
+    }.items():
+        if hasattr(scheduler, name):
+            setattr(scheduler, name, value)
+
+
+def _configured_scheduler_coordinate_nodes(
+    scheduler,
+    *,
+    coordinate_domain: str,
+) -> np.ndarray:
+    normalized_domain = str(coordinate_domain).lower().strip()
+    if normalized_domain == "timestep":
+        normalized_domain = "timesteps"
+    if normalized_domain == "sigma":
+        normalized_domain = "sigmas"
+    if normalized_domain == "timesteps":
+        timesteps = scheduler.timesteps.detach().cpu().float().numpy()
+        return np.concatenate([timesteps.astype(np.float64), np.asarray([0.0], dtype=np.float64)])
+    if normalized_domain == "sigmas":
+        raw_sigmas = getattr(scheduler, "sigmas", None)
+        if raw_sigmas is None:
+            raise ValueError(f"Scheduler {scheduler.__class__.__name__} does not expose sigma schedules.")
+        values = raw_sigmas.detach().cpu().float().numpy() if hasattr(raw_sigmas, "detach") else np.asarray(raw_sigmas)
+        return np.asarray(values, dtype=np.float64)
+    raise ValueError(f"Unsupported PNDM coordinate domain: {coordinate_domain}")
+
+
+def _collapse_adjacent_trajectory_nodes(
+    coordinate_nodes: np.ndarray,
+    states: list[torch.Tensor],
+    *,
+    eps: float,
+) -> tuple[np.ndarray, torch.Tensor]:
+    nodes = np.asarray(coordinate_nodes, dtype=np.float64)
+    if len(nodes) != len(states):
+        raise ValueError("coordinate node count must match recorded trajectory state count.")
+    collapsed_nodes: list[float] = []
+    collapsed_states: list[torch.Tensor] = []
+    for node, state in zip(nodes.tolist(), states):
+        if collapsed_nodes and abs(float(node) - collapsed_nodes[-1]) <= float(eps):
+            collapsed_nodes[-1] = float(node)
+            collapsed_states[-1] = state
+            continue
+        collapsed_nodes.append(float(node))
+        collapsed_states.append(state)
+    if len(collapsed_nodes) < 2:
+        raise RuntimeError("Recorded trajectory collapsed to fewer than two coordinate nodes.")
+    return np.asarray(collapsed_nodes, dtype=np.float64), torch.stack(collapsed_states, dim=0)
+
+
+def _trajectory_init_sigma(scheduler) -> float:
+    init_noise_sigma = getattr(scheduler, "init_noise_sigma", None)
+    if init_noise_sigma is not None:
+        if hasattr(init_noise_sigma, "detach"):
+            return float(init_noise_sigma.detach().cpu().float().reshape(()).item())
+        return float(init_noise_sigma)
+    raw_sigmas = getattr(scheduler, "sigmas", None)
+    if raw_sigmas is not None:
+        values = raw_sigmas.detach().cpu().float().numpy() if hasattr(raw_sigmas, "detach") else np.asarray(raw_sigmas)
+        return float(np.asarray(values, dtype=np.float64)[0])
+    return 1.0
+
+
+def _run_pndm_base_trajectory(
+    *,
+    model: torch.nn.Module,
+    scheduler,
+    solver: str,
+    effective_nfe: int,
+    initial_sample: torch.Tensor,
+    coordinate_domain: str,
+    eps: float,
+) -> tuple[np.ndarray, torch.Tensor]:
+    device = initial_sample.device
+    plan = resolve_effective_nfe_plan(solver, int(effective_nfe))
+    scheduler.set_timesteps(plan.solver_steps, device=device)
+    _force_zero_terminal_sigma(scheduler)
+    _reset_scheduler_history(scheduler)
+    coordinate_nodes = _configured_scheduler_coordinate_nodes(
+        scheduler,
+        coordinate_domain=coordinate_domain,
+    )
+    states = [initial_sample.detach().clone()]
+    sample = initial_sample.detach().clone()
+    with torch.inference_mode():
+        for timestep in scheduler.timesteps:
+            model_timestep = timestep
+            if not isinstance(model_timestep, torch.Tensor):
+                model_timestep = torch.tensor([model_timestep], device=device)
+            if model_timestep.ndim == 0:
+                model_timestep = model_timestep[None]
+            if model_timestep.numel() == 1:
+                model_timestep = model_timestep.expand(sample.shape[0])
+            model_input = sample
+            if hasattr(scheduler, "scale_model_input"):
+                model_input = scheduler.scale_model_input(sample, timestep)
+            model_output = model(model_input, model_timestep)
+            step_output = scheduler.step(model_output, timestep, sample)
+            sample = step_output.prev_sample
+            states.append(sample.detach().clone())
+    return _collapse_adjacent_trajectory_nodes(coordinate_nodes, states, eps=eps)
+
+
+def collect_trajectory_window_calibration_stats(
+    *,
+    model: torch.nn.Module,
+    scheduler,
+    solver: str,
+    image_size: int,
+    batch_size: int,
+    num_batches: int,
+    seed: int,
+    multires_nfes: Sequence[int] = (16, 32, 64),
+    window_size: int | None = None,
+    observation_microbatch: int | None = None,
+    coordinate_domain: str | None = None,
+    q_min: float = 1.05,
+    q_max: float = 6.0,
+    eps: float = 1.0e-12,
+) -> tuple[np.ndarray, FPTrajectoryStats, dict[str, object]]:
+    spec = get_solver_native_spec("pndm", solver)
+    if not spec.supports_base_trajectory_recording:
+        raise ValueError(f"PNDM solver `{solver}` does not support trajectory-window FP calibration: {spec.notes}")
+    nfes = tuple(int(value) for value in multires_nfes)
+    if len(nfes) != 3 or nfes[1] != 2 * nfes[0] or nfes[2] != 2 * nfes[1]:
+        raise ValueError("trajectory-window FP calibration expects multires_nfes=[N,2N,4N].")
+    active_domain = str(coordinate_domain or spec.native_coordinate).lower().strip()
+    if active_domain == "timestep":
+        active_domain = "timesteps"
+    if active_domain == "sigma":
+        active_domain = "sigmas"
+    if active_domain not in {"timesteps", "sigmas"}:
+        raise ValueError(f"Unsupported PNDM trajectory coordinate domain: {active_domain}")
+    active_window = int(window_size or spec.recommended_window_len)
+    if active_window < int(spec.solver_order):
+        raise ValueError("window_size must be at least the solver order/history length.")
+
+    device = next(model.parameters()).device
+    generator = torch.Generator(device=device).manual_seed(seed)
+    batches: list[FPTrajectoryStats] = []
+    details: list[dict[str, object]] = []
+    coarse_grid_reference: np.ndarray | None = None
+
+    with torch.inference_mode():
+        for _ in range(num_batches):
+            scheduler.set_timesteps(resolve_effective_nfe_plan(solver, nfes[0]).solver_steps, device=device)
+            _force_zero_terminal_sigma(scheduler)
+            init_sigma = _trajectory_init_sigma(scheduler)
+            initial_sample = torch.randn(
+                (batch_size, model.in_channels, image_size, image_size),
+                generator=generator,
+                device=device,
+            ) * init_sigma
+
+            micro = observation_microbatch if observation_microbatch and observation_microbatch > 0 else batch_size
+            micro = min(int(micro), batch_size)
+            for start in range(0, batch_size, micro):
+                stop = min(start + micro, batch_size)
+                sample_slice = initial_sample[start:stop]
+                trajectories = [
+                    _run_pndm_base_trajectory(
+                        model=model,
+                        scheduler=scheduler,
+                        solver=solver,
+                        effective_nfe=nfe,
+                        initial_sample=sample_slice,
+                        coordinate_domain=active_domain,
+                        eps=eps,
+                    )
+                    for nfe in nfes
+                ]
+                stats, window_details = collect_trajectory_window_stats(
+                    coarse_grid=trajectories[0][0],
+                    coarse_states=trajectories[0][1],
+                    mid_grid=trajectories[1][0],
+                    mid_states=trajectories[1][1],
+                    fine_grid=trajectories[2][0],
+                    fine_states=trajectories[2][1],
+                    window_size=active_window,
+                    q_min=q_min,
+                    q_max=q_max,
+                    eps=eps,
+                )
+                if coarse_grid_reference is None:
+                    coarse_grid_reference = trajectories[0][0]
+                elif not np.allclose(coarse_grid_reference, trajectories[0][0], rtol=0.0, atol=max(float(eps), 1.0e-8)):
+                    raise RuntimeError("Official-base coarse grids changed across trajectory-window calibration batches.")
+                batches.append(stats)
+                details.append(
+                    {
+                        "window_size": int(window_details.window_size),
+                        "mean_window_residual_perp_norm": float(np.mean(window_details.window_residual_perp_norm)),
+                        "mean_window_delta_s": float(np.mean(window_details.window_delta_s)),
+                        "mean_window_effective_order": float(np.mean(window_details.window_effective_order)),
+                    }
+                )
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    if coarse_grid_reference is None:
+        raise RuntimeError("No PNDM trajectory-window calibration batches were collected.")
+    stats = concatenate_fp_clock_stats(batches)
+    detail_meta = {
+        "window_size": active_window,
+        "solver_order": int(spec.solver_order),
+        "coordinate_domain": active_domain,
+        "multires_nfes": list(nfes),
+        "trajectory_window_batch_summaries": details,
+    }
+    return coarse_grid_reference, stats, detail_meta
+
+
 def collect_stork_refinement_stats_stateful(
     *,
     model: torch.nn.Module,
@@ -1459,7 +1682,7 @@ def collect_solver_refinement_stats(
     )
 
 
-def collect_ri_sadb_calibration_stats(
+def collect_fp_clock_calibration_stats(
     *,
     model: torch.nn.Module,
     scheduler,
@@ -1476,12 +1699,12 @@ def collect_ri_sadb_calibration_stats(
     q_min: float = 1.05,
     q_max: float = 6.0,
     eps: float = 1.0e-12,
-) -> TrajectoryGeometryStats:
+) -> FPTrajectoryStats:
     normalized_solver = normalize_solver_name(solver)
     if normalized_solver in {"dpm_solver_lu", "dpm_solver_default", "dpm_solver_pp", "dpm_solverpp"}:
-        raise ValueError("RI-SADB calibration is disabled for PNDM DPMSolver custom schedules.")
+        raise ValueError("FP_CLOCK calibration is disabled for PNDM DPMSolver custom schedules.")
     if normalized_solver in STORK_PNDM_SOLVERS:
-        raise ValueError("RI-SADB vector calibration is not implemented for stateful PNDM STORK solvers.")
+        raise ValueError("FP_CLOCK vector calibration is not implemented for stateful PNDM STORK solvers.")
 
     grid = np.asarray(physical_grid, dtype=np.float64)
     if grid.ndim != 1 or len(grid) < 2:
@@ -1531,7 +1754,7 @@ def collect_ri_sadb_calibration_stats(
 
     device = next(model.parameters()).device
     generator = torch.Generator(device=device).manual_seed(seed)
-    batches: list[TrajectoryGeometryStats] = []
+    batches: list[FPTrajectoryStats] = []
     with torch.inference_mode():
         for _ in range(num_batches):
             sample = torch.randn(
@@ -1540,7 +1763,7 @@ def collect_ri_sadb_calibration_stats(
                 device=device,
             ) * float(sigma_grid[0])
             batches.append(
-                collect_ri_sadb_stats(
+                collect_fp_clock_stats(
                     initial_sample=sample,
                     physical_grid=grid,
                     velocity_fn=velocity_fn,
@@ -1554,7 +1777,7 @@ def collect_ri_sadb_calibration_stats(
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-    return concatenate_ri_sadb_stats(batches)
+    return concatenate_fp_clock_stats(batches)
 
 
 def collect_velocity_curvature_calibration_stats(
