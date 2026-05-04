@@ -18,7 +18,7 @@ from src.clock.defect_balanced import (
 )
 from src.clock.profile import ClockProfile
 
-FP_CLOCK_VERSION = 7
+FP_CLOCK_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -140,6 +140,15 @@ def collect_anchored_replay_stats(
     batch_count = int(reference.shape[1])
     interval_displacement = reference[1:] - reference[:-1]
     delta_s = np.maximum(_window_l2_norm(interval_displacement).T, safe_eps)
+    q_lower = max(float(q_min), 1.0 + safe_eps)
+
+    def finite_positive(values: np.ndarray) -> np.ndarray:
+        array = np.asarray(values, dtype=np.float64)
+        finite = array[np.isfinite(array) & (array > 0.0)]
+        fallback = float(np.median(finite)) if finite.size else safe_eps
+        return np.maximum(np.nan_to_num(array, nan=fallback, posinf=fallback, neginf=fallback), safe_eps)
+
+    delta_s = finite_positive(delta_s)
 
     accumulated_defect = np.zeros((batch_count, n_intervals), dtype=np.float64)
     accumulated_q = np.zeros((batch_count, n_intervals), dtype=np.float64)
@@ -169,18 +178,19 @@ def collect_anchored_replay_stats(
             tangent,
             eps=safe_eps,
         )
-        full_error_norm = np.maximum(per_sample_l2_norm(full_residual).cpu().numpy(), safe_eps)
-        half_error_norm = np.maximum(per_sample_l2_norm(half_residual).cpu().numpy(), safe_eps)
-        residual_16_norm = np.maximum(per_sample_l2_norm(residual_16).cpu().numpy(), safe_eps)
-        residual_32_norm = np.maximum(per_sample_l2_norm(residual_32).cpu().numpy(), safe_eps)
+        full_error_norm = finite_positive(per_sample_l2_norm(full_residual).cpu().numpy())
+        half_error_norm = finite_positive(per_sample_l2_norm(half_residual).cpu().numpy())
+        residual_16_norm = finite_positive(per_sample_l2_norm(residual_16).cpu().numpy())
+        residual_32_norm = finite_positive(per_sample_l2_norm(residual_32).cpu().numpy())
         q = np.clip(
             1.0 + np.log2((full_error_norm + safe_eps) / (half_error_norm + safe_eps)),
-            max(float(q_min), 1.0 + safe_eps),
+            q_lower,
             float(q_max),
         )
+        q = np.clip(np.nan_to_num(q, nan=q_lower, posinf=float(q_max), neginf=q_lower), q_lower, float(q_max))
         ds_window = np.maximum(np.sum(delta_s[:, start:stop], axis=1), safe_eps)
         rho = np.maximum(np.abs(1.0 - np.power(2.0, 1.0 - q)), safe_eps)
-        window_defect = residual_16_norm / (rho * np.power(ds_window + safe_eps, q) + safe_eps)
+        window_defect = finite_positive(residual_16_norm / (rho * np.power(ds_window + safe_eps, q) + safe_eps))
 
         weights = delta_s[:, start:stop] / ds_window[:, None]
         accumulated_defect[:, start:stop] += weights * window_defect[:, None]
@@ -193,18 +203,23 @@ def collect_anchored_replay_stats(
     missing = coverage <= safe_eps
     if np.any(missing):
         accumulated_defect[missing] = safe_eps
-        accumulated_q[missing] = max(float(q_min), 1.0 + safe_eps)
+        accumulated_q[missing] = q_lower
         coverage[missing] = 1.0
 
-    interval_defect = np.maximum(accumulated_defect / np.maximum(coverage, safe_eps), safe_eps)
+    interval_defect = finite_positive(accumulated_defect / np.maximum(coverage, safe_eps))
     interval_q = np.clip(
         accumulated_q / np.maximum(coverage, safe_eps),
-        max(float(q_min), 1.0 + safe_eps),
+        q_lower,
+        float(q_max),
+    )
+    interval_q = np.clip(
+        np.nan_to_num(interval_q, nan=q_lower, posinf=float(q_max), neginf=q_lower),
+        q_lower,
         float(q_max),
     )
     interval_rho = np.maximum(np.abs(1.0 - np.power(2.0, 1.0 - interval_q)), safe_eps)
-    residual_perp = np.maximum(interval_defect * interval_rho * np.power(delta_s + safe_eps, interval_q), safe_eps)
-    half_error = residual_perp / np.maximum(np.power(2.0, interval_q - 1.0), safe_eps)
+    residual_perp = finite_positive(interval_defect * interval_rho * np.power(delta_s + safe_eps, interval_q))
+    half_error = finite_positive(residual_perp / np.maximum(np.power(2.0, interval_q - 1.0), safe_eps))
 
     stats = FPTrajectoryStats(
         full_step_error=residual_perp.copy(),
@@ -216,8 +231,11 @@ def collect_anchored_replay_stats(
     details = FPAnchoredReplayDetails(
         window_size=max_window,
         window_residual_perp_norm=np.maximum(window_residuals, safe_eps),
-        window_delta_s=np.maximum(window_delta_s, safe_eps),
-        window_effective_order=np.maximum(window_orders, max(float(q_min), 1.0 + safe_eps)),
+        window_delta_s=finite_positive(window_delta_s),
+        window_effective_order=np.maximum(
+            np.nan_to_num(window_orders, nan=q_lower, posinf=float(q_max), neginf=q_lower),
+            q_lower,
+        ),
         coverage=coverage,
     )
     return stats, details
@@ -279,7 +297,7 @@ def _evaluate_velocity(
     sample_start: int,
     sample_stop: int,
 ) -> torch.Tensor:
-    coordinate_tensor = torch.as_tensor(float(coordinate), device=sample.device, dtype=sample.dtype)
+    coordinate_tensor = torch.as_tensor(float(coordinate), device=sample.device, dtype=torch.float32)
     return _call_velocity(velocity_fn, sample, coordinate_tensor, sample_start, sample_stop)
 
 

@@ -1785,25 +1785,21 @@ def test_blackbox_replay_refinement_improves_prefix_dependent_loss() -> None:
     assert result.history[-1]["objective"] < result.history[0]["objective"]
 
 
-def test_diffusers_goes_exporter_rejects_unsupported_solver_modes() -> None:
+def test_diffusers_goes_exporter_selects_replay_backend_for_history_solvers() -> None:
     module = _load_script_module("export_goes_diffusers_schedule_test", "scripts/run/export_goes_diffusers_schedule.py")
 
     assert module._validate_solver_pipeline_pair("flux", "flow_heun") == "heun2"
     assert module._validate_solver_pipeline_pair("sdxl", "euler") == "euler"
+    assert module._validate_solver_pipeline_pair("flux", "flow_unipc") == "anchored_replay"
+    assert module._validate_solver_pipeline_pair("flux", "flow_stork4_1st") == "anchored_replay"
+    assert module._validate_solver_pipeline_pair("sdxl", "dpm_solver_pp") == "anchored_replay"
+    assert module._validate_solver_pipeline_pair("sdxl", "sde_dpm_solver_pp") == "anchored_replay"
+    assert module._validate_solver_pipeline_pair("sdxl", "unipc") == "anchored_replay"
+    assert module._validate_solver_pipeline_pair("sdxl", "stork4_2nd") == "anchored_replay"
+    assert module._validate_solver_pipeline_pair("sdxl", "edm_dpm_solver_pp") == "anchored_replay"
 
-    try:
-        module._validate_solver_pipeline_pair("flux", "flow_unipc")
-    except ValueError as exc:
-        assert "Multistep solvers require black-box replay refinement" in str(exc)
-    else:
-        raise AssertionError("flow_unipc should be rejected until scheduler-history replay refinement is implemented.")
-
-    try:
-        module._validate_solver_pipeline_pair("sdxl", "dpm_solver_pp")
-    except ValueError as exc:
-        assert "scheduler-history replay refinement" in str(exc)
-    else:
-        raise AssertionError("VP DPM solver should be rejected until replay refinement is implemented.")
+    assert module._resolve_defect_backend("sdxl", "euler", "auto") == "single_step"
+    assert module._resolve_defect_backend("sdxl", "dpm_solver_pp", "auto") == "anchored_replay"
 
 
 def test_diffusers_goes_exporter_repeats_prompt_asset_without_mixing_splits(tmp_path) -> None:

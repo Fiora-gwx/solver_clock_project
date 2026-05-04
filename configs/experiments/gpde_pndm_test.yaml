@@ -3,6 +3,14 @@ backend: pndm
 dataset: cifar10
 solvers:
   - euler
+  - ddim
+  - deis
+  - dpm_solver_lu
+  - dpm_solver_default
+  - dpm_solver_pp
+  - unipc
+  - stork4_1st
+  - stork4_2nd
 schedules:
   - base
   - GPDE
@@ -13,7 +21,6 @@ nfes:
   - 8
   - 10
   - 12
-  - 15
 seeds:
   - 0
 num_samples: 5000
@@ -23,7 +30,8 @@ preview_samples: 64
 metrics:
   - fid
 execution:
-  num_gpus: 4
+  num_gpus: 3
+  gpu_ids: [0, 1, 2]
   materialize_schedules: true
   prepare_schedules_first: true
 gpde:

@@ -72,6 +72,17 @@ _DIFFUSERS_SPECS: dict[str, SolverNativeSpec] = {
     "dpm_solverpp": SolverNativeSpec("dpm_solverpp", "diffusers_vp", "sigmas", True, 2, 2),
     "sde_dpm_solver_pp": SolverNativeSpec("sde_dpm_solver_pp", "diffusers_vp", "sigmas", True, 2, 2),
     "sde_dpmsolverpp": SolverNativeSpec("sde_dpmsolverpp", "diffusers_vp", "sigmas", True, 2, 2),
+    "unipc": SolverNativeSpec("unipc", "diffusers_vp", "sigmas", True, 2, 2),
+    "stork4_1st": SolverNativeSpec("stork4_1st", "diffusers_vp", "sigmas", True, 4, 4),
+    "stork_4_1st": SolverNativeSpec("stork_4_1st", "diffusers_vp", "sigmas", True, 4, 4),
+    "stork4_2nd": SolverNativeSpec("stork4_2nd", "diffusers_vp", "sigmas", True, 4, 4),
+    "stork_4_2nd": SolverNativeSpec("stork_4_2nd", "diffusers_vp", "sigmas", True, 4, 4),
+    "stork4_3rd": SolverNativeSpec("stork4_3rd", "diffusers_vp", "sigmas", True, 4, 4),
+    "stork_4_3rd": SolverNativeSpec("stork_4_3rd", "diffusers_vp", "sigmas", True, 4, 4),
+    "edm_euler": SolverNativeSpec("edm_euler", "diffusers_edm", "sigmas", True, 1, 1),
+    "edm_dpm_solver": SolverNativeSpec("edm_dpm_solver", "diffusers_edm", "sigmas", True, 2, 2),
+    "edm_dpm_solver_pp": SolverNativeSpec("edm_dpm_solver_pp", "diffusers_edm", "sigmas", True, 2, 2),
+    "edm_sde_dpm_solver_pp": SolverNativeSpec("edm_sde_dpm_solver_pp", "diffusers_edm", "sigmas", True, 2, 2),
 }
 
 

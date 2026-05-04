@@ -29,6 +29,10 @@ ONE_EVAL_SOLVERS = {
     "flow_stork_4_1st",
     "flow_stork_4_2nd",
     "flow_stork_4_3rd",
+    "edm_euler",
+    "edm_dpm_solver",
+    "edm_dpm_solver_pp",
+    "edm_sde_dpm_solver_pp",
     "ddim",
     "pndm",
 }

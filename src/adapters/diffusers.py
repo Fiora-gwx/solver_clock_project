@@ -34,6 +34,8 @@ _ensure_local_diffusers()
 from diffusers import (  # type: ignore  # noqa: E402
     DPMSolverMultistepScheduler,
     DiffusionPipeline,
+    EDMDPMSolverMultistepScheduler,
+    EDMEulerScheduler,
     EulerDiscreteScheduler,
     FlowMatchEulerDiscreteScheduler,
     FlowMatchHeunDiscreteScheduler,
@@ -501,6 +503,20 @@ def _vp_timestep_from_sigma(scheduler, sigma: torch.Tensor) -> float:
     )
 
 
+def _scale_vp_model_input_for_sigma(
+    pipeline,
+    latent_model_input: torch.Tensor,
+    *,
+    sigma: torch.Tensor,
+    timestep: torch.Tensor,
+) -> torch.Tensor:
+    if pipeline.scheduler.__class__.__name__ == "EulerDiscreteScheduler":
+        sigma_tensor = torch.as_tensor(sigma, device=latent_model_input.device, dtype=torch.float32).reshape(())
+        pipeline.scheduler.is_scale_input_called = True
+        return latent_model_input / ((sigma_tensor**2 + 1.0) ** 0.5)
+    return pipeline.scheduler.scale_model_input(latent_model_input, timestep)
+
+
 def _prepare_sd_defect_latents(
     pipeline,
     *,
@@ -574,8 +590,14 @@ def _prepare_stable_diffusion_defect_batch(
         batch = current_latents.shape[0]
         timestep_value = _vp_timestep_from_sigma(pipeline.scheduler, sigma)
         latent_model_input = torch.cat([current_latents] * 2) if do_cfg else current_latents
+        timestep_scalar = torch.as_tensor(timestep_value, device=current_latents.device, dtype=torch.float32)
         timestep = torch.full((latent_model_input.shape[0],), timestep_value, device=current_latents.device, dtype=torch.float32)
-        latent_model_input = pipeline.scheduler.scale_model_input(latent_model_input, timestep)
+        latent_model_input = _scale_vp_model_input_for_sigma(
+            pipeline,
+            latent_model_input,
+            sigma=sigma,
+            timestep=timestep_scalar,
+        )
         if do_cfg:
             active_prompt_embeds = torch.cat(
                 [
@@ -684,8 +706,14 @@ def _prepare_sdxl_defect_batch(
         batch = current_latents.shape[0]
         timestep_value = _vp_timestep_from_sigma(pipeline.scheduler, sigma)
         latent_model_input = torch.cat([current_latents] * 2) if do_cfg else current_latents
+        timestep_scalar = torch.as_tensor(timestep_value, device=current_latents.device, dtype=torch.float32)
         timestep = torch.full((latent_model_input.shape[0],), timestep_value, device=current_latents.device, dtype=torch.float32)
-        latent_model_input = pipeline.scheduler.scale_model_input(latent_model_input, timestep)
+        latent_model_input = _scale_vp_model_input_for_sigma(
+            pipeline,
+            latent_model_input,
+            sigma=sigma,
+            timestep=timestep_scalar,
+        )
         if do_cfg:
             active_prompt_embeds = torch.cat(
                 [
@@ -786,7 +814,12 @@ def _prepare_deepfloyd_if_defect_batch(
         timestep_value = _vp_timestep_from_sigma(pipeline.scheduler, sigma)
         latent_model_input = torch.cat([current_latents] * 2) if do_cfg else current_latents
         timestep = torch.as_tensor(timestep_value, device=current_latents.device, dtype=torch.float32)
-        latent_model_input = pipeline.scheduler.scale_model_input(latent_model_input, timestep)
+        latent_model_input = _scale_vp_model_input_for_sigma(
+            pipeline,
+            latent_model_input,
+            sigma=sigma,
+            timestep=timestep,
+        )
         if do_cfg:
             if negative_prompt_embeds is None:
                 raise RuntimeError("DeepFloyd IF CFG requested but negative prompt embeddings are unavailable.")
@@ -987,6 +1020,9 @@ def _diffusers_timesteps_for_sigmas(scheduler, sigmas: np.ndarray) -> np.ndarray
     if _uses_flow_sigmas(scheduler):
         total_steps = float(getattr(getattr(scheduler, "config", None), "num_train_timesteps", 1000))
         return sigma_values * total_steps
+    if hasattr(scheduler, "precondition_noise"):
+        sigma_tensor = torch.from_numpy(sigma_values.astype(np.float32))
+        return scheduler.precondition_noise(sigma_tensor).detach().cpu().float().numpy().astype(np.float64)
     if hasattr(scheduler, "alphas_cumprod"):
         train_sigmas = np.sqrt(
             np.clip(1.0 - scheduler.alphas_cumprod.detach().float().cpu().numpy(), 0.0, None)
@@ -994,18 +1030,16 @@ def _diffusers_timesteps_for_sigmas(scheduler, sigmas: np.ndarray) -> np.ndarray
         )
         log_sigmas = np.log(np.clip(train_sigmas, 1.0e-10, None))
         if hasattr(scheduler, "_sigma_to_t"):
+            def sigma_to_t(sigma: float) -> float:
+                sigma_array = np.asarray([max(float(sigma), 1.0e-10)], dtype=np.float64)
+                try:
+                    value = scheduler._sigma_to_t(sigma_array, log_sigmas)
+                except TypeError:
+                    value = scheduler._sigma_to_t(sigma_array)
+                return float(np.asarray(value).reshape(-1)[0])
+
             return np.asarray(
-                [
-                    float(
-                        np.asarray(
-                            scheduler._sigma_to_t(
-                                np.asarray([max(float(sigma), 1.0e-10)], dtype=np.float64),
-                                log_sigmas,
-                            )
-                        ).reshape(-1)[0]
-                    )
-                    for sigma in sigma_values
-                ],
+                [sigma_to_t(float(sigma)) for sigma in sigma_values],
                 dtype=np.float64,
             )
         return np.interp(
@@ -1093,7 +1127,7 @@ def _scheduler_sigma_at(scheduler, index: int, *, device: torch.device, dtype: t
     if sigmas is None:
         raise RuntimeError("The selected diffusers scheduler does not expose sigmas for anchored replay.")
     sigma = sigmas[int(index)]
-    return torch.as_tensor(sigma, device=device, dtype=dtype)
+    return torch.as_tensor(sigma, device=device, dtype=torch.float32)
 
 
 def _evaluate_scheduler_model_output(
@@ -1180,14 +1214,14 @@ def _run_diffusers_base_trajectory(
         pipeline.scheduler,
         coordinate_domain=coordinate_domain,
     )
-    sigmas = _scheduler_sigma_values(pipeline.scheduler).to(device=device, dtype=initial_sample.dtype)
+    sigmas = _scheduler_sigma_values(pipeline.scheduler).to(device=device, dtype=torch.float32)
     states = [initial_sample.detach().clone()]
     sample = initial_sample.detach().clone()
     step_parameters = set(inspect.signature(pipeline.scheduler.step).parameters.keys())
     step_generator = torch.Generator(device=device).manual_seed(int(generator_seed))
     with torch.inference_mode():
         for index, timestep in enumerate(pipeline.scheduler.timesteps):
-            sigma = sigmas[min(index, len(sigmas) - 1)].to(device=device, dtype=sample.dtype)
+            sigma = sigmas[min(index, len(sigmas) - 1)].to(device=device, dtype=torch.float32)
             model_output = defect_batch.velocity_fn(sample, sigma, batch_start, batch_stop)
             kwargs: dict[str, Any] = {}
             if "generator" in step_parameters:
@@ -1565,6 +1599,55 @@ def replace_scheduler(pipeline, solver_name: str):
             algorithm_type="sde-dpmsolver++",
             solver_order=2,
         )
+    elif solver == "unipc":
+        pipeline.scheduler = UniPCMultistepScheduler.from_config(
+            pipeline.scheduler.config,
+            solver_order=2,
+        )
+    elif solver == "edm_euler":
+        prediction_type = str(getattr(pipeline.scheduler.config, "prediction_type", "epsilon"))
+        pipeline.scheduler = EDMEulerScheduler(prediction_type=prediction_type)
+    elif solver in {"edm_dpm_solver", "edm_dpm_solver_pp"}:
+        prediction_type = str(getattr(pipeline.scheduler.config, "prediction_type", "epsilon"))
+        pipeline.scheduler = EDMDPMSolverMultistepScheduler(
+            prediction_type=prediction_type,
+            algorithm_type="dpmsolver++",
+            solver_order=2,
+        )
+    elif solver == "edm_sde_dpm_solver_pp":
+        prediction_type = str(getattr(pipeline.scheduler.config, "prediction_type", "epsilon"))
+        pipeline.scheduler = EDMDPMSolverMultistepScheduler(
+            prediction_type=prediction_type,
+            algorithm_type="sde-dpmsolver++",
+            solver_order=2,
+        )
+    elif solver in {"stork4_1st", "stork_4_1st"}:
+        prediction_type = str(getattr(pipeline.scheduler.config, "prediction_type", "epsilon"))
+        pipeline.scheduler = STORKScheduler.from_config(
+            pipeline.scheduler.config,
+            prediction_type=prediction_type,
+            solver_order=4,
+            derivative_order=1,
+            shift=shift,
+        )
+    elif solver in {"stork4_2nd", "stork_4_2nd"}:
+        prediction_type = str(getattr(pipeline.scheduler.config, "prediction_type", "epsilon"))
+        pipeline.scheduler = STORKScheduler.from_config(
+            pipeline.scheduler.config,
+            prediction_type=prediction_type,
+            solver_order=4,
+            derivative_order=2,
+            shift=shift,
+        )
+    elif solver in {"stork4_3rd", "stork_4_3rd"}:
+        prediction_type = str(getattr(pipeline.scheduler.config, "prediction_type", "epsilon"))
+        pipeline.scheduler = STORKScheduler.from_config(
+            pipeline.scheduler.config,
+            prediction_type=prediction_type,
+            solver_order=4,
+            derivative_order=3,
+            shift=shift,
+        )
     elif solver in {"flow_stork4_1st", "flow_stork_4_1st"}:
         pipeline.scheduler = STORKScheduler.from_config(
             pipeline.scheduler.config,
@@ -1595,6 +1678,7 @@ def replace_scheduler(pipeline, solver_name: str):
         pipeline.scheduler.register_to_config(variance_type="fixed_small")
     _attach_flow_native_sigmas(pipeline.scheduler)
     _attach_unipc_device_sigmas(pipeline.scheduler)
+    _attach_edm_native_sigmas(pipeline.scheduler)
     return pipeline
 
 
@@ -1610,6 +1694,112 @@ def _move_unipc_sigmas_to_device(scheduler, device: torch.device | str | None) -
     solver_p = getattr(scheduler, "solver_p", None)
     if solver_p is not None and isinstance(getattr(solver_p, "sigmas", None), torch.Tensor):
         solver_p.sigmas = solver_p.sigmas.to(device=device)
+
+
+def _set_unipc_vp_custom_sigmas(
+    scheduler: UniPCMultistepScheduler,
+    sigmas: Sequence[float] | np.ndarray,
+    *,
+    device: torch.device | str | None,
+    num_inference_steps: int | None,
+) -> None:
+    sigma_array = np.asarray(sigmas, dtype=np.float32).reshape(-1)
+    if sigma_array.ndim != 1 or len(sigma_array) == 0:
+        raise ValueError("Custom UniPC sigmas must be a non-empty 1D array.")
+    has_terminal = len(sigma_array) > 1 and abs(float(sigma_array[-1])) < 1.0e-12
+    active_sigmas = sigma_array[:-1] if has_terminal else sigma_array
+    if len(active_sigmas) == 0:
+        raise ValueError("Custom UniPC sigmas must contain at least one non-terminal sigma.")
+    if np.any(np.diff(active_sigmas) >= 0.0):
+        raise ValueError("Custom UniPC sigmas must be strictly descending.")
+    if num_inference_steps is not None and len(active_sigmas) != int(num_inference_steps):
+        raise ValueError("Custom UniPC sigmas length must match num_inference_steps when both are provided.")
+
+    alphas = scheduler.alphas_cumprod.detach().float().cpu().numpy()
+    train_sigmas = np.sqrt(np.clip(1.0 - alphas, 0.0, None) / np.clip(alphas, 1.0e-12, None))
+    log_sigmas = np.log(np.clip(train_sigmas, 1.0e-10, None))
+    timesteps = np.asarray(
+        [
+            float(
+                np.asarray(
+                    scheduler._sigma_to_t(
+                        np.asarray([float(max(sigma, 1.0e-10))], dtype=np.float64),
+                        log_sigmas,
+                    )
+                ).reshape(-1)[0]
+            )
+            for sigma in active_sigmas
+        ],
+        dtype=np.float64,
+    )
+    if np.any(np.diff(timesteps) >= 0.0):
+        raise ValueError("Custom UniPC sigmas mapped to non-descending timesteps.")
+
+    final_sigmas_type = str(getattr(scheduler.config, "final_sigmas_type", "zero"))
+    if final_sigmas_type == "sigma_min":
+        sigma_last = float(active_sigmas[-1])
+    elif final_sigmas_type == "zero":
+        sigma_last = 0.0
+    else:
+        raise ValueError(f"Unsupported UniPC final_sigmas_type for custom sigmas: {final_sigmas_type}")
+
+    scheduler.sigmas = torch.from_numpy(
+        np.concatenate([active_sigmas.astype(np.float32), np.asarray([sigma_last], dtype=np.float32)])
+    )
+    scheduler.timesteps = torch.from_numpy(timesteps.astype(np.float32)).to(device=device, dtype=torch.float32)
+    scheduler.num_inference_steps = len(timesteps)
+    scheduler.model_outputs = [None] * int(scheduler.config.solver_order)
+    scheduler.lower_order_nums = 0
+    scheduler.last_sample = None
+    if getattr(scheduler, "solver_p", None):
+        scheduler.solver_p.set_timesteps(scheduler.num_inference_steps, device=device)
+    scheduler._step_index = None
+    scheduler._begin_index = None
+    _move_unipc_sigmas_to_device(scheduler, device)
+
+
+def _set_edm_custom_sigmas_state(
+    scheduler,
+    sigmas: Sequence[float] | np.ndarray,
+    *,
+    device: torch.device | str | None,
+    num_inference_steps: int | None,
+) -> None:
+    native = np.asarray(sigmas, dtype=np.float32).reshape(-1)
+    if native.ndim != 1 or len(native) == 0:
+        raise ValueError("Custom EDM sigmas must be a non-empty 1D array.")
+    if len(native) > 1 and abs(float(native[-1])) < 1.0e-12:
+        native = native[:-1]
+    if len(native) == 0:
+        raise ValueError("Custom EDM sigmas must contain at least one non-terminal sigma.")
+    if np.any(~np.isfinite(native)):
+        raise ValueError("Custom EDM sigmas contain NaN or Inf.")
+    if np.any(np.diff(native) >= 0.0):
+        raise ValueError("Custom EDM sigmas must be strictly descending.")
+    if num_inference_steps is not None and len(native) != int(num_inference_steps):
+        raise ValueError("Custom EDM sigmas length must match num_inference_steps when both are provided.")
+
+    sigma_tensor = torch.from_numpy(native.astype(np.float32)).to(device=device, dtype=torch.float32)
+    timestep_tensor = scheduler.precondition_noise(sigma_tensor)
+    final_sigmas_type = str(getattr(scheduler.config, "final_sigmas_type", "zero"))
+    if final_sigmas_type == "sigma_min":
+        sigma_last = float(native[-1])
+    elif final_sigmas_type == "zero":
+        sigma_last = 0.0
+    else:
+        raise ValueError(f"Unsupported EDM final_sigmas_type for custom sigmas: {final_sigmas_type}")
+    full_sigmas = torch.cat(
+        [sigma_tensor, torch.full((1,), fill_value=float(sigma_last), dtype=torch.float32, device=device)]
+    )
+    scheduler.timesteps = timestep_tensor
+    scheduler.sigmas = full_sigmas
+    scheduler.num_inference_steps = len(native)
+    if isinstance(scheduler, EDMDPMSolverMultistepScheduler):
+        scheduler.model_outputs = [None] * int(scheduler.config.solver_order)
+        scheduler.lower_order_nums = 0
+    scheduler._step_index = None
+    scheduler._begin_index = None
+    scheduler.sigmas = scheduler.sigmas.to("cpu")
 
 
 def _uses_flow_sigmas(scheduler) -> bool:
@@ -1715,16 +1905,63 @@ def _attach_unipc_device_sigmas(scheduler):
     original_set_timesteps = scheduler.set_timesteps
 
     @wraps(original_set_timesteps)
-    def set_timesteps_with_device_sigmas(*args, **kwargs):
-        result = original_set_timesteps(*args, **kwargs)
-        target_device = kwargs.get("device", None)
-        if target_device is None and len(args) >= 2:
-            target_device = args[1]
+    def set_timesteps_with_device_sigmas(
+        num_inference_steps: int | None = None,
+        device: str | torch.device | None = None,
+        sigmas: Sequence[float] | np.ndarray | None = None,
+        mu: float | None = None,
+    ):
+        if sigmas is not None and not _uses_flow_sigmas(scheduler):
+            _set_unipc_vp_custom_sigmas(
+                scheduler,
+                sigmas,
+                device=device,
+                num_inference_steps=num_inference_steps,
+            )
+            return None
+        result = original_set_timesteps(
+            num_inference_steps=num_inference_steps,
+            device=device,
+            sigmas=sigmas,
+            mu=mu,
+        )
+        target_device = device
         _move_unipc_sigmas_to_device(scheduler, target_device)
         return result
 
     scheduler.set_timesteps = set_timesteps_with_device_sigmas
     scheduler._solver_clock_unipc_sigmas_patch = True
+    return scheduler
+
+
+def _attach_edm_native_sigmas(scheduler):
+    if not isinstance(scheduler, (EDMEulerScheduler, EDMDPMSolverMultistepScheduler)):
+        return scheduler
+    if getattr(scheduler, "_solver_clock_edm_native_sigmas_patch", False):
+        return scheduler
+    original_set_timesteps = scheduler.set_timesteps
+
+    def set_timesteps_with_native_sigmas(
+        num_inference_steps: int | None = None,
+        device: str | torch.device | None = None,
+        sigmas: Sequence[float] | np.ndarray | torch.Tensor | None = None,
+    ):
+        if sigmas is not None:
+            if isinstance(sigmas, torch.Tensor):
+                sigma_values = sigmas.detach().cpu().float().numpy()
+            else:
+                sigma_values = np.asarray(sigmas, dtype=np.float32)
+            _set_edm_custom_sigmas_state(
+                scheduler,
+                sigma_values,
+                device=device,
+                num_inference_steps=num_inference_steps,
+            )
+            return None
+        return original_set_timesteps(num_inference_steps=num_inference_steps, device=device)
+
+    scheduler.set_timesteps = set_timesteps_with_native_sigmas
+    scheduler._solver_clock_edm_native_sigmas_patch = True
     return scheduler
 
 
@@ -1800,19 +2037,29 @@ def build_pipeline_kwargs(
     if "mu" in parameters and getattr(pipeline.scheduler.config, "use_dynamic_shifting", False):
         kwargs["mu"] = compute_dynamic_mu(pipeline, height=height, width=width)
     if schedule_bundle is not None:
+        scheduler_parameters = set(inspect.signature(pipeline.scheduler.set_timesteps).parameters.keys())
         if _stork_uses_flow_prediction(pipeline.scheduler) and "sigmas" in parameters:
             sigmas = _stork_flow_anchor_sigmas(schedule_bundle)
             if sigmas is not None:
                 kwargs["sigmas"] = sigmas
                 kwargs["num_inference_steps"] = len(sigmas)
-        elif "timesteps" in parameters and schedule_bundle.timesteps is not None:
+        elif (
+            "sigmas" in parameters
+            and "sigmas" in scheduler_parameters
+            and schedule_bundle.sigmas is not None
+        ):
+            sigma_values = schedule_bundle.sigma_grid if schedule_bundle.sigma_grid is not None else schedule_bundle.sigmas
+            kwargs["sigmas"] = np.asarray(sigma_values, dtype=np.float32)
+        elif (
+            "timesteps" in parameters
+            and "timesteps" in scheduler_parameters
+            and schedule_bundle.timesteps is not None
+        ):
             num_train_timesteps = int(getattr(pipeline.scheduler.config, "num_train_timesteps", 1000))
             kwargs["timesteps"] = _snap_descending_timesteps(
                 schedule_bundle.timesteps,
                 num_train_timesteps=num_train_timesteps,
             ).tolist()
-        elif "sigmas" in parameters and schedule_bundle.sigmas is not None:
-            kwargs["sigmas"] = np.asarray(schedule_bundle.sigmas, dtype=np.float32)
     return kwargs
 
 

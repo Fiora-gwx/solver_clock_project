@@ -1051,7 +1051,7 @@ def test_preview_prints_shared_prepare_step_once(capsys) -> None:
 def test_build_invocations_rejects_unsupported_goes_solvers_before_prepare() -> None:
     args = _build_args()
     pndm_config = {
-        "name": "goes_bad_pndm_solver",
+        "name": "goes_pndm_replay_solver",
         "backend": "pndm",
         "dataset": "cifar10",
         "solvers": ["dpm_solver_lu"],
@@ -1059,15 +1059,30 @@ def test_build_invocations_rejects_unsupported_goes_solvers_before_prepare() -> 
         "nfes": [6],
     }
     execution = resolve_execution_config(pndm_config, args)
+    pndm_invocations = build_invocations(args, pndm_config, execution_config=execution)
+    assert len(pndm_invocations) == 1
+    assert pndm_invocations[0].prepare_steps
+    assert "--solver" in pndm_invocations[0].prepare_steps[0].arguments
+    assert "dpm_solver_lu" in pndm_invocations[0].prepare_steps[0].arguments
+
+    unsupported_pndm_config = {
+        "name": "goes_bad_pndm_solver",
+        "backend": "pndm",
+        "dataset": "cifar10",
+        "solvers": ["pndm"],
+        "schedules": ["GOES"],
+        "nfes": [6],
+    }
+    execution = resolve_execution_config(unsupported_pndm_config, args)
     try:
-        build_invocations(args, pndm_config, execution_config=execution)
+        build_invocations(args, unsupported_pndm_config, execution_config=execution)
     except ValueError as error:
-        assert "deterministic euler/heun2" in str(error)
+        assert "PRK/PLMS" in str(error)
     else:
-        raise AssertionError("PNDM GOES should reject unsupported multistep solvers during expansion.")
+        raise AssertionError("PNDM/PLMS GOES should be rejected until its nonuniform runner is validated.")
 
     flow_config = {
-        "name": "goes_bad_flow_solver",
+        "name": "goes_flow_replay_solver",
         "backend": "diffusers",
         "models": ["sd35_medium"],
         "solvers": ["flow_unipc"],
@@ -1075,15 +1090,14 @@ def test_build_invocations_rejects_unsupported_goes_solvers_before_prepare() -> 
         "nfes": [8],
     }
     execution = resolve_execution_config(flow_config, args)
-    try:
-        build_invocations(args, flow_config, execution_config=execution)
-    except ValueError as error:
-        assert "flow_euler/flow_heun only" in str(error)
-    else:
-        raise AssertionError("Flow GOES should reject unsupported multistep solvers during expansion.")
+    flow_invocations = build_invocations(args, flow_config, execution_config=execution)
+    assert len(flow_invocations) == 1
+    assert flow_invocations[0].prepare_steps
+    assert "--solver" in flow_invocations[0].prepare_steps[0].arguments
+    assert "flow_unipc" in flow_invocations[0].prepare_steps[0].arguments
 
     vp_config = {
-        "name": "goes_bad_vp_solver",
+        "name": "goes_vp_replay_solver",
         "backend": "diffusers",
         "models": ["stable_diffusion_15"],
         "solvers": ["dpm_solver_pp"],
@@ -1091,12 +1105,79 @@ def test_build_invocations_rejects_unsupported_goes_solvers_before_prepare() -> 
         "nfes": [10],
     }
     execution = resolve_execution_config(vp_config, args)
-    try:
-        build_invocations(args, vp_config, execution_config=execution)
-    except ValueError as error:
-        assert "empirical euler only" in str(error)
-    else:
-        raise AssertionError("VP GOES should reject DPM/UniPC/SDE solvers during expansion.")
+    vp_invocations = build_invocations(args, vp_config, execution_config=execution)
+    assert len(vp_invocations) == 1
+    assert vp_invocations[0].prepare_steps
+    assert "--solver" in vp_invocations[0].prepare_steps[0].arguments
+    assert "dpm_solver_pp" in vp_invocations[0].prepare_steps[0].arguments
+
+
+def test_build_invocations_allows_diffusers_goes_history_solver_adapters() -> None:
+    args = _build_args()
+    vp_config = {
+        "name": "goes_vp_history_solvers",
+        "backend": "diffusers",
+        "models": ["stable_diffusion_15"],
+        "solvers": ["dpm_solver_pp", "sde_dpm_solver_pp", "unipc", "stork4_1st", "edm_dpm_solver_pp"],
+        "schedules": ["GOES"],
+        "nfes": [10],
+        "gpde": {"defect_backend": "anchored_replay", "anchor_nfe": 16, "window_size": 4},
+    }
+    execution = resolve_execution_config(vp_config, args)
+    vp_invocations = build_invocations(args, vp_config, execution_config=execution)
+    assert len(vp_invocations) == 5
+    for invocation in vp_invocations:
+        arguments = invocation.prepare_steps[0].arguments
+        assert "--defect-backend" in arguments
+        assert "anchored_replay" in arguments
+        assert "--anchor-nfe" in arguments
+        assert "16" in arguments
+        assert "--window-size" in arguments
+        assert "4" in arguments
+
+    flow_config = {
+        "name": "goes_flow_history_solvers",
+        "backend": "diffusers",
+        "models": ["sd35_medium"],
+        "solvers": ["flow_dpm_solver", "flow_unipc", "flow_stork4_1st"],
+        "schedules": ["GOES"],
+        "nfes": [8],
+    }
+    execution = resolve_execution_config(flow_config, args)
+    assert len(build_invocations(args, flow_config, execution_config=execution)) == 3
+
+
+def test_build_invocations_allows_pndm_goes_history_solver_adapters() -> None:
+    args = _build_args()
+    config = {
+        "name": "goes_pndm_history_solvers",
+        "backend": "pndm",
+        "dataset": "cifar10",
+        "solvers": [
+            "ddim",
+            "deis",
+            "dpm_solver_lu",
+            "dpm_solver_default",
+            "dpm_solver_pp",
+            "unipc",
+            "stork4_1st",
+            "stork4_2nd",
+        ],
+        "schedules": ["GOES"],
+        "nfes": [6],
+        "gpde": {"defect_backend": "anchored_replay", "anchor_nfe": 16, "window_size": 4},
+    }
+    execution = resolve_execution_config(config, args)
+    invocations = build_invocations(args, config, execution_config=execution)
+    assert len(invocations) == 8
+    for invocation in invocations:
+        arguments = invocation.prepare_steps[0].arguments
+        assert "--defect-backend" in arguments
+        assert "anchored_replay" in arguments
+        assert "--anchor-nfe" in arguments
+        assert "16" in arguments
+        assert "--window-size" in arguments
+        assert "4" in arguments
 
 
 def test_build_invocations_expands_diffusers_seeds_and_published_ays() -> None:

@@ -18,6 +18,7 @@ from src.clock.baseline import BASELINE_SCHEDULE_IMPLEMENTATION_VERSION
 from src.clock.defect_balanced import DEFECT_BALANCED_CLOCK_VERSION
 from src.clock.fp_clock import FP_CLOCK_VERSION
 from src.clock.goes import GPDE_SCHEDULE_IMPLEMENTATION_VERSION, GOES_SCHEDULE_IMPLEMENTATION_VERSION
+from src.clock.solver_registry import get_solver_native_spec
 from src.utils.config import dump_json, load_json, load_yaml, repo_root, resolve_repo_path
 from src.utils.nfe_budget import normalize_solver_name, resolve_effective_nfe_plan
 from src.utils.results import append_result_row
@@ -445,20 +446,41 @@ GOES_PNDM_CLI_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("coordinate_domain", "--coordinate-domain", ()),
     ("model_output_type", "--model-output-type", ()),
     ("sigma_floor", "--sigma-floor", ()),
+    ("defect_backend", "--defect-backend", ()),
+    ("anchor_nfe", "--anchor-nfe", ()),
+    ("window_size", "--window-size", ()),
+    ("replay_q_min", "--replay-q-min", ()),
+    ("replay_q_max", "--replay-q-max", ()),
 )
 
 
 GOES_DIFFUSERS_CLI_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("physical_grid_mode", "--physical-grid-mode", ()),
+    ("defect_backend", "--defect-backend", ()),
+    ("anchor_nfe", "--anchor-nfe", ()),
+    ("window_size", "--window-size", ()),
+    ("replay_q_min", "--replay-q-min", ()),
+    ("replay_q_max", "--replay-q-max", ()),
 )
 
 
 def validate_goes_pndm_solver(solver: str) -> None:
     normalized = normalize_solver_name(solver)
-    if normalized not in {"euler", "heun2"}:
+    if normalized in {"euler", "heun2"}:
+        return
+    if normalized == "pndm":
         raise ValueError(
-            f"GPDE PNDM materialization currently supports deterministic euler/heun2 only, got `{solver}`. "
-            "Multistep solvers require scheduler-history replay refinement."
+            "GPDE PNDM materialization does not enable the `pndm` PRK/PLMS solver yet; "
+            "its nonuniform production runner still needs separate validation."
+        )
+    try:
+        spec = get_solver_native_spec("pndm", normalized)
+    except ValueError as error:
+        raise ValueError(f"GPDE PNDM materialization has no registered solver adapter for `{solver}`.") from error
+    if not spec.supports_base_trajectory_recording:
+        raise ValueError(
+            f"GPDE PNDM materialization for solver `{solver}` cannot use anchored replay: "
+            f"{spec.notes or 'base trajectory recording is disabled'}."
         )
 
 
@@ -500,21 +522,34 @@ def validate_goes_diffusers_solver(
 ) -> None:
     kind = infer_goes_diffusers_pipeline_kind(model_key, model_config, goes_config)
     normalized = str(solver).lower().replace("-", "_")
-    if kind in {"flux", "sd3", "lumina2"}:
-        if normalized not in {"flow_euler", "flow_heun"}:
-            raise ValueError(
-                f"GPDE diffusers materialization for flow pipeline `{kind}` supports flow_euler/flow_heun only, "
-                f"got `{solver}`. Multistep solvers require scheduler-history replay refinement."
-            )
+    if kind not in {"flux", "sd3", "lumina2", "stable_diffusion", "sdxl", "deepfloyd_if"}:
+        raise ValueError(f"Unsupported GPDE diffusers pipeline kind: {kind}")
+    if kind in {"flux", "sd3", "lumina2"} and normalized in {"flow_euler", "flow_heun"}:
         return
-    if kind in {"stable_diffusion", "sdxl", "deepfloyd_if"}:
-        if normalized != "euler":
-            raise ValueError(
-                f"GPDE diffusers materialization for VP pipeline `{kind}` currently supports empirical euler only, "
-                f"got `{solver}`. DPM/UniPC/SDE solvers require scheduler-history replay refinement."
-            )
+    if kind in {"stable_diffusion", "sdxl", "deepfloyd_if"} and normalized == "euler":
         return
-    raise ValueError(f"Unsupported GPDE diffusers pipeline kind: {kind}")
+    try:
+        spec = get_solver_native_spec("diffusers", normalized)
+    except ValueError as error:
+        raise ValueError(
+            f"GPDE diffusers materialization for pipeline `{kind}` has no registered solver adapter for `{solver}`."
+        ) from error
+    if not spec.supports_base_trajectory_recording:
+        raise ValueError(
+            f"GPDE diffusers materialization for pipeline `{kind}` solver `{solver}` cannot use anchored replay: "
+            f"{spec.notes or 'base trajectory recording is disabled'}."
+        )
+    if kind in {"flux", "sd3", "lumina2"} and not spec.family.startswith("diffusers_flow"):
+        raise ValueError(
+            f"GPDE diffusers flow pipeline `{kind}` requires a flow solver adapter, got `{solver}` "
+            f"with family `{spec.family}`."
+        )
+    if kind in {"stable_diffusion", "sdxl", "deepfloyd_if"} and spec.family not in {"diffusers_vp", "diffusers_edm"}:
+        raise ValueError(
+            f"GPDE diffusers VP pipeline `{kind}` requires a VP/EDM solver adapter, got `{solver}` "
+            f"with family `{spec.family}`."
+        )
+    return
 
 
 def schedule_display_name(schedule_name: str, clock_label: str | None) -> str:

@@ -1,10 +1,11 @@
-name: gpde_diffusers_t2i_nfe10
+name: gpde_diffusers_t2i_nfe10_pilot32_prompts50
 backend: diffusers
 models:
   - stable_diffusion_15
-  - sdxl
 solvers:
   - euler
+  - dpm_solver_pp
+  - unipc
 schedules:
   - base
   - GPDE
@@ -13,7 +14,7 @@ nfes:
   - 10
 seeds:
   - 0
-prompt_asset: diffusers_practical_prompts
+prompt_asset: diffusers_ablation_prompts
 metrics:
   - clipscore
   - imagereward
@@ -26,8 +27,8 @@ execution:
   prepare_schedules_first: true
   skip_existing: true
 gpde:
-  batch_size: 2
-  num_batches: 4
+  batch_size: 4
+  num_batches: 8
   microbatch_size: 1
   ref_nfe: 256
   ref_grid_size: 257

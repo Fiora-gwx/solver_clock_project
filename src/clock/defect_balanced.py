@@ -10,7 +10,7 @@ from src.clock.profile import ClockProfile, build_clock_profile_from_alpha
 
 StepFn = Callable[[torch.Tensor, float, float, int, int], torch.Tensor]
 VelocityFn = Callable[..., torch.Tensor]
-DEFECT_BALANCED_CLOCK_VERSION = 6
+DEFECT_BALANCED_CLOCK_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -128,7 +128,7 @@ def euler_step(
     sample_stop: int | None = None,
 ) -> torch.Tensor:
     step = float(coordinate_end) - float(coordinate_start)
-    coordinate = torch.as_tensor(float(coordinate_start), device=sample.device, dtype=sample.dtype)
+    coordinate = torch.as_tensor(float(coordinate_start), device=sample.device, dtype=torch.float32)
     return sample + _call_velocity(velocity_fn, sample, coordinate, sample_start, sample.shape[0] if sample_stop is None else sample_stop) * step
 
 
@@ -141,8 +141,8 @@ def heun2_step(
     sample_stop: int | None = None,
 ) -> torch.Tensor:
     step = float(coordinate_end) - float(coordinate_start)
-    start = torch.as_tensor(float(coordinate_start), device=sample.device, dtype=sample.dtype)
-    end = torch.as_tensor(float(coordinate_end), device=sample.device, dtype=sample.dtype)
+    start = torch.as_tensor(float(coordinate_start), device=sample.device, dtype=torch.float32)
+    end = torch.as_tensor(float(coordinate_end), device=sample.device, dtype=torch.float32)
     resolved_stop = sample.shape[0] if sample_stop is None else sample_stop
     velocity_start = _call_velocity(velocity_fn, sample, start, sample_start, resolved_stop)
     predicted = sample + velocity_start * step
@@ -215,7 +215,7 @@ def collect_velocity_curvature_stats(
         raise ValueError("defect_clip_quantile must be in (0, 1].")
 
     def evaluate_velocity(sample: torch.Tensor, coordinate: float, sample_start: int, sample_stop: int) -> torch.Tensor:
-        coordinate_tensor = torch.as_tensor(float(coordinate), device=sample.device, dtype=sample.dtype)
+        coordinate_tensor = torch.as_tensor(float(coordinate), device=sample.device, dtype=torch.float32)
         return _call_velocity(velocity_fn, sample, coordinate_tensor, sample_start, sample_stop)
 
     current = initial_sample.detach()
