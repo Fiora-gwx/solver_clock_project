@@ -15,11 +15,11 @@ schedules:
   - GPDE[metric_edm_scalar]
   - GPDE[metric_channel_whitened]
 nfes:
+  - 5
   - 10
+  - 15
 seeds:
   - 0
-  - 1
-  - 2
 num_samples: 5000
 batch_size: 64
 save_samples: false
@@ -27,8 +27,9 @@ preview_samples: 64
 metrics:
   - fid
 execution:
-  num_gpus: 1
-  materialize_schedules: false
+  num_gpus: 3
+  gpu_ids: [0, 1, 2]
+  materialize_schedules: true
   prepare_schedules_first: true
 gpde:
   batch_size: 8

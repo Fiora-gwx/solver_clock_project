@@ -1,0 +1,3 @@
+aggregation: cvar
+cvar_alpha: 0.80
+trim_ratio: 0.10
