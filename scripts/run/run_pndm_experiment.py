@@ -27,7 +27,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--schedule-name", default="base")
     parser.add_argument("--schedule-dir")
     parser.add_argument("--compute-fid", action="store_true", default=False)
+    parser.add_argument("--compute-kid", action="store_true", default=False)
     parser.add_argument("--reference-fid-asset")
+    parser.add_argument("--reference-kid-asset")
     parser.add_argument("--discard-samples", action="store_true", default=False)
     parser.add_argument("--preview-samples", type=int, default=0)
     return parser.parse_args()
@@ -49,7 +51,9 @@ def main() -> None:
         schedule_name=args.schedule_name,
         schedule_dir=args.schedule_dir,
         compute_fid_score=args.compute_fid,
+        compute_kid_score=args.compute_kid,
         reference_fid_asset_key=args.reference_fid_asset,
+        reference_kid_asset_key=args.reference_kid_asset,
         save_samples=not args.discard_samples,
         preview_samples=args.preview_samples,
     )

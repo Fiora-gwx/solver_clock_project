@@ -284,6 +284,41 @@ def test_native_sigma_coordinate_grid_matches_vendor_stork_range() -> None:
     assert np.all(np.diff(sigma_grid) <= 0.0)
 
 
+def test_native_timestep_grid_uses_scheduler_terminal_step() -> None:
+    scheduler = build_scheduler("ddim")
+    time_grid = build_pndm_native_coordinate_grid(
+        scheduler,
+        solver_name="ddim",
+        effective_nfe=6,
+        coordinate_domain="timesteps",
+    )
+
+    assert len(time_grid) == 7
+    assert time_grid[-1] < time_grid[-2]
+    assert np.all(np.diff(time_grid) < 0.0)
+
+
+def test_pndm_custom_timesteps_initialize_prk_and_plms_state() -> None:
+    scheduler = build_scheduler("pndm")
+    bundle = ScheduleBundle(
+        timesteps=np.asarray([830.0, 664.0, 498.0, 332.0, 166.0, 0.0], dtype=np.float64),
+        time_grid=np.asarray([830.0, 664.0, 498.0, 332.0, 166.0, 0.0, -166.0], dtype=np.float64),
+    )
+
+    _configure_scheduler_timesteps(
+        scheduler,
+        num_inference_steps=6,
+        device=torch.device("cpu"),
+        schedule_bundle=bundle,
+    )
+
+    assert scheduler.prk_timesteps is not None
+    assert scheduler.plms_timesteps is not None
+    assert len(scheduler.prk_timesteps) > 0
+    assert len(scheduler.plms_timesteps) > 0
+    assert len(scheduler.timesteps) == len(scheduler.prk_timesteps) + len(scheduler.plms_timesteps)
+
+
 def test_native_lambda_coordinate_grid_is_disabled() -> None:
     scheduler = build_scheduler("dpm_solver_lu")
     try:
@@ -321,6 +356,24 @@ def test_dpm_solver_custom_sigma_grid_is_accepted() -> None:
     assert scheduler.num_inference_steps == 3
     assert len(scheduler.sigmas) == 4
     assert np.all(np.diff(scheduler.sigmas.detach().cpu().numpy()) < 0.0)
+
+
+def test_euler_schedule_bundle_with_both_fields_uses_timesteps_only() -> None:
+    scheduler = build_scheduler("euler")
+    bundle = ScheduleBundle(
+        timesteps=np.asarray([900.0, 500.0, 100.0], dtype=np.float64),
+        sigmas=np.asarray([5.0, 2.0, 0.5], dtype=np.float64),
+    )
+
+    _configure_scheduler_timesteps(
+        scheduler,
+        num_inference_steps=3,
+        device=torch.device("cpu"),
+        schedule_bundle=bundle,
+    )
+
+    assert np.allclose(scheduler.timesteps.detach().cpu().numpy(), np.asarray([900, 500, 100]))
+    assert len(scheduler.sigmas) == 4
 
 
 def test_heun_resolves_custom_sigma_grid_directly() -> None:

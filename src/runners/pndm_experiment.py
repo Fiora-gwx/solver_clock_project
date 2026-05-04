@@ -8,7 +8,7 @@ from typing import Any
 from src.adapters.pndm import build_scheduler, load_model, run_generation
 from src.utils.assets import AssetManifest
 from src.utils.config import load_yaml, resolve_repo_path
-from src.utils.fid import compute_fid
+from src.utils.fid import compute_fid, compute_kid
 from src.utils.nfe_budget import resolve_effective_nfe_plan
 from src.utils.results import append_result_row, write_run_manifest
 from src.utils.schedule_bundle import ScheduleBundle
@@ -65,12 +65,14 @@ def run_pndm_experiment(
     schedule_name: str = "base",
     schedule_dir: str | None = None,
     compute_fid_score: bool = False,
+    compute_kid_score: bool = False,
     reference_fid_asset_key: str | None = None,
+    reference_kid_asset_key: str | None = None,
     save_samples: bool = True,
     preview_samples: int = 0,
 ) -> dict[str, Any]:
-    if not save_samples and not compute_fid_score:
-        raise ValueError("save_samples=False is only supported when compute_fid_score=True.")
+    if not save_samples and not (compute_fid_score or compute_kid_score):
+        raise ValueError("save_samples=False is only supported when FID or KID computation is enabled.")
     if preview_samples < 0:
         raise ValueError("preview_samples must be non-negative.")
 
@@ -131,9 +133,16 @@ def run_pndm_experiment(
                 schedule_bundle=bundle,
             )
             fid_value = None
+            kid_value = None
             if compute_fid_score:
                 fid_asset_key = reference_fid_asset_key or dataset_config["default_fid_asset"]
                 fid_value = compute_fid(image_dir, manifest.path(fid_asset_key))
+            if compute_kid_score:
+                kid_asset_key = reference_kid_asset_key or reference_fid_asset_key or dataset_config["default_fid_asset"]
+                kid_value = compute_kid(image_dir, manifest.path(kid_asset_key), seed=seed)
+            metric_names = ",".join(
+                name for name, value in (("fid", fid_value), ("kid", kid_value)) if value is not None
+            )
             preview_samples_persisted, preview_dir = persist_preview_images(
                 image_dir,
                 persisted_output_dir,
@@ -156,10 +165,12 @@ def run_pndm_experiment(
                 "step_methods": step_methods,
                 "execution_backend": execution_backend,
                 "num_samples": num_samples,
-                "metric_name": "fid" if fid_value is not None else "",
-                "metric_value": fid_value,
+                "metric_name": metric_names,
+                "metric_value": fid_value if fid_value is not None else kid_value,
                 "fid": fid_value,
                 "fid_reference": reference_fid_asset_key or dataset_config.get("default_fid_asset", ""),
+                "kid": kid_value,
+                "kid_reference": reference_kid_asset_key or reference_fid_asset_key or dataset_config.get("default_fid_asset", ""),
                 "clip_score": None,
                 "image_reward": None,
                 "schedule_dir": schedule_dir or "",
@@ -178,9 +189,16 @@ def run_pndm_experiment(
             return result
 
     fid_value: float | None = None
+    kid_value: float | None = None
     if compute_fid_score:
         fid_asset_key = reference_fid_asset_key or dataset_config["default_fid_asset"]
         fid_value = compute_fid(image_dir, manifest.path(fid_asset_key))
+    if compute_kid_score:
+        kid_asset_key = reference_kid_asset_key or reference_fid_asset_key or dataset_config["default_fid_asset"]
+        kid_value = compute_kid(image_dir, manifest.path(kid_asset_key), seed=seed)
+    metric_names = ",".join(
+        name for name, value in (("fid", fid_value), ("kid", kid_value)) if value is not None
+    )
 
     result = {
         "backend": "pndm",
@@ -199,10 +217,12 @@ def run_pndm_experiment(
         "step_methods": step_methods,
         "execution_backend": execution_backend,
         "num_samples": num_samples,
-        "metric_name": "fid" if fid_value is not None else "",
-        "metric_value": fid_value,
+        "metric_name": metric_names,
+        "metric_value": fid_value if fid_value is not None else kid_value,
         "fid": fid_value,
         "fid_reference": reference_fid_asset_key or dataset_config.get("default_fid_asset", ""),
+        "kid": kid_value,
+        "kid_reference": reference_kid_asset_key or reference_fid_asset_key or dataset_config.get("default_fid_asset", ""),
         "clip_score": None,
         "image_reward": None,
         "schedule_dir": schedule_dir or "",

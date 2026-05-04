@@ -31,6 +31,7 @@ def canonical_schedule_label(name: str) -> str:
         "base": "base",
         "linear": "linear",
         "ays": "ays",
+        "goes": "GOES",
         "legacy_sadb": "LEGACY_SADB",
         "fp_clock": "FP_CLOCK",
     }

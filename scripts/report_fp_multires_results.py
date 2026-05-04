@@ -41,7 +41,7 @@ REQUIRED_FIELDS = (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Summarize FP_CLOCK[trajectory_window] smoke outputs.")
+    parser = argparse.ArgumentParser(description="Summarize FP_CLOCK[anchored_replay] smoke outputs.")
     parser.add_argument("--metrics-root", required=True)
     parser.add_argument("--samples-root", required=True)
     parser.add_argument("--output", required=True)
@@ -86,7 +86,7 @@ def clock_fields(schedule: str) -> tuple[str, str, str]:
     else:
         base = schedule
     if base == "FP_CLOCK":
-        return label, "FP_CLOCK", "trajectory_window" if label == "trajectory_window" else ""
+        return label, "FP_CLOCK", label if label == "anchored_replay" else ""
     if base == "LEGACY_SADB":
         return label, "LEGACY_SADB", ""
     return label, base, ""
@@ -240,7 +240,7 @@ def schedule_order(schedule: str) -> int:
         "AYS": 1,
         "ays": 1,
         "LEGACY_SADB": 2,
-        "FP_CLOCK[trajectory_window]": 3,
+        "FP_CLOCK[anchored_replay]": 3,
         "FP_CLOCK": 3,
     }
     return order.get(schedule, 50)
@@ -265,7 +265,7 @@ def pndm_solver_table(rows: list[dict[str, Any]]) -> list[list[str]]:
         solver_rows = [row for row in pndm_rows if row.get("solver") == solver]
         base = mean_metric(solver_rows, schedule="base", metric="fid")
         legacy = mean_metric(solver_rows, schedule="LEGACY_SADB", metric="fid")
-        fp = mean_metric(solver_rows, schedule="FP_CLOCK[trajectory_window]", metric="fid")
+        fp = mean_metric(solver_rows, schedule="FP_CLOCK[anchored_replay]", metric="fid")
         failures = [row for row in solver_rows if row.get("status") == "FAILED"]
         status = "FAILED" if failures and fp is None else ("PARTIAL" if failures else "OK")
         table.append(
@@ -291,8 +291,8 @@ def diffusers_model_solver_table(rows: list[dict[str, Any]]) -> list[list[str]]:
         group = [row for row in diff_rows if row.get("model_asset") == model and row.get("solver") == solver]
         base_clip = mean_metric(group, schedule="base", metric="clip_score")
         base_reward = mean_metric(group, schedule="base", metric="image_reward")
-        fp_clip = mean_metric(group, schedule="FP_CLOCK[trajectory_window]", metric="clip_score")
-        fp_reward = mean_metric(group, schedule="FP_CLOCK[trajectory_window]", metric="image_reward")
+        fp_clip = mean_metric(group, schedule="FP_CLOCK[anchored_replay]", metric="clip_score")
+        fp_reward = mean_metric(group, schedule="FP_CLOCK[anchored_replay]", metric="image_reward")
         failures = [row for row in group if row.get("status") == "FAILED"]
         status = "FAILED" if failures and fp_clip is None and fp_reward is None else ("PARTIAL" if failures else "OK")
         table.append(
@@ -424,8 +424,8 @@ def inspect_fp_meta(samples_root: Path) -> dict[str, Any]:
             prepare_by_solver[solver] += 1
         expected = {
             "schedule_family": "FP_CLOCK",
-            "estimator": "trajectory_window",
-            "calibration_nfes": [16, 32, 64],
+            "estimator": "anchored_replay",
+            "calibration_nfes": [16],
         }
         for key, expected_value in expected.items():
             if meta.get(key) != expected_value:
@@ -455,10 +455,10 @@ def inspect_fp_meta(samples_root: Path) -> dict[str, Any]:
 
 def fp_prepare_table(rows: list[dict[str, Any]], meta_check: dict[str, Any]) -> list[list[str]]:
     prepare_by_solver = meta_check["prepare_by_solver"]
-    solvers = sorted({str(row.get("solver", "")) for row in rows if row.get("schedule") == "FP_CLOCK[trajectory_window]"})
+    solvers = sorted({str(row.get("solver", "")) for row in rows if row.get("schedule") == "FP_CLOCK[anchored_replay]"})
     table: list[list[str]] = []
     for solver in solvers:
-        fp_rows = [row for row in rows if row.get("solver") == solver and row.get("schedule") == "FP_CLOCK[trajectory_window]"]
+        fp_rows = [row for row in rows if row.get("solver") == solver and row.get("schedule") == "FP_CLOCK[anchored_replay]"]
         failures = [row for row in fp_rows if row.get("status") == "FAILED"]
         table.append(
             [
@@ -596,7 +596,7 @@ def main() -> None:
                         "solver",
                         "base metric",
                         "legacy metric",
-                        "FP_CLOCK[trajectory_window] metric",
+                        "FP_CLOCK[anchored_replay] metric",
                         "FP-base",
                         "FP-legacy",
                         "status",

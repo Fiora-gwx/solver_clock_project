@@ -1,0 +1,55 @@
+name: goes_pndm_rho_metric_ablation
+backend: pndm
+dataset: cifar10
+solvers:
+  - euler
+schedules:
+  - base
+  - GOES[rho_0]
+  - GOES[rho_005]
+  - GOES[rho_01]
+  - GOES[rho_02]
+  - GOES[rho_05]
+  - GOES[rho_1]
+  - GOES[metric_identity]
+  - GOES[metric_edm_scalar]
+  - GOES[metric_channel_whitened]
+nfes:
+  - 10
+seeds:
+  - 0
+  - 1
+  - 2
+num_samples: 5000
+batch_size: 64
+save_samples: false
+preview_samples: 64
+metrics:
+  - fid
+execution:
+  num_gpus: 1
+  materialize_schedules: false
+  prepare_schedules_first: true
+goes:
+  batch_size: 8
+  num_batches: 4
+  microbatch_size: 2
+  ref_nfe: 256
+  ref_grid_size: 257
+  candidate_grid_size: 512
+  metric: channel_whitened
+  rho: 0.1
+  aggregation: trimmed_mean
+  trim_ratio: 0.10
+schedule_clock_configs:
+  GOES:
+    variants:
+      rho_0: configs/goes/variants/rho_0.yaml
+      rho_005: configs/goes/variants/rho_005.yaml
+      rho_01: configs/goes/variants/rho_01.yaml
+      rho_02: configs/goes/variants/rho_02.yaml
+      rho_05: configs/goes/variants/rho_05.yaml
+      rho_1: configs/goes/variants/rho_1.yaml
+      metric_identity: configs/goes/variants/metric_identity.yaml
+      metric_edm_scalar: configs/goes/variants/metric_edm_scalar.yaml
+      metric_channel_whitened: configs/goes/variants/metric_channel_whitened.yaml

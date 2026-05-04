@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.clock.baseline import BASELINE_SCHEDULE_IMPLEMENTATION_VERSION
 from src.clock.defect_balanced import DEFECT_BALANCED_CLOCK_VERSION
 from src.clock.fp_clock import FP_CLOCK_VERSION
+from src.clock.goes import GOES_SCHEDULE_IMPLEMENTATION_VERSION
 from src.utils.config import dump_json, load_json, load_yaml, repo_root, resolve_repo_path
 from src.utils.nfe_budget import normalize_solver_name, resolve_effective_nfe_plan
 from src.utils.results import append_result_row
@@ -111,13 +113,26 @@ def load_experiment_config(path: str | Path) -> dict[str, Any]:
 
 
 def normalize_metric_names(raw_metrics: Any) -> list[str]:
+    def canonical_metric_name(value: Any) -> str:
+        normalized = str(value).strip().lower().replace("-", "_")
+        aliases = {
+            "clip": "clipscore",
+            "clip_score": "clipscore",
+            "clipscore": "clipscore",
+            "image_reward": "imagereward",
+            "imagereward": "imagereward",
+            "fid": "fid",
+            "kid": "kid",
+        }
+        return aliases.get(normalized, normalized)
+
     if raw_metrics is None:
         return []
     if isinstance(raw_metrics, str):
-        return [raw_metrics]
+        return [canonical_metric_name(raw_metrics)]
     if not isinstance(raw_metrics, (list, tuple)):
         raise TypeError("`metrics` must be a string or list of strings.")
-    return [str(item) for item in raw_metrics]
+    return [canonical_metric_name(item) for item in raw_metrics]
 
 
 def normalize_experiment_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -140,6 +155,22 @@ def normalize_experiment_config(config: Mapping[str, Any]) -> dict[str, Any]:
 def wants_metric(experiment_config: Mapping[str, Any], metric_name: str) -> bool:
     desired = metric_name.lower()
     return any(str(metric).lower() == desired for metric in experiment_config.get("metrics", []))
+
+
+def validate_experiment_metrics(experiment_config: Mapping[str, Any], *, backend: str) -> None:
+    supported_by_backend = {
+        "pndm": {"fid", "kid"},
+        "diffusers": {"clipscore", "imagereward"},
+    }
+    supported = supported_by_backend.get(str(backend), set())
+    requested = {str(metric).lower() for metric in experiment_config.get("metrics", []) if str(metric).strip()}
+    unsupported = sorted(requested - supported)
+    if unsupported:
+        message = (
+            f"Unsupported metrics for backend `{backend}`: {unsupported}. "
+            f"Supported metrics are: {sorted(supported)}."
+        )
+        raise ValueError(message)
 
 
 def experiment_seeds(experiment_config: Mapping[str, Any]) -> list[int]:
@@ -198,6 +229,7 @@ def canonical_schedule_name(name: str) -> tuple[str, str]:
         "base": ("base", "base"),
         "linear": ("linear", "linear"),
         "ays": ("ays", "ays_like"),
+        "goes": ("GOES", "GOES"),
         "legacy_sadb": ("LEGACY_SADB", "LEGACY_SADB"),
         "fp_clock": ("FP_CLOCK", "FP_CLOCK"),
     }
@@ -271,7 +303,7 @@ def resolve_schedule_clock_configs(
     default_clock_config_path: str,
 ) -> ClockConfigRefs:
     configs: ClockConfigRefs = {
-        "FP_CLOCK": ((None, "configs/clocks/FP_CLOCK.yaml"),),
+        "FP_CLOCK": ((None, default_clock_config_path),),
         "LEGACY_SADB": ((None, "configs/clocks/LEGACY_SADB.yaml"),),
     }
     raw_mapping = experiment_config.get("schedule_clock_configs")
@@ -293,7 +325,7 @@ def resolve_schedule_clock_configs(
 
     for raw_key, raw_value in raw_mapping.items():
         schedule_name, _ = canonical_schedule_name(str(raw_key))
-        if schedule_name not in configs:
+        if schedule_name not in {*configs, "GOES"}:
             raise ValueError(f"Unsupported materializable schedule in `schedule_clock_configs`: {raw_key}")
         if isinstance(raw_value, str):
             configs[schedule_name] = ((None, raw_value),)
@@ -348,6 +380,137 @@ def active_clock_variants_for_schedule(
     return selected
 
 
+def resolve_goes_config(experiment_config: Mapping[str, Any]) -> dict[str, Any]:
+    raw_config = experiment_config.get("goes", {})
+    if raw_config is None:
+        return {}
+    if not isinstance(raw_config, Mapping):
+        raise TypeError("`goes` must be a mapping when provided.")
+    return dict(raw_config)
+
+
+def resolve_goes_variant_config(base_config: Mapping[str, Any], clock_variant: ClockVariant) -> dict[str, Any]:
+    if not clock_variant.config:
+        return dict(base_config)
+    if not isinstance(clock_variant.config, Mapping):
+        raise TypeError("GOES clock variant config files must contain a mapping.")
+    raw_variant_config = clock_variant.config.get("goes", clock_variant.config)
+    if raw_variant_config is None:
+        return dict(base_config)
+    if not isinstance(raw_variant_config, Mapping):
+        raise TypeError("GOES clock variant configs must be mappings or contain a mapping `goes` section.")
+    return deep_merge_dicts(base_config, raw_variant_config)
+
+
+def _goes_value(config: Mapping[str, Any], key: str, *aliases: str) -> Any:
+    for candidate in (key, *aliases):
+        if candidate in config and config[candidate] is not None:
+            return config[candidate]
+    return None
+
+
+def goes_cli_options(config: Mapping[str, Any], specs: tuple[tuple[str, str, tuple[str, ...]], ...]) -> tuple[str, ...]:
+    arguments: list[str] = []
+    for key, flag, aliases in specs:
+        value = _goes_value(config, key, *aliases)
+        if value is None:
+            continue
+        arguments.extend([flag, str(value)])
+    return tuple(arguments)
+
+
+GOES_COMMON_CLI_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("batch_size", "--batch-size", ("calibration_batch_size", "pilot_batch_size")),
+    ("num_batches", "--num-batches", ("calibration_num_batches", "pilot_num_batches")),
+    ("microbatch_size", "--microbatch-size", ("calibration_microbatch_size", "pilot_observation_microbatch")),
+    ("ref_nfe", "--ref-nfe", ()),
+    ("ref_grid_size", "--ref-grid-size", ()),
+    ("candidate_grid_size", "--candidate-grid-size", ()),
+    ("metric", "--metric", ()),
+    ("sigma_data", "--sigma-data", ()),
+    ("rho", "--rho", ()),
+    ("aggregation", "--aggregation", ()),
+    ("trim_ratio", "--trim-ratio", ()),
+    ("cvar_alpha", "--cvar-alpha", ()),
+)
+
+
+GOES_PNDM_CLI_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("coordinate_domain", "--coordinate-domain", ()),
+    ("model_output_type", "--model-output-type", ()),
+    ("sigma_floor", "--sigma-floor", ()),
+)
+
+
+GOES_DIFFUSERS_CLI_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("physical_grid_mode", "--physical-grid-mode", ()),
+)
+
+
+def validate_goes_pndm_solver(solver: str) -> None:
+    normalized = normalize_solver_name(solver)
+    if normalized not in {"euler", "heun2"}:
+        raise ValueError(
+            f"GOES PNDM materialization currently supports deterministic euler/heun2 only, got `{solver}`. "
+            "Multistep solvers require scheduler-history replay refinement."
+        )
+
+
+def infer_goes_diffusers_pipeline_kind(
+    model_key: str,
+    model_config: Mapping[str, Any],
+    goes_config: Mapping[str, Any],
+) -> str:
+    configured = goes_config.get("pipeline_kind") or model_config.get("pipeline_kind")
+    if configured is not None:
+        return str(configured)
+    normalized_key = str(model_key).lower()
+    asset_key = str(model_config.get("asset_key", "")).lower()
+    combined = f"{normalized_key} {asset_key}"
+    if "flux" in combined:
+        return "flux"
+    if "sd35" in combined or "sd3" in combined or "stable-diffusion-3" in combined:
+        return "sd3"
+    if "lumina" in combined:
+        return "lumina2"
+    if "sdxl" in combined:
+        return "sdxl"
+    if "deepfloyd" in combined or "if_stage" in combined:
+        return "deepfloyd_if"
+    if "stable_diffusion" in combined or "stable-diffusion" in combined or "sd15" in combined:
+        return "stable_diffusion"
+    raise ValueError(
+        f"Cannot infer GOES diffusers pipeline kind for model `{model_key}`. "
+        "Set `goes.pipeline_kind` in the experiment config."
+    )
+
+
+def validate_goes_diffusers_solver(
+    *,
+    model_key: str,
+    model_config: Mapping[str, Any],
+    solver: str,
+    goes_config: Mapping[str, Any],
+) -> None:
+    kind = infer_goes_diffusers_pipeline_kind(model_key, model_config, goes_config)
+    normalized = str(solver).lower().replace("-", "_")
+    if kind in {"flux", "sd3", "lumina2"}:
+        if normalized not in {"flow_euler", "flow_heun"}:
+            raise ValueError(
+                f"GOES diffusers materialization for flow pipeline `{kind}` supports flow_euler/flow_heun only, "
+                f"got `{solver}`. Multistep solvers require scheduler-history replay refinement."
+            )
+        return
+    if kind in {"stable_diffusion", "sdxl", "deepfloyd_if"}:
+        if normalized != "euler":
+            raise ValueError(
+                f"GOES diffusers materialization for VP pipeline `{kind}` currently supports empirical euler only, "
+                f"got `{solver}`. DPM/UniPC/SDE solvers require scheduler-history replay refinement."
+            )
+        return
+    raise ValueError(f"Unsupported GOES diffusers pipeline kind: {kind}")
+
+
 def schedule_display_name(schedule_name: str, clock_label: str | None) -> str:
     if clock_label is None:
         return schedule_name
@@ -384,8 +547,8 @@ def cached_schedule_root(cache_root: Path, schedule_folder: str, backend: str, *
 
 def is_materializable_schedule(backend: str, schedule_name: str) -> bool:
     materializable = {
-        "pndm": {"linear", "LEGACY_SADB", "FP_CLOCK"},
-        "diffusers": {"linear", "LEGACY_SADB", "FP_CLOCK"},
+        "pndm": {"linear", "GOES", "LEGACY_SADB", "FP_CLOCK"},
+        "diffusers": {"linear", "GOES", "LEGACY_SADB", "FP_CLOCK"},
     }
     return schedule_name in materializable.get(backend, set())
 
@@ -408,7 +571,7 @@ def schedule_target_dir(root: Path, nfe: int) -> Path:
 
 
 def maybe_seeded_schedule_parts(parts: tuple[str, ...], *, schedule_name: str, seed: int, seed_count: int) -> tuple[str, ...]:
-    if schedule_name in {"LEGACY_SADB", "FP_CLOCK"} and seed_count > 1:
+    if schedule_name in {"GOES", "LEGACY_SADB", "FP_CLOCK"} and seed_count > 1:
         return (*parts, f"seed_{int(seed)}")
     return parts
 
@@ -428,7 +591,7 @@ def infer_num_samples(experiment_config: Mapping[str, Any], dataset_config: Mapp
     if "num_samples" in experiment_config:
         return int(experiment_config["num_samples"])
     name = str(experiment_config.get("name", ""))
-    if name.startswith("smoke"):
+    if name.startswith("smoke") or name.endswith("_smoke") or "_smoke_" in name:
         return int(dataset_config.get("smoke_num_samples", 100))
     if wants_metric(experiment_config, "fid"):
         return int(dataset_config.get("full_num_samples", dataset_config.get("smoke_num_samples", 100)))
@@ -439,7 +602,7 @@ def infer_batch_size(experiment_config: Mapping[str, Any], dataset_config: Mappi
     if "batch_size" in experiment_config:
         return int(experiment_config["batch_size"])
     name = str(experiment_config.get("name", ""))
-    if name.startswith("smoke"):
+    if name.startswith("smoke") or name.endswith("_smoke") or "_smoke_" in name:
         return int(dataset_config.get("smoke_batch_size", dataset_config.get("default_batch_size", 16)))
     return int(dataset_config.get("default_batch_size", dataset_config.get("smoke_batch_size", 16)))
 
@@ -509,6 +672,7 @@ def build_pndm_prepare_steps(
     ays_reference_solver: str,
     ays_consumer_solvers: tuple[str, ...],
     schedule_parts: tuple[str, ...] | None = None,
+    goes_config: Mapping[str, Any] | None = None,
 ) -> tuple[PrepareStep, ...]:
     if schedule_name == "base":
         return ()
@@ -562,6 +726,53 @@ def build_pndm_prepare_steps(
                             nfe,
                         )
                     ),
+                ),
+            )
+            for nfe in target_nfes
+        )
+
+    if schedule_name == "GOES":
+        validate_goes_pndm_solver(solver)
+        active_goes_config = goes_config or {}
+        goes_parts = schedule_parts or pndm_schedule_parts(
+            dataset_name=dataset_name,
+            model_asset=model_asset,
+            solver=solver,
+            schedule_name=schedule_name,
+            clock_label=clock_label,
+            share_ays_across_solvers=share_ays_across_solvers,
+        )
+        root = cached_schedule_root(schedule_cache_root, schedule_folder, "pndm", *goes_parts)
+        oracle_cache_dir = Path(
+            str(active_goes_config.get("oracle_cache_dir", schedule_cache_root / "_goes_oracle_cache" / "pndm"))
+        )
+        extra_args = goes_cli_options(active_goes_config, GOES_COMMON_CLI_SPECS + GOES_PNDM_CLI_SPECS)
+        reuse_args = ("--no-reuse-oracle",) if bool(active_goes_config.get("no_reuse_oracle", False)) else ()
+        return tuple(
+            PrepareStep(
+                key=f"GOES:pndm:{':'.join(goes_parts)}:{nfe}",
+                runtime_backend="pndm",
+                output_path=schedule_target_dir(root, nfe),
+                arguments=(
+                    "scripts/run/export_goes_pndm_schedule.py",
+                    "--manifest",
+                    manifest_path,
+                    "--dataset-config",
+                    dataset_config_path,
+                    "--model-asset",
+                    model_asset,
+                    "--solver",
+                    solver,
+                    "--seed",
+                    str(seed),
+                    "--nfe",
+                    str(nfe),
+                    "--output-dir",
+                    str(schedule_target_dir(root, nfe)),
+                    "--oracle-cache-dir",
+                    str(oracle_cache_dir),
+                    *extra_args,
+                    *reuse_args,
                 ),
             )
             for nfe in target_nfes
@@ -629,6 +840,7 @@ def build_diffusers_prepare_steps(
     clock_config_path: str,
     clock_label: str | None,
     schedule_parts: tuple[str, ...] | None = None,
+    goes_config: Mapping[str, Any] | None = None,
 ) -> tuple[PrepareStep, ...]:
     if schedule_name == "base":
         return ()
@@ -665,6 +877,53 @@ def build_diffusers_prepare_steps(
                             nfe,
                         )
                     ),
+                ),
+            )
+            for nfe in target_nfes
+        )
+
+    if schedule_name == "GOES":
+        active_goes_config = goes_config or {}
+        goes_parts = schedule_parts or extend_schedule_parts((model_key, solver), clock_label)
+        root = cached_schedule_root(schedule_cache_root, schedule_folder, "diffusers", *goes_parts)
+        oracle_cache_dir = Path(
+            str(active_goes_config.get("oracle_cache_dir", schedule_cache_root / "_goes_oracle_cache" / "diffusers"))
+        )
+        extra_args = goes_cli_options(active_goes_config, GOES_COMMON_CLI_SPECS + GOES_DIFFUSERS_CLI_SPECS)
+        reuse_args = ("--no-reuse-oracle",) if bool(active_goes_config.get("no_reuse_oracle", False)) else ()
+        return tuple(
+            PrepareStep(
+                key=f"GOES:diffusers:{':'.join(goes_parts)}:{nfe}",
+                runtime_backend="diffusers",
+                output_path=schedule_target_dir(root, nfe),
+                arguments=(
+                    "scripts/run/export_goes_diffusers_schedule.py",
+                    "--manifest",
+                    manifest_path,
+                    "--model-asset",
+                    model_asset,
+                    "--prompt-asset",
+                    prompt_asset,
+                    "--solver",
+                    solver,
+                    "--seed",
+                    str(seed),
+                    "--dtype",
+                    dtype_name,
+                    "--height",
+                    str(image_size),
+                    "--width",
+                    str(image_size),
+                    "--guidance-scale",
+                    str(guidance_scale),
+                    "--nfe",
+                    str(nfe),
+                    "--output-dir",
+                    str(schedule_target_dir(root, nfe)),
+                    "--oracle-cache-dir",
+                    str(oracle_cache_dir),
+                    *extra_args,
+                    *reuse_args,
                 ),
             )
             for nfe in target_nfes
@@ -746,6 +1005,7 @@ def build_pndm_invocations(
     configured_reference_solver = experiment_config.get("ays_reference_solver")
     if configured_reference_solver is not None and str(configured_reference_solver) not in solvers:
         raise ValueError("`ays_reference_solver` must be present in the experiment `solvers` list.")
+    goes_config = resolve_goes_config(experiment_config)
 
     for dataset_name in dataset_names:
         dataset_config_path = Path("configs/datasets") / f"{dataset_name}.yaml"
@@ -758,6 +1018,7 @@ def build_pndm_invocations(
         num_samples = infer_num_samples(experiment_config, dataset_config)
         batch_size = infer_batch_size(experiment_config, dataset_config)
         compute_fid = wants_metric(experiment_config, "fid")
+        compute_kid = wants_metric(experiment_config, "kid")
 
         for model_asset in model_assets:
             ays_reference_solver = str(configured_reference_solver or solvers[0])
@@ -765,6 +1026,8 @@ def build_pndm_invocations(
                 active_schedules = solver_schedule_overrides[solver]
                 for raw_schedule in active_schedules:
                     schedule_name, schedule_folder, requested_clock_label = parse_schedule_spec(str(raw_schedule))
+                    if schedule_name == "GOES":
+                        validate_goes_pndm_solver(solver)
                     active_clock_variants = active_clock_variants_for_schedule(
                         schedule_name,
                         schedule_clock_configs=schedule_clock_configs,
@@ -797,6 +1060,11 @@ def build_pndm_invocations(
                         )
                         materializable = is_materializable_schedule("pndm", schedule_name)
                         display_name = schedule_display_name(schedule_name, clock_variant.label)
+                        active_goes_config = (
+                            resolve_goes_variant_config(goes_config, clock_variant)
+                            if schedule_name == "GOES"
+                            else goes_config
+                        )
 
                         for seed in seeds:
                             schedule_parts = maybe_seeded_schedule_parts(
@@ -823,6 +1091,7 @@ def build_pndm_invocations(
                                 ays_reference_solver=ays_reference_solver,
                                 ays_consumer_solvers=active_ays_consumers,
                                 schedule_parts=schedule_parts,
+                                goes_config=active_goes_config,
                             )
                             schedule_root_path = resolve_schedule_root(
                                 schedule_cache_root=schedule_cache_root,
@@ -876,6 +1145,11 @@ def build_pndm_invocations(
                                 ]
                                 if compute_fid:
                                     run_arguments.append("--compute-fid")
+                                if compute_kid:
+                                    run_arguments.append("--compute-kid")
+                                    reference_kid_asset = experiment_config.get("reference_kid_asset")
+                                    if reference_kid_asset:
+                                        run_arguments.extend(["--reference-kid-asset", str(reference_kid_asset)])
                                 if not save_samples:
                                     run_arguments.append("--discard-samples")
                                 if preview_samples > 0:
@@ -923,6 +1197,7 @@ def build_diffusers_invocations(
     prompt_asset = str(experiment_config.get("prompt_asset", "diffusers_smoke_prompts"))
     summary_csv = Path(metrics_root) / f"{experiment_config['name']}.csv"
     seeds = experiment_seeds(experiment_config)
+    goes_config = resolve_goes_config(experiment_config)
     invocations: list[ExperimentInvocation] = []
 
     for model_key in model_keys:
@@ -943,6 +1218,13 @@ def build_diffusers_invocations(
                 active_schedules = solver_schedule_overrides[solver]
                 for raw_schedule in active_schedules:
                     schedule_name, schedule_folder, requested_clock_label = parse_schedule_spec(str(raw_schedule))
+                    if schedule_name == "GOES":
+                        validate_goes_diffusers_solver(
+                            model_key=model_key,
+                            model_config=model_config,
+                            solver=solver,
+                            goes_config=goes_config,
+                        )
                     active_clock_variants = active_clock_variants_for_schedule(
                         schedule_name,
                         schedule_clock_configs=schedule_clock_configs,
@@ -952,6 +1234,11 @@ def build_diffusers_invocations(
                     for clock_variant in active_clock_variants:
                         materializable = is_materializable_schedule("diffusers", schedule_name)
                         display_name = schedule_display_name(schedule_name, clock_variant.label)
+                        active_goes_config = (
+                            resolve_goes_variant_config(goes_config, clock_variant)
+                            if schedule_name == "GOES"
+                            else goes_config
+                        )
 
                         for seed in seeds:
                             schedule_parts = maybe_seeded_schedule_parts(
@@ -977,6 +1264,7 @@ def build_diffusers_invocations(
                                 clock_config_path=clock_variant.config_path,
                                 clock_label=clock_variant.label,
                                 schedule_parts=schedule_parts,
+                                goes_config=active_goes_config,
                             )
                             schedule_root_path = resolve_schedule_root(
                                 schedule_cache_root=schedule_cache_root,
@@ -1069,6 +1357,7 @@ def build_invocations(
     *,
     execution_config: ExecutionConfig,
 ) -> list[ExperimentInvocation]:
+    experiment_config = normalize_experiment_config(experiment_config)
     clock_config_path = str(experiment_config.get("clock_config", args.clock_config))
     schedule_clock_configs = resolve_schedule_clock_configs(
         experiment_config,
@@ -1077,6 +1366,7 @@ def build_invocations(
     ays_config_path = str(experiment_config.get("ays_config", args.ays_config))
     models_config_path = str(experiment_config.get("models_config", args.models_config))
     backend = experiment_config["backend"]
+    validate_experiment_metrics(experiment_config, backend=str(backend))
     samples_root = experiment_samples_root(args, experiment_config)
     metrics_root = experiment_metrics_root(args, experiment_config)
     if backend == "pndm":
@@ -1245,6 +1535,7 @@ def _expected_schedule_implementation_version(schedule_family: str) -> int | Non
     versions = {
         "base": BASELINE_SCHEDULE_IMPLEMENTATION_VERSION,
         "linear": BASELINE_SCHEDULE_IMPLEMENTATION_VERSION,
+        "GOES": GOES_SCHEDULE_IMPLEMENTATION_VERSION,
         "LEGACY_SADB": DEFECT_BALANCED_CLOCK_VERSION,
         "FP_CLOCK": FP_CLOCK_VERSION,
     }
@@ -1260,7 +1551,16 @@ def _is_current_materializable_schedule_bundle_dir(schedule_dir: Path) -> bool:
     expected_version = _expected_schedule_implementation_version(schedule_family)
     if expected_version is None:
         return True
-    return int(meta.get("schedule_implementation_version", -1)) == expected_version
+    if int(meta.get("schedule_implementation_version", -1)) != expected_version:
+        return False
+    if schedule_family == "GOES":
+        try:
+            from goes.verify import verify_goes_schedule
+
+            verify_goes_schedule(schedule_dir / "schedule.json", bundle_dir=schedule_dir)
+        except Exception:
+            return False
+    return True
 
 
 def validate_schedule_dirs(invocations: list[ExperimentInvocation]) -> None:
@@ -1268,8 +1568,12 @@ def validate_schedule_dirs(invocations: list[ExperimentInvocation]) -> None:
     for invocation in invocations:
         if invocation.schedule_dir is None:
             continue
-        if not resolve_repo_path(invocation.schedule_dir).exists():
+        resolved_schedule_dir = resolve_repo_path(invocation.schedule_dir)
+        if not resolved_schedule_dir.exists():
             missing.append(f"{invocation.label}: {invocation.schedule_dir}")
+            continue
+        if invocation.materializable and not _is_current_materializable_schedule_bundle_dir(resolved_schedule_dir):
+            missing.append(f"{invocation.label}: stale_or_invalid:{invocation.schedule_dir}")
     if missing:
         raise FileNotFoundError("Missing schedule bundles after prepare phase:\n" + "\n".join(f"  - {item}" for item in missing))
 
@@ -1380,13 +1684,19 @@ def run_prepare_phase(
 
 
 def print_invocations(invocations: list[ExperimentInvocation], runtime_config: str) -> None:
+    printed_prepare_keys: set[str] = set()
     for index, invocation in enumerate(invocations, start=1):
         runtime_env = get_runtime_env(invocation.runtime_backend, runtime_config)
         print(f"[{index}] {invocation.label}")
         print(f"  env: {runtime_env.name}")
         if invocation.prepare_steps:
             for step in invocation.prepare_steps:
-                print(f"  prepare: {command_preview(runtime_env, step.arguments)}")
+                if step.key in printed_prepare_keys:
+                    print(f"  prepare: reuse key={step.key}")
+                    continue
+                printed_prepare_keys.add(step.key)
+                prepare_env = get_runtime_env(step.runtime_backend, runtime_config)
+                print(f"  prepare: {command_preview(prepare_env, step.arguments)}")
         print(f"  run: {command_preview(runtime_env, invocation.run_arguments)}")
         if invocation.notes:
             print(f"  notes: {', '.join(invocation.notes)}")
@@ -1410,7 +1720,7 @@ def _clock_fields(schedule_name: str) -> tuple[str, str, str]:
     else:
         base_name = schedule_name
     if base_name == "FP_CLOCK":
-        return clock_label, "FP_CLOCK", "trajectory_window" if clock_label == "trajectory_window" else ""
+        return clock_label, "FP_CLOCK", clock_label if clock_label == "anchored_replay" else ""
     if base_name == "LEGACY_SADB":
         return clock_label, "LEGACY_SADB", ""
     return clock_label, base_name, ""
@@ -1421,6 +1731,15 @@ def _compact_error(exc: BaseException) -> str:
     if len(message) > 1200:
         return message[:1197] + "..."
     return message
+
+
+def _metric_names_from_arguments(arguments: tuple[str, ...]) -> str:
+    names = []
+    if "--compute-fid" in arguments:
+        names.append("fid")
+    if "--compute-kid" in arguments:
+        names.append("kid")
+    return ",".join(names)
 
 
 def append_failure_row(invocation: ExperimentInvocation, error: BaseException) -> None:
@@ -1448,9 +1767,10 @@ def append_failure_row(invocation: ExperimentInvocation, error: BaseException) -
         "seed": _argument_value(arguments, "--seed", ""),
         "guidance_scale": _argument_value(arguments, "--guidance-scale", ""),
         "num_samples": _argument_value(arguments, "--num-samples", ""),
-        "metric_name": "fid" if "--compute-fid" in arguments else "",
+        "metric_name": _metric_names_from_arguments(arguments),
         "metric_value": "",
         "fid": "",
+        "kid": "",
         "clip_score": "",
         "image_reward": "",
         "status": "FAILED",
@@ -1596,6 +1916,57 @@ def run_scoring_phase(
         print(f"[pairwise-failed] {_compact_error(exc)}")
 
 
+def experiment_includes_goes(experiment_config: Mapping[str, Any]) -> bool:
+    raw_schedules: list[Any] = list(
+        experiment_config.get("schedules")
+        or experiment_config.get("variants")
+        or ([experiment_config["schedule"]] if "schedule" in experiment_config else [])
+    )
+    raw_overrides = experiment_config.get("solver_schedules")
+    if isinstance(raw_overrides, Mapping):
+        for schedules in raw_overrides.values():
+            if isinstance(schedules, (list, tuple)):
+                raw_schedules.extend(schedules)
+            elif schedules:
+                raw_schedules.append(schedules)
+    return any(parse_schedule_spec(str(schedule))[0] == "GOES" for schedule in raw_schedules)
+
+
+def run_goes_oracle_reuse_report(
+    args: argparse.Namespace,
+    experiment_config: Mapping[str, Any],
+    *,
+    execution_config: ExecutionConfig,
+) -> None:
+    if not experiment_includes_goes(experiment_config):
+        return
+    schedule_root = execution_config.schedule_cache_root / "GOES"
+    if not resolve_repo_path(schedule_root).exists():
+        print(f"[goes-oracle-reuse] skipped: no GOES schedule root at {schedule_root}")
+        return
+    output_csv = experiment_output_root(args, experiment_config) / "paper_tables" / "oracle_reuse_cost.csv"
+    report_args = (
+        sys.executable,
+        "scripts/report_goes_oracle_reuse_cost.py",
+        str(schedule_root),
+        "--output-csv",
+        str(output_csv),
+    )
+    print("[goes-oracle-reuse]")
+    print("  " + " ".join(shlex.quote(str(item)) for item in report_args))
+    try:
+        subprocess.run(
+            report_args,
+            cwd=repo_root(),
+            check=True,
+            text=True,
+        )
+    except Exception as exc:
+        if not execution_config.continue_on_error:
+            raise
+        print(f"[goes-oracle-reuse-failed] {_compact_error(exc)}")
+
+
 def build_child_command(args: argparse.Namespace, *, shard_count: int, shard_index: int, skip_existing: bool) -> list[str]:
     command = [
         sys.executable,
@@ -1698,6 +2069,7 @@ def main() -> None:
         print("No pending invocations.")
         if args.execute and not args.distributed_child and args.shard_count == 1:
             run_scoring_phase(args, experiment_config, execution_config=execution_config)
+            run_goes_oracle_reuse_report(args, experiment_config, execution_config=execution_config)
         return
     print(f"[summary] invocations={len(invocations)} unique_prepare_steps={count_unique_prepare_steps(invocations)}")
 
@@ -1724,6 +2096,7 @@ def main() -> None:
     if args.execute and not args.distributed_child and args.shard_count == 1 and execution_config.num_gpus > 1:
         dispatch_multi_gpu(args, experiment_config, execution_config=execution_config)
         run_scoring_phase(args, experiment_config, execution_config=execution_config)
+        run_goes_oracle_reuse_report(args, experiment_config, execution_config=execution_config)
         return
 
     invocations = shard_invocations(invocations, shard_count=args.shard_count, shard_index=args.shard_index)
@@ -1747,6 +2120,7 @@ def main() -> None:
                 invocations=invocations,
             )
             run_scoring_phase(args, experiment_config, execution_config=execution_config)
+            run_goes_oracle_reuse_report(args, experiment_config, execution_config=execution_config)
 
 
 if __name__ == "__main__":

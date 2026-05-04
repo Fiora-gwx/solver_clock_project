@@ -4,8 +4,7 @@ import torch
 from src.clock.fp_clock import (
     FPTrajectoryStats,
     build_fp_clock_profile,
-    collect_trajectory_window_stats,
-    interpolate_trajectory_states,
+    collect_anchored_replay_stats,
     project_residual_to_frenet_normal,
 )
 from src.clock.profile import build_reparameterized_bundle
@@ -86,25 +85,9 @@ def test_fp_clock_profile_materializes_valid_schedule() -> None:
     assert np.all(np.diff(bundle.time_grid) <= 1.0e-12)
 
 
-def test_trajectory_window_uses_interval_displacement_not_endpoint_residual() -> None:
+def test_anchored_replay_uses_same_anchor_replay_residual() -> None:
     grid = np.asarray([2.0, 1.0, 0.0], dtype=np.float64)
-    coarse = torch.tensor(
-        [
-            [[0.0, 0.0]],
-            [[1.0, 1.0]],
-            [[2.0, 0.0]],
-        ],
-        dtype=torch.float64,
-    )
-    mid = torch.tensor(
-        [
-            [[0.0, 0.0]],
-            [[1.0, -1.0]],
-            [[2.0, 0.0]],
-        ],
-        dtype=torch.float64,
-    )
-    fine = torch.tensor(
+    reference = torch.tensor(
         [
             [[0.0, 0.0]],
             [[1.0, 0.0]],
@@ -112,72 +95,66 @@ def test_trajectory_window_uses_interval_displacement_not_endpoint_residual() ->
         ],
         dtype=torch.float64,
     )
+    replay_1x = torch.tensor(
+        [
+            [[1.0, 0.30]],
+            [[2.0, 0.20]],
+        ],
+        dtype=torch.float64,
+    )
+    replay_2x = torch.tensor(
+        [
+            [[1.0, 0.10]],
+            [[2.0, 0.05]],
+        ],
+        dtype=torch.float64,
+    )
+    replay_4x = torch.tensor(
+        [
+            [[1.0, 0.04]],
+            [[2.0, 0.02]],
+        ],
+        dtype=torch.float64,
+    )
 
-    endpoint_residual = torch.linalg.vector_norm(coarse[-1] - mid[-1]).item()
-    stats, details = collect_trajectory_window_stats(
-        coarse_grid=grid,
-        coarse_states=coarse,
-        mid_grid=grid,
-        mid_states=mid,
-        fine_grid=grid,
-        fine_states=fine,
+    stats, details = collect_anchored_replay_stats(
+        physical_grid=grid,
+        reference_states=reference,
+        replay_1x_endpoints=replay_1x,
+        replay_2x_endpoints=replay_2x,
+        replay_4x_endpoints=replay_4x,
         window_size=1,
     )
 
-    assert endpoint_residual == 0.0
     assert stats.residual_perp_norm.shape == (1, 2)
     assert np.all(stats.residual_perp_norm > 0.0)
     assert details.window_size == 1
 
 
-def test_trajectory_window_interpolates_non_nested_official_grids() -> None:
-    coarse_grid = np.asarray([3.0, 1.5, 0.0], dtype=np.float64)
-    mid_grid = np.asarray([3.0, 2.0, 1.0, 0.0], dtype=np.float64)
-    fine_grid = np.asarray([3.0, 2.4, 1.6, 0.7, 0.0], dtype=np.float64)
-
-    def states_for(nodes: np.ndarray, offset: float) -> torch.Tensor:
-        values = []
-        for value in nodes:
-            x = 3.0 - float(value)
-            values.append([[x, np.sin(x) + offset * x * (3.0 - x)]])
-        return torch.tensor(values, dtype=torch.float64)
-
-    interpolated = interpolate_trajectory_states(mid_grid, states_for(mid_grid, 0.1), coarse_grid)
-    assert interpolated.shape == (3, 1, 2)
-    assert torch.isfinite(interpolated).all()
-
-    stats, _ = collect_trajectory_window_stats(
-        coarse_grid=coarse_grid,
-        coarse_states=states_for(coarse_grid, 0.2),
-        mid_grid=mid_grid,
-        mid_states=states_for(mid_grid, 0.1),
-        fine_grid=fine_grid,
-        fine_states=states_for(fine_grid, 0.0),
-        window_size=1,
-    )
-
-    assert stats.residual_perp_norm.shape == (1, 2)
-    assert np.all(np.isfinite(stats.residual_perp_norm))
-    assert np.all(np.isfinite(stats.effective_order))
-
-
-def test_trajectory_window_distributes_multistep_windows_to_intervals() -> None:
+def test_anchored_replay_distributes_multistep_windows_to_intervals() -> None:
     grid = np.asarray([4.0, 3.0, 2.0, 1.0, 0.0], dtype=np.float64)
 
-    def states_for(nodes: np.ndarray, scale: float) -> torch.Tensor:
+    def states_for(nodes: np.ndarray) -> torch.Tensor:
         values = []
         for value in nodes:
             x = 4.0 - float(value)
-            values.append([[x, scale * x * (4.0 - x)]])
+            values.append([[x, 0.1 * x * (4.0 - x)]])
         return torch.tensor(values, dtype=torch.float64)
 
-    stats, details = collect_trajectory_window_stats(
-        coarse_grid=grid,
-        coarse_states=states_for(grid, 0.30),
-        mid_grid=grid,
-        mid_states=states_for(grid, 0.16),
-        fine_grid=grid,
-        fine_states=states_for(grid, 0.08),
+    reference = states_for(grid)
+    replay_1x = reference[1:].clone()
+    replay_2x = reference[1:].clone()
+    replay_4x = reference[1:].clone()
+    replay_1x[..., 1] += torch.tensor([0.20, 0.16, 0.12, 0.08], dtype=torch.float64).reshape(4, 1)
+    replay_2x[..., 1] += torch.tensor([0.08, 0.06, 0.04, 0.03], dtype=torch.float64).reshape(4, 1)
+    replay_4x[..., 1] += torch.tensor([0.03, 0.02, 0.015, 0.01], dtype=torch.float64).reshape(4, 1)
+
+    stats, details = collect_anchored_replay_stats(
+        physical_grid=grid,
+        reference_states=reference,
+        replay_1x_endpoints=replay_1x,
+        replay_2x_endpoints=replay_2x,
+        replay_4x_endpoints=replay_4x,
         window_size=2,
         q_min=1.05,
         q_max=6.0,

@@ -1,14 +1,14 @@
 clock:
   family: FP_CLOCK
-  estimator: trajectory_window
+  estimator: anchored_replay
   calibration_mode: fp_clock
   calibration_solver: target
   model_output_type: epsilon
-  physical_grid_mode: official_base
-  multires_nfes: [16, 32, 64]
-  pilot_batch_size: 2
-  pilot_num_batches: 1
-  pilot_observation_microbatch: 1
+  physical_grid_mode: anchored_base
+  anchor_nfe: 16
+  pilot_batch_size: 8
+  pilot_num_batches: 4
+  pilot_observation_microbatch: 2
   smoothing_window: 1
   epsilon: 1.0e-12
   q_min: 1.05

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import random
+import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,6 +100,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-reward-model", default="ImageReward-v1.0")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--bootstrap-samples", type=int, default=1000)
+    parser.add_argument("--bootstrap-seed", type=int, default=0)
+    parser.add_argument("--ci-level", type=float, default=0.95)
     parser.add_argument("--local-files-only", action="store_true", default=False)
     parser.add_argument("--allow-missing-metrics", action="store_true", default=False)
     return parser.parse_args()
@@ -164,6 +169,71 @@ def mean(values: list[float | None]) -> float | None:
     return sum(present) / len(present)
 
 
+def percentile(values: list[float], quantile: float) -> float:
+    if not values:
+        raise ValueError("Cannot compute a percentile of an empty list.")
+    if len(values) == 1:
+        return float(values[0])
+    ordered = sorted(values)
+    rank = max(0.0, min(1.0, float(quantile))) * (len(ordered) - 1)
+    lower_index = int(rank)
+    upper_index = min(lower_index + 1, len(ordered) - 1)
+    fraction = rank - lower_index
+    return float(ordered[lower_index] * (1.0 - fraction) + ordered[upper_index] * fraction)
+
+
+def bootstrap_mean_uncertainty(
+    values: list[float | None],
+    *,
+    samples: int,
+    seed: int,
+    ci_level: float,
+) -> dict[str, float | str]:
+    if samples < 0:
+        raise ValueError("bootstrap samples must be non-negative.")
+    if not 0.0 < ci_level < 1.0:
+        raise ValueError("ci level must be between 0 and 1.")
+    present = [float(value) for value in values if value is not None]
+    if len(present) < 2 or samples == 0:
+        return {"bootstrap_se": "", "ci_low": "", "ci_high": ""}
+
+    rng = random.Random(seed)
+    means: list[float] = []
+    for _ in range(samples):
+        draw = [present[rng.randrange(len(present))] for _ in range(len(present))]
+        means.append(sum(draw) / len(draw))
+
+    alpha = (1.0 - ci_level) / 2.0
+    return {
+        "bootstrap_se": statistics.stdev(means) if len(means) > 1 else 0.0,
+        "ci_low": percentile(means, alpha),
+        "ci_high": percentile(means, 1.0 - alpha),
+    }
+
+
+def metric_summary_fields(
+    metric_name: str,
+    values: list[float | None],
+    *,
+    bootstrap_samples: int,
+    bootstrap_seed: int,
+    ci_level: float,
+) -> dict[str, Any]:
+    metric_mean = mean(values)
+    uncertainty = bootstrap_mean_uncertainty(
+        values,
+        samples=bootstrap_samples,
+        seed=bootstrap_seed,
+        ci_level=ci_level,
+    )
+    return {
+        f"{metric_name}_mean": "" if metric_mean is None else metric_mean,
+        f"{metric_name}_bootstrap_se": uncertainty["bootstrap_se"],
+        f"{metric_name}_ci_low": uncertainty["ci_low"],
+        f"{metric_name}_ci_high": uncertainty["ci_high"],
+    }
+
+
 def write_csv(path: str | Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
     resolved = resolve_repo_path(path)
     resolved.parent.mkdir(parents=True, exist_ok=True)
@@ -208,10 +278,28 @@ def update_summary_csv(path: str | Path, aggregate_rows: list[dict[str, Any]]) -
 
 def main() -> None:
     args = parse_args()
+    if args.bootstrap_samples < 0:
+        raise ValueError("--bootstrap-samples must be non-negative.")
+    if not 0.0 < args.ci_level < 1.0:
+        raise ValueError("--ci-level must be between 0 and 1.")
     metrics = selected_metrics(args.metrics)
     records = discover_runs(args.outputs_root, args.run_dir)
     if not records:
         raise ValueError("No run_manifest.json files found.")
+
+    records_with_images: list[tuple[RunRecord, list[Path]]] = []
+    empty_run_dirs: list[str] = []
+    for record in records:
+        images = run_images(record.run_dir)
+        if images:
+            records_with_images.append((record, images))
+        else:
+            empty_run_dirs.append(str(record.run_dir))
+    if not records_with_images:
+        raise ValueError(
+            "No scorable images found in discovered run directories. "
+            f"Empty run directories: {empty_run_dirs[:10]}"
+        )
 
     clip_scorer = None
     image_reward_scorer = None
@@ -232,10 +320,7 @@ def main() -> None:
     detail_rows: list[dict[str, Any]] = []
     aggregate_rows: list[dict[str, Any]] = []
 
-    for record in records:
-        images = run_images(record.run_dir)
-        if not images:
-            continue
+    for record, images in records_with_images:
         prompts_source = load_prompts(asset_manifest, record.manifest, args.prompt_asset)
         prompts = [prompts_source[index % len(prompts_source)] for index in range(len(images))]
 
@@ -272,8 +357,22 @@ def main() -> None:
             {
                 **base,
                 "num_images": len(images),
-                "clip_score_mean": "" if mean(clip_scores) is None else mean(clip_scores),
-                "image_reward_mean": "" if mean(image_reward_scores) is None else mean(image_reward_scores),
+                "bootstrap_samples": int(args.bootstrap_samples),
+                "ci_level": float(args.ci_level),
+                **metric_summary_fields(
+                    "clip_score",
+                    clip_scores,
+                    bootstrap_samples=int(args.bootstrap_samples),
+                    bootstrap_seed=int(args.bootstrap_seed),
+                    ci_level=float(args.ci_level),
+                ),
+                **metric_summary_fields(
+                    "image_reward",
+                    image_reward_scores,
+                    bootstrap_samples=int(args.bootstrap_samples),
+                    bootstrap_seed=int(args.bootstrap_seed),
+                    ci_level=float(args.ci_level),
+                ),
             }
         )
 
@@ -309,10 +408,18 @@ def main() -> None:
             "seed",
             "guidance_scale",
             "num_images",
+            "bootstrap_samples",
+            "ci_level",
             "schedule_dir",
             "output_dir",
             "clip_score_mean",
+            "clip_score_bootstrap_se",
+            "clip_score_ci_low",
+            "clip_score_ci_high",
             "image_reward_mean",
+            "image_reward_bootstrap_se",
+            "image_reward_ci_low",
+            "image_reward_ci_high",
         ],
     )
     if args.summary_csv:

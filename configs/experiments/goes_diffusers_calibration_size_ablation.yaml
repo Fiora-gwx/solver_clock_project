@@ -1,0 +1,51 @@
+name: goes_diffusers_calibration_size_ablation
+backend: diffusers
+models:
+  - sd35_medium
+solvers:
+  - flow_euler
+schedules:
+  - base
+  - GOES[calibration_k4]
+  - GOES[calibration_k8]
+  - GOES[calibration_k16]
+  - GOES[calibration_k32]
+  - GOES[calibration_k64]
+  - GOES[calibration_k128]
+nfes:
+  - 10
+seeds:
+  - 0
+  - 1
+  - 2
+prompt_asset: diffusers_smoke_prompts
+guidance_scales:
+  - 7.5
+metrics:
+  - clipscore
+  - imagereward
+execution:
+  num_gpus: 1
+  materialize_schedules: false
+  prepare_schedules_first: true
+goes:
+  batch_size: 4
+  num_batches: 8
+  microbatch_size: 1
+  ref_nfe: 256
+  ref_grid_size: 257
+  candidate_grid_size: 512
+  physical_grid_mode: scheduler_sigmas
+  metric: channel_whitened
+  rho: 0.1
+  aggregation: trimmed_mean
+  trim_ratio: 0.10
+schedule_clock_configs:
+  GOES:
+    variants:
+      calibration_k4: configs/goes/variants/calibration_k4.yaml
+      calibration_k8: configs/goes/variants/calibration_k8.yaml
+      calibration_k16: configs/goes/variants/calibration_k16.yaml
+      calibration_k32: configs/goes/variants/calibration_k32.yaml
+      calibration_k64: configs/goes/variants/calibration_k64.yaml
+      calibration_k128: configs/goes/variants/calibration_k128.yaml

@@ -1,0 +1,5 @@
+method: goes
+solver:
+  name: euler
+  target_nfe: 10
+  mode: one_step

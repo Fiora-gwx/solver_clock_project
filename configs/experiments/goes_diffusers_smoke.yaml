@@ -1,0 +1,35 @@
+name: goes_diffusers_smoke
+backend: diffusers
+models:
+  - sd35_medium
+solvers:
+  - flow_euler
+schedules:
+  - base
+  - GOES
+nfes:
+  - 4
+seeds:
+  - 0
+prompt_asset: diffusers_smoke_prompts
+guidance_scales:
+  - 3.5
+metrics:
+  - clipscore
+  - imagereward
+execution:
+  num_gpus: 1
+  materialize_schedules: false
+  prepare_schedules_first: true
+goes:
+  batch_size: 2
+  num_batches: 1
+  microbatch_size: 1
+  ref_nfe: 8
+  ref_grid_size: 9
+  candidate_grid_size: 8
+  physical_grid_mode: scheduler_sigmas
+  metric: identity
+  rho: 0.1
+  aggregation: trimmed_mean
+  trim_ratio: 0.10

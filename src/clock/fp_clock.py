@@ -18,7 +18,7 @@ from src.clock.defect_balanced import (
 )
 from src.clock.profile import ClockProfile
 
-FP_CLOCK_VERSION = 2
+FP_CLOCK_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -31,7 +31,7 @@ class FPTrajectoryStats:
 
 
 @dataclass(frozen=True)
-class FPWindowEstimatorDetails:
+class FPAnchoredReplayDetails:
     window_size: int
     window_residual_perp_norm: np.ndarray
     window_delta_s: np.ndarray
@@ -88,99 +88,57 @@ def _as_trajectory_tensor(states: Sequence[torch.Tensor] | torch.Tensor) -> torc
     return tensor
 
 
-def interpolate_trajectory_states(
-    source_grid: np.ndarray,
-    source_states: Sequence[torch.Tensor] | torch.Tensor,
-    target_grid: np.ndarray,
-    *,
-    eps: float = 1.0e-12,
-) -> torch.Tensor:
-    """Linearly interpolate a recorded trajectory to target coordinate nodes."""
-    source = np.asarray(source_grid, dtype=np.float64)
-    target = np.asarray(target_grid, dtype=np.float64)
-    states = _as_trajectory_tensor(source_states)
-    if source.ndim != 1 or target.ndim != 1:
-        raise ValueError("source_grid and target_grid must be 1D arrays.")
-    if len(source) != states.shape[0]:
-        raise ValueError("source_grid length must match the trajectory node count.")
-    if len(source) < 2:
-        raise ValueError("source_grid must contain at least two nodes.")
-    diffs = np.diff(source)
-    if np.any(np.abs(diffs) <= float(eps)):
-        raise ValueError("source_grid must not contain repeated adjacent nodes.")
-    if not (np.all(diffs > 0.0) or np.all(diffs < 0.0)):
-        raise ValueError("source_grid must be strictly monotone.")
-
-    if source[0] > source[-1]:
-        xp_np = source[::-1].copy()
-        state_xp = torch.flip(states, dims=(0,))
-    else:
-        xp_np = source
-        state_xp = states
-
-    clipped = np.clip(target, float(xp_np[0]), float(xp_np[-1]))
-    indices = np.searchsorted(xp_np, clipped, side="left")
-    indices = np.clip(indices, 1, len(xp_np) - 1)
-    left = indices - 1
-    right = indices
-    denom = np.maximum(xp_np[right] - xp_np[left], float(eps))
-    weight_np = (clipped - xp_np[left]) / denom
-
-    device = states.device
-    weight = torch.as_tensor(weight_np, device=device, dtype=states.dtype).reshape(
-        (len(target),) + (1,) * (states.ndim - 1)
-    )
-    left_tensor = torch.as_tensor(left, device=device, dtype=torch.long)
-    right_tensor = torch.as_tensor(right, device=device, dtype=torch.long)
-    return state_xp.index_select(0, left_tensor) + weight * (
-        state_xp.index_select(0, right_tensor) - state_xp.index_select(0, left_tensor)
-    )
-
-
 def _window_l2_norm(values: torch.Tensor) -> np.ndarray:
     node_count, batch_count = values.shape[:2]
     return values.detach().float().reshape(node_count, batch_count, -1).norm(dim=2).cpu().numpy()
 
 
-def collect_trajectory_window_stats(
+def collect_anchored_replay_stats(
     *,
-    coarse_grid: np.ndarray,
-    coarse_states: Sequence[torch.Tensor] | torch.Tensor,
-    mid_grid: np.ndarray,
-    mid_states: Sequence[torch.Tensor] | torch.Tensor,
-    fine_grid: np.ndarray,
-    fine_states: Sequence[torch.Tensor] | torch.Tensor,
+    physical_grid: np.ndarray,
+    reference_states: Sequence[torch.Tensor] | torch.Tensor,
+    replay_1x_endpoints: Sequence[torch.Tensor] | torch.Tensor,
+    replay_2x_endpoints: Sequence[torch.Tensor] | torch.Tensor,
+    replay_4x_endpoints: Sequence[torch.Tensor] | torch.Tensor,
     window_size: int,
     q_min: float = 1.05,
     q_max: float = 6.0,
     eps: float = 1.0e-12,
-) -> tuple[FPTrajectoryStats, FPWindowEstimatorDetails]:
-    """Estimate FP clock stats from solver-native multiresolution trajectories.
+) -> tuple[FPTrajectoryStats, FPAnchoredReplayDetails]:
+    """Estimate FP clock stats from same-anchor coarse/half/quarter replay.
 
-    The residual is a window displacement discrepancy, not an accumulated endpoint
-    discrepancy. All trajectories are aligned to the coarse grid before measuring
-    the coarse/mid and mid/fine displacement residuals.
+    Each replay endpoint must start from the same anchor state and cover the same
+    native-coordinate window. This keeps the residual local to the target solver
+    instead of comparing independently evolved complete trajectories.
     """
-    grid = np.asarray(coarse_grid, dtype=np.float64)
+    grid = np.asarray(physical_grid, dtype=np.float64)
     if grid.ndim != 1 or len(grid) < 2:
-        raise ValueError("coarse_grid must be a 1D array with at least two nodes.")
+        raise ValueError("physical_grid must be a 1D array with at least two nodes.")
     if int(window_size) <= 0:
         raise ValueError("window_size must be positive.")
     if np.any(np.abs(np.diff(grid)) <= float(eps)):
-        raise ValueError("coarse_grid must not contain repeated adjacent nodes.")
+        raise ValueError("physical_grid must not contain repeated adjacent nodes.")
 
-    coarse = _as_trajectory_tensor(coarse_states)
-    if coarse.shape[0] != len(grid):
-        raise ValueError("coarse_states must have one state per coarse_grid node.")
-    mid_on_coarse = interpolate_trajectory_states(mid_grid, mid_states, grid, eps=eps).to(coarse.device)
-    fine_on_coarse = interpolate_trajectory_states(fine_grid, fine_states, grid, eps=eps).to(coarse.device)
-    if coarse.shape != mid_on_coarse.shape or coarse.shape != fine_on_coarse.shape:
-        raise ValueError("aligned trajectory state shapes must match.")
+    reference = _as_trajectory_tensor(reference_states)
+    if reference.shape[0] != len(grid):
+        raise ValueError("reference_states must have one state per physical_grid node.")
+    replay_1x = _as_trajectory_tensor(replay_1x_endpoints).to(reference.device)
+    replay_2x = _as_trajectory_tensor(replay_2x_endpoints).to(reference.device)
+    replay_4x = _as_trajectory_tensor(replay_4x_endpoints).to(reference.device)
 
     safe_eps = float(eps)
     n_intervals = len(grid) - 1
-    batch_count = int(coarse.shape[1])
-    interval_displacement = fine_on_coarse[1:] - fine_on_coarse[:-1]
+    expected_replay_shape = (n_intervals,) + tuple(reference.shape[1:])
+    for name, replay in {
+        "replay_1x_endpoints": replay_1x,
+        "replay_2x_endpoints": replay_2x,
+        "replay_4x_endpoints": replay_4x,
+    }.items():
+        if tuple(replay.shape) != expected_replay_shape:
+            raise ValueError(f"{name} must have shape [len(physical_grid)-1, batch, ...].")
+
+    batch_count = int(reference.shape[1])
+    interval_displacement = reference[1:] - reference[:-1]
     delta_s = np.maximum(_window_l2_norm(interval_displacement).T, safe_eps)
 
     accumulated_defect = np.zeros((batch_count, n_intervals), dtype=np.float64)
@@ -197,25 +155,26 @@ def collect_trajectory_window_stats(
         if node_stop <= start:
             continue
 
-        coarse_displacement = coarse[node_stop] - coarse[start]
-        mid_displacement = mid_on_coarse[node_stop] - mid_on_coarse[start]
-        fine_displacement = fine_on_coarse[node_stop] - fine_on_coarse[start]
-        tangent = fine_displacement
+        tangent = reference[node_stop] - reference[start]
 
+        full_residual = replay_1x[start] - replay_2x[start]
+        half_residual = replay_2x[start] - replay_4x[start]
         residual_16, _ = project_residual_to_frenet_normal(
-            coarse_displacement - mid_displacement,
+            full_residual,
             tangent,
             eps=safe_eps,
         )
         residual_32, _ = project_residual_to_frenet_normal(
-            mid_displacement - fine_displacement,
+            half_residual,
             tangent,
             eps=safe_eps,
         )
+        full_error_norm = np.maximum(per_sample_l2_norm(full_residual).cpu().numpy(), safe_eps)
+        half_error_norm = np.maximum(per_sample_l2_norm(half_residual).cpu().numpy(), safe_eps)
         residual_16_norm = np.maximum(per_sample_l2_norm(residual_16).cpu().numpy(), safe_eps)
         residual_32_norm = np.maximum(per_sample_l2_norm(residual_32).cpu().numpy(), safe_eps)
         q = np.clip(
-            1.0 + np.log2((residual_16_norm + safe_eps) / (residual_32_norm + safe_eps)),
+            1.0 + np.log2((full_error_norm + safe_eps) / (half_error_norm + safe_eps)),
             max(float(q_min), 1.0 + safe_eps),
             float(q_max),
         )
@@ -254,7 +213,7 @@ def collect_trajectory_window_stats(
         delta_s=delta_s,
         residual_perp_norm=residual_perp,
     )
-    details = FPWindowEstimatorDetails(
+    details = FPAnchoredReplayDetails(
         window_size=max_window,
         window_residual_perp_norm=np.maximum(window_residuals, safe_eps),
         window_delta_s=np.maximum(window_delta_s, safe_eps),

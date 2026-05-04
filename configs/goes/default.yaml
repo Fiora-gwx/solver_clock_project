@@ -1,0 +1,67 @@
+method: goes
+model:
+  name: toy_flow
+  checkpoint: null
+  dtype: float64
+  device: cpu
+  state_shape: [2]
+coordinate:
+  name: t
+  direction: increasing
+  u_min: 0.0
+  u_max: 1.0
+oracle:
+  ref_integrator: rk4
+  ref_nfe: 200
+  ref_grid_size: 257
+  interpolation: linear
+  cache_dir: ./outputs/goes/oracle_cache
+  reuse: true
+calibration:
+  num_samples: 8
+  seed: 123
+  prompt_file: null
+  split: calibration
+  guidance_scale: 1.0
+heldout:
+  num_samples: 8
+  seed: 456
+  split: heldout
+candidate_grid:
+  size: 64
+  type: uniform_in_u
+solver:
+  name: euler
+  target_nfe: 10
+  mode: one_step
+metric:
+  name: identity
+  sigma_data: 0.5
+  eps: 1.0e-12
+  min_weight: 1.0e-4
+  max_weight: 1.0e4
+mixed_defect:
+  rho: 0.1
+  eps: 1.0e-12
+  fallback_full_residual_on_tiny_tangent: true
+aggregation:
+  name: trimmed_mean
+  trim_ratio: 0.10
+  alpha: 0.80
+optimizer:
+  name: dp_minimax
+  tie_break_sum_cost: true
+  tie_tolerance: 1.0e-12
+replay_refinement:
+  enabled: false
+  rounds: 3
+  local_window: 8
+  smoothmax_alpha: 10.0
+  lambda_final: 0.0
+  mu_smooth: 0.0
+output:
+  root: ./outputs/goes
+  save_edge_table: true
+  save_schedule: true
+  save_images: false
+  save_plots: true

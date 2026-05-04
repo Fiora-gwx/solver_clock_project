@@ -1,0 +1,49 @@
+name: goes_diffusers_cfg_nfe_sweep
+backend: diffusers
+models:
+  - sd35_medium
+solvers:
+  - flow_euler
+schedules:
+  - base
+  - GOES
+nfes:
+  - 4
+  - 5
+  - 6
+  - 8
+  - 10
+  - 12
+  - 15
+  - 20
+  - 30
+  - 50
+seeds:
+  - 0
+  - 1
+  - 2
+prompt_asset: diffusers_smoke_prompts
+guidance_scales:
+  - 3.0
+  - 5.0
+  - 7.5
+  - 10.0
+metrics:
+  - clipscore
+  - imagereward
+execution:
+  num_gpus: 1
+  materialize_schedules: false
+  prepare_schedules_first: true
+goes:
+  batch_size: 4
+  num_batches: 8
+  microbatch_size: 1
+  ref_nfe: 256
+  ref_grid_size: 257
+  candidate_grid_size: 512
+  physical_grid_mode: scheduler_sigmas
+  metric: channel_whitened
+  rho: 0.1
+  aggregation: trimmed_mean
+  trim_ratio: 0.10

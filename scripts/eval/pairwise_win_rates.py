@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import random
 import statistics
 import sys
 from collections import defaultdict
@@ -26,6 +27,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-csv", action="append", required=True, help="Detail CSV from score_text_image_outputs.py.")
     parser.add_argument("--output-csv", required=True)
     parser.add_argument("--metrics", default="clip_score,image_reward")
+    parser.add_argument("--bootstrap-samples", type=int, default=1000)
+    parser.add_argument("--bootstrap-seed", type=int, default=0)
+    parser.add_argument("--ci-level", type=float, default=0.95)
     return parser.parse_args()
 
 
@@ -49,6 +53,8 @@ def schedule_family(schedule: str) -> str:
         return "base"
     if lower in {"ays", "ays_like"}:
         return "AYS"
+    if lower == "goes" or lower.startswith("goes["):
+        return normalized if normalized.startswith("GOES") else "GOES" + normalized[4:]
     if lower == "legacy_sadb" or lower.startswith("legacy_sadb["):
         return normalized if normalized.startswith("LEGACY_SADB") else "LEGACY_SADB" + normalized[11:]
     if lower == "fp_clock" or lower.startswith("fp_clock["):
@@ -78,6 +84,73 @@ def comparison_label(left: str, right: str) -> str:
     return f"{left} vs {right}"
 
 
+def win_rate_from_deltas(deltas: list[float]) -> float:
+    wins = 0.0
+    for delta in deltas:
+        if delta > 0.0:
+            wins += 1.0
+        elif delta == 0.0:
+            wins += 0.5
+    return wins / len(deltas)
+
+
+def percentile(values: list[float], quantile: float) -> float:
+    if not values:
+        raise ValueError("Cannot compute a percentile of an empty list.")
+    if len(values) == 1:
+        return float(values[0])
+    ordered = sorted(values)
+    rank = max(0.0, min(1.0, float(quantile))) * (len(ordered) - 1)
+    lower_index = int(rank)
+    upper_index = min(lower_index + 1, len(ordered) - 1)
+    fraction = rank - lower_index
+    return float(ordered[lower_index] * (1.0 - fraction) + ordered[upper_index] * fraction)
+
+
+def bootstrap_uncertainty(
+    deltas: list[float],
+    *,
+    samples: int,
+    seed: int,
+    ci_level: float,
+) -> dict[str, float | int | str]:
+    if samples < 0:
+        raise ValueError("bootstrap samples must be non-negative.")
+    if not 0.0 < ci_level < 1.0:
+        raise ValueError("ci level must be between 0 and 1.")
+    if samples == 0:
+        return {
+            "bootstrap_samples": 0,
+            "ci_level": ci_level,
+            "win_rate_bootstrap_se": "",
+            "win_rate_ci_low": "",
+            "win_rate_ci_high": "",
+            "mean_delta_bootstrap_se": "",
+            "mean_delta_ci_low": "",
+            "mean_delta_ci_high": "",
+        }
+
+    rng = random.Random(seed)
+    win_rates: list[float] = []
+    mean_deltas: list[float] = []
+    for _ in range(samples):
+        draw = [deltas[rng.randrange(len(deltas))] for _ in range(len(deltas))]
+        win_rates.append(win_rate_from_deltas(draw))
+        mean_deltas.append(statistics.fmean(draw))
+
+    alpha = (1.0 - ci_level) / 2.0
+    return {
+        "bootstrap_samples": samples,
+        "ci_level": ci_level,
+        "win_rate_bootstrap_se": statistics.stdev(win_rates) if len(win_rates) > 1 else 0.0,
+        "win_rate_ci_low": percentile(win_rates, alpha),
+        "win_rate_ci_high": percentile(win_rates, 1.0 - alpha),
+        "mean_delta_bootstrap_se": statistics.stdev(mean_deltas) if len(mean_deltas) > 1 else 0.0,
+        "mean_delta_ci_low": percentile(mean_deltas, alpha),
+        "mean_delta_ci_high": percentile(mean_deltas, 1.0 - alpha),
+    }
+
+
 def build_comparisons(schedules: set[str]) -> list[tuple[str, str]]:
     comparisons: list[tuple[str, str]] = []
     if "AYS" in schedules and "base" in schedules:
@@ -85,7 +158,9 @@ def build_comparisons(schedules: set[str]) -> list[tuple[str, str]]:
     adaptive_schedules = sorted(
         schedule
         for schedule in schedules
-        if schedule == "LEGACY_SADB"
+        if schedule == "GOES"
+        or schedule.startswith("GOES[")
+        or schedule == "LEGACY_SADB"
         or schedule.startswith("LEGACY_SADB[")
         or schedule == "FP_CLOCK"
         or schedule.startswith("FP_CLOCK[")
@@ -104,12 +179,14 @@ def summarize_deltas(
     left_schedule: str,
     right_schedule: str,
     metric: str,
+    bootstrap_samples: int,
+    bootstrap_seed: int,
+    ci_level: float,
 ) -> dict[str, Any] | None:
     left_rows = rows_by_schedule[left_schedule]
     right_rows = rows_by_schedule[right_schedule]
     common_keys = sorted(set(left_rows) & set(right_rows))
     deltas: list[float] = []
-    wins = 0.0
     for key in common_keys:
         left_value = numeric_value(left_rows[key], metric)
         right_value = numeric_value(right_rows[key], metric)
@@ -117,22 +194,28 @@ def summarize_deltas(
             continue
         delta = left_value - right_value
         deltas.append(delta)
-        if delta > 0.0:
-            wins += 1.0
-        elif delta == 0.0:
-            wins += 0.5
     if not deltas:
         return None
     return {
         "num_pairs": len(deltas),
-        "win_rate": wins / len(deltas),
-        "mean_delta": sum(deltas) / len(deltas),
+        "win_rate": win_rate_from_deltas(deltas),
+        "mean_delta": statistics.fmean(deltas),
         "median_delta": statistics.median(deltas),
+        **bootstrap_uncertainty(
+            deltas,
+            samples=bootstrap_samples,
+            seed=bootstrap_seed,
+            ci_level=ci_level,
+        ),
     }
 
 
 def main() -> None:
     args = parse_args()
+    if args.bootstrap_samples < 0:
+        raise ValueError("--bootstrap-samples must be non-negative.")
+    if not 0.0 < args.ci_level < 1.0:
+        raise ValueError("--ci-level must be between 0 and 1.")
     rows = load_rows(args.input_csv)
     metrics = parse_metrics(args.metrics)
     optional_keys = tuple(key for key in OPTIONAL_GROUP_KEYS if any(str(row.get(key, "")).strip() for row in rows))
@@ -154,6 +237,9 @@ def main() -> None:
                     left_schedule=left_schedule,
                     right_schedule=right_schedule,
                     metric=metric,
+                    bootstrap_samples=int(args.bootstrap_samples),
+                    bootstrap_seed=int(args.bootstrap_seed),
+                    ci_level=float(args.ci_level),
                 )
                 if summary is None:
                     continue
@@ -180,7 +266,21 @@ def main() -> None:
         "win_rate",
         "mean_delta",
         "median_delta",
+        "bootstrap_samples",
+        "ci_level",
+        "win_rate_bootstrap_se",
+        "win_rate_ci_low",
+        "win_rate_ci_high",
+        "mean_delta_bootstrap_se",
+        "mean_delta_ci_low",
+        "mean_delta_ci_high",
     ]
+    if not output_rows:
+        raise ValueError(
+            "No paired schedule comparisons found. "
+            "Check that detail rows contain matched model_asset/solver/nfe/seed/prompt_index"
+            " groups with base, AYS, GOES, LEGACY_SADB, or FP_CLOCK schedules and numeric metrics."
+        )
     output_path = resolve_repo_path(args.output_csv)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="") as handle:

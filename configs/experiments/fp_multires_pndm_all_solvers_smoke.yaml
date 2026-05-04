@@ -10,9 +10,8 @@ base_config:
   continue_on_error: true
   save_samples: true
   preview_samples: 4
-  num_samples: 8
-  batch_size: 8
-  clock_config: configs/clocks/FP_CLOCK_trajectory_window_smoke.yaml
+  num_samples: 2000
+  clock_config: configs/clocks/FP_CLOCK_anchored_replay_smoke.yaml
 
 datasets:
   - cifar10
@@ -45,12 +44,19 @@ solvers:
 
 schedules:
   - base
-  - FP_CLOCK[trajectory_window]
+  - FP_CLOCK[anchored_replay]
+
+solver_schedules:
+  # PNDM/PLMS uses a PRK/PLMS warmup/history contract whose nonuniform
+  # production runner has not been validated yet. Keep it as a base reference
+  # instead of exporting an FP schedule with incorrect step semantics.
+  pndm:
+    - base
 
 schedule_clock_configs:
   FP_CLOCK:
     variants:
-      trajectory_window: configs/clocks/FP_CLOCK_trajectory_window_smoke.yaml
+      anchored_replay: configs/clocks/FP_CLOCK_anchored_replay_smoke.yaml
 
 seeds: [0]
 eval_nfes: [6, 10]

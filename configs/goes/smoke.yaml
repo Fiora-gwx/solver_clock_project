@@ -1,0 +1,35 @@
+method: goes
+model:
+  name: toy_flow
+  state_shape: [2]
+oracle:
+  ref_nfe: 32
+  ref_grid_size: 33
+  cache_dir: ./outputs/goes/oracle_cache
+  reuse: true
+calibration:
+  num_samples: 4
+  seed: 11
+  split: calibration
+  guidance_scale: 1.0
+heldout:
+  num_samples: 4
+  seed: 29
+  split: heldout
+candidate_grid:
+  size: 12
+  type: uniform_in_u
+solver:
+  name: euler
+  target_nfe: 4
+  mode: one_step
+metric:
+  name: identity
+mixed_defect:
+  rho: 0.1
+aggregation:
+  name: trimmed_mean
+  trim_ratio: 0.10
+output:
+  root: ./outputs/goes
+  save_plots: false

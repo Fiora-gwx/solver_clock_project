@@ -10,7 +10,7 @@ base_config:
   materialize_schedules: true
   continue_on_error: true
   metrics: [clipscore, imagereward]
-  clock_config: configs/clocks/FP_CLOCK_trajectory_window_smoke.yaml
+  clock_config: configs/clocks/FP_CLOCK_anchored_replay_smoke.yaml
 
 models:
   - sd35_medium
@@ -70,12 +70,12 @@ model_solvers:
 
 schedules:
   - base
-  - FP_CLOCK[trajectory_window]
+  - FP_CLOCK[anchored_replay]
 
 schedule_clock_configs:
   FP_CLOCK:
     variants:
-      trajectory_window: configs/clocks/FP_CLOCK_trajectory_window_smoke.yaml
+      anchored_replay: configs/clocks/FP_CLOCK_anchored_replay_smoke.yaml
 
 seeds: [0]
 eval_nfes: [6, 10]

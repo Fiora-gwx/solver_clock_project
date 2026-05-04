@@ -1,0 +1,38 @@
+name: cifar10_mainline_fp_clock
+backend: pndm
+
+base_config:
+  dataset: cifar10
+  metrics: [fid]
+  num_gpus: 4
+  gpu_ids: [0, 1, 2, 3]
+  prepare_schedules_first: true
+  materialize_schedules: true
+  save_samples: false
+  preview_samples: 8
+  num_samples: 50000
+  clock_config: configs/clocks/FP_CLOCK.yaml
+
+model_assets:
+  - pndm_model_ddim_cifar10
+
+
+solvers:
+  - euler
+  - deis
+  - stork4_1st
+  - stork4_2nd
+
+schedules:
+  - base
+  - FP_CLOCK
+
+solver_schedules:
+  euler: [base, ]
+  heun2: [base, ]
+  deis: [base]
+  stork4_1st: [base, ]
+  stork4_2nd: [base, ]
+
+
+eval_nfes: [5, 7, 9, 11, 15]

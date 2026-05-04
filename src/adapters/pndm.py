@@ -13,6 +13,8 @@ from PIL import Image
 
 from src.clock.defect_balanced import (
     StepRefinementStats,
+    _microbatch_map,
+    _refined_step,
     build_velocity_stepper,
     collect_step_refinement_stats,
     collect_velocity_curvature_stats,
@@ -21,8 +23,8 @@ from src.clock.defect_balanced import (
 )
 from src.clock.fp_clock import (
     FPTrajectoryStats,
+    collect_anchored_replay_stats,
     collect_fp_clock_stats,
-    collect_trajectory_window_stats,
     concatenate_fp_clock_stats,
 )
 from src.clock.solver_registry import get_solver_native_spec
@@ -227,6 +229,36 @@ def preferred_calibration_domain(solver_name: str) -> str:
     return "timesteps"
 
 
+def _attach_unipc_device_sigmas(scheduler):
+    if not isinstance(scheduler, UniPCMultistepScheduler) or getattr(scheduler, "_solver_clock_unipc_sigmas_patch", False):
+        return scheduler
+
+    original_set_timesteps = scheduler.set_timesteps
+
+    @wraps(original_set_timesteps)
+    def set_timesteps_with_device_sigmas(*args, **kwargs):
+        result = original_set_timesteps(*args, **kwargs)
+        target_device = kwargs.get("device", None)
+        if target_device is None and len(args) >= 2:
+            target_device = args[1]
+        _move_unipc_sigmas_to_device(scheduler, target_device)
+        return result
+
+    scheduler.set_timesteps = set_timesteps_with_device_sigmas
+    scheduler._solver_clock_unipc_sigmas_patch = True
+    return scheduler
+
+
+def _move_unipc_sigmas_to_device(scheduler, device: torch.device | str | None) -> None:
+    if not isinstance(scheduler, UniPCMultistepScheduler) or device is None:
+        return
+    if isinstance(getattr(scheduler, "sigmas", None), torch.Tensor):
+        scheduler.sigmas = scheduler.sigmas.to(device=device)
+    solver_p = getattr(scheduler, "solver_p", None)
+    if solver_p is not None and isinstance(getattr(solver_p, "sigmas", None), torch.Tensor):
+        solver_p.sigmas = solver_p.sigmas.to(device=device)
+
+
 def build_scheduler(
     solver_name: str,
     *,
@@ -299,7 +331,7 @@ def build_scheduler(
             "Use `stork4_1st` or `stork4_2nd` for PNDM experiments."
         )
     if solver == "unipc":
-        return UniPCMultistepScheduler(**common, solver_order=2)
+        return _attach_unipc_device_sigmas(UniPCMultistepScheduler(**common, solver_order=2))
     raise ValueError(f"Unsupported PNDM solver: {solver_name}")
 
 
@@ -389,6 +421,7 @@ def _set_scheduler_state_from_timesteps(
     if hasattr(scheduler, "_begin_index"):
         scheduler._begin_index = None
     _force_zero_terminal_sigma(scheduler)
+    _move_unipc_sigmas_to_device(scheduler, device)
 
 
 def _set_scheduler_state_from_sigmas(
@@ -438,6 +471,75 @@ def _set_scheduler_state_from_sigmas(
     if hasattr(scheduler, "_begin_index"):
         scheduler._begin_index = None
     _force_zero_terminal_sigma(scheduler)
+    _move_unipc_sigmas_to_device(scheduler, device)
+
+
+def _pndm_prk_plms_from_anchor_timesteps(
+    scheduler,
+    custom_timesteps: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    descending = np.round(np.asarray(custom_timesteps, dtype=np.float64)).astype(np.int64)
+    if descending.ndim != 1 or len(descending) == 0:
+        raise ValueError("Custom PNDM timesteps must be a non-empty 1D array.")
+    if np.any(np.diff(descending) >= 0):
+        raise ValueError("Custom PNDM timesteps must be strictly descending.")
+
+    ascending = descending[::-1].copy()
+    scheduler_order = int(getattr(scheduler, "pndm_order", 4))
+    scheduler_order = max(1, min(scheduler_order, len(ascending)))
+    if getattr(getattr(scheduler, "config", None), "skip_prk_steps", False):
+        prk_timesteps = np.asarray([], dtype=np.int64)
+        if len(ascending) >= 2:
+            plms_source = np.concatenate([ascending[:-1], ascending[-2:-1], ascending[-1:]])
+        else:
+            plms_source = ascending
+        return ascending, prk_timesteps, plms_source[::-1].copy().astype(np.int64)
+
+    warmup_start = len(ascending) - scheduler_order
+    warmup = ascending[warmup_start:]
+    raw: list[float] = []
+    for offset, value in enumerate(warmup):
+        index = warmup_start + offset
+        if index + 1 < len(ascending):
+            half_step = 0.5 * float(ascending[index + 1] - ascending[index])
+        elif len(ascending) > 1:
+            half_step = 0.5 * float(ascending[-1] - ascending[-2])
+        else:
+            half_step = 0.5 * float(getattr(scheduler.config, "num_train_timesteps", 1000))
+        raw.extend([float(value), float(value) + half_step])
+    prk_source = np.round(np.asarray(raw[:-1], dtype=np.float64)).astype(np.int64)
+    prk_timesteps = prk_source.repeat(2)[1:-1][::-1].copy()
+    plms_timesteps = ascending[: -(scheduler_order - 1)][::-1].copy() if scheduler_order > 1 else ascending[::-1].copy()
+    return ascending, prk_timesteps.astype(np.int64), plms_timesteps.astype(np.int64)
+
+
+def _set_pndm_state_from_timesteps(
+    scheduler,
+    timesteps: np.ndarray,
+    *,
+    device: torch.device,
+) -> None:
+    ascending, prk_timesteps, plms_timesteps = _pndm_prk_plms_from_anchor_timesteps(scheduler, timesteps)
+    scheduler._timesteps = ascending
+    scheduler.prk_timesteps = prk_timesteps
+    scheduler.plms_timesteps = plms_timesteps
+    scheduler.timesteps = torch.from_numpy(np.concatenate([prk_timesteps, plms_timesteps]).astype(np.int64)).to(device)
+    scheduler.num_inference_steps = len(ascending)
+    scheduler.ets = []
+    scheduler.counter = 0
+    scheduler.cur_model_output = 0
+
+
+def _set_scheduler_state_from_timesteps_compatible(
+    scheduler,
+    timesteps: np.ndarray,
+    *,
+    device: torch.device,
+) -> None:
+    if isinstance(scheduler, PNDMScheduler):
+        _set_pndm_state_from_timesteps(scheduler, timesteps, device=device)
+        return
+    _set_scheduler_state_from_timesteps(scheduler, timesteps, device=device)
 
 
 def _scheduler_prefers_sigma_schedule(scheduler) -> bool:
@@ -470,6 +572,21 @@ def _bundle_anchor_sigmas(schedule_bundle: ScheduleBundle) -> np.ndarray | None:
     if schedule_bundle.sigma_grid is not None:
         return np.asarray(schedule_bundle.sigma_grid[:-1], dtype=np.float64)
     return None
+
+
+def _terminal_timestep_coordinate(scheduler) -> float:
+    timesteps = getattr(scheduler, "timesteps", None)
+    if isinstance(timesteps, torch.Tensor) and timesteps.numel() > 0:
+        if isinstance(scheduler, (DDIMScheduler, PNDMScheduler)):
+            step_count = max(int(getattr(scheduler, "num_inference_steps", int(timesteps.numel()))), 1)
+            step = int(getattr(scheduler.config, "num_train_timesteps", 1000)) // step_count
+            return float(timesteps.detach().cpu().float().reshape(-1)[-1].item()) - float(step)
+        raw_sigmas = getattr(scheduler, "sigmas", None)
+        if raw_sigmas is not None:
+            sigmas = raw_sigmas.detach().cpu().float().numpy() if isinstance(raw_sigmas, torch.Tensor) else np.asarray(raw_sigmas)
+            if len(sigmas) == int(timesteps.numel()) + 1:
+                return float(_interp_timesteps_for_sigmas(scheduler, np.asarray([float(sigmas[-1])], dtype=np.float64))[0])
+    return 0.0
 
 
 def _stork_uses_flow_prediction(scheduler) -> bool:
@@ -505,37 +622,36 @@ def _schedule_bundle_kwargs(
     if prefer not in {"sigmas", "timesteps"}:
         raise ValueError(f"Unsupported schedule preference: {prefer}")
 
-    kwargs: dict[str, list[float] | list[int]] = {}
     if _stork_uses_flow_prediction(scheduler):
         sigmas = _stork_flow_anchor_sigmas(schedule_bundle)
         if sigmas is None:
             raise ValueError("STORK flow schedules require full schedule sigmas or sigma_grid.")
-        kwargs["sigmas"] = sigmas.tolist()
-        return kwargs
+        return {"sigmas": sigmas.tolist()}
+
+    if isinstance(scheduler, STORKScheduler):
+        kwargs: dict[str, list[float] | list[int]] = {}
+        timesteps = _bundle_anchor_timesteps(scheduler, schedule_bundle)
+        sigmas = _bundle_anchor_sigmas(schedule_bundle)
+        if timesteps is not None and scheduler_accepts(scheduler, "timesteps"):
+            kwargs["timesteps"] = _schedule_timesteps_arg(scheduler, timesteps)
+        if sigmas is not None and scheduler_accepts(scheduler, "sigmas"):
+            kwargs["sigmas"] = sigmas.tolist()
+        if kwargs:
+            return kwargs
 
     if prefer == "sigmas":
         sigmas = _bundle_anchor_sigmas(schedule_bundle)
         if sigmas is not None and scheduler_accepts(scheduler, "sigmas"):
-            kwargs["sigmas"] = sigmas.tolist()
-            timesteps = _bundle_anchor_timesteps(scheduler, schedule_bundle)
-            if timesteps is not None and scheduler_accepts(scheduler, "timesteps"):
-                kwargs["timesteps"] = _schedule_timesteps_arg(scheduler, timesteps)
-            return kwargs
+            return {"sigmas": sigmas.tolist()}
 
     timesteps = _bundle_anchor_timesteps(scheduler, schedule_bundle)
     if timesteps is not None and scheduler_accepts(scheduler, "timesteps"):
-        kwargs["timesteps"] = _schedule_timesteps_arg(scheduler, timesteps)
-        if prefer == "timesteps":
-            sigmas = _bundle_anchor_sigmas(schedule_bundle)
-            if sigmas is not None and scheduler_accepts(scheduler, "sigmas"):
-                kwargs["sigmas"] = sigmas.tolist()
-        return kwargs
+        return {"timesteps": _schedule_timesteps_arg(scheduler, timesteps)}
 
     if prefer == "timesteps":
         sigmas = _bundle_anchor_sigmas(schedule_bundle)
         if sigmas is not None and scheduler_accepts(scheduler, "sigmas"):
-            kwargs["sigmas"] = sigmas.tolist()
-            return kwargs
+            return {"sigmas": sigmas.tolist()}
 
     supported = [name for name in ("timesteps", "sigmas") if scheduler_accepts(scheduler, name)]
     supported_str = ", ".join(supported) if supported else "none"
@@ -562,6 +678,8 @@ def _configure_scheduler_timesteps(
 ) -> None:
     if schedule_bundle is None:
         scheduler.set_timesteps(num_inference_steps, device=device)
+        _force_zero_terminal_sigma(scheduler)
+        _move_unipc_sigmas_to_device(scheduler, device)
         return
 
     _apply_stork_runtime_options(scheduler, schedule_bundle)
@@ -588,13 +706,14 @@ def _configure_scheduler_timesteps(
     except ValueError:
         fallback_timesteps = _bundle_anchor_timesteps(scheduler, schedule_bundle)
         if fallback_timesteps is not None:
-            _set_scheduler_state_from_timesteps(scheduler, fallback_timesteps, device=device)
+            _set_scheduler_state_from_timesteps_compatible(scheduler, fallback_timesteps, device=device)
             return
         raise
 
     try:
         scheduler.set_timesteps(device=device, **schedule_kwargs)
         _force_zero_terminal_sigma(scheduler)
+        _move_unipc_sigmas_to_device(scheduler, device)
     except ValueError as error:
         fallback_timesteps = _bundle_anchor_timesteps(scheduler, schedule_bundle)
         if fallback_timesteps is None:
@@ -612,7 +731,7 @@ def _configure_scheduler_timesteps(
         )
         if not supported_fallback:
             raise
-        _set_scheduler_state_from_timesteps(scheduler, fallback_timesteps, device=device)
+        _set_scheduler_state_from_timesteps_compatible(scheduler, fallback_timesteps, device=device)
 
 
 def _base_sigmas_from_scheduler(scheduler) -> np.ndarray:
@@ -708,9 +827,10 @@ def build_pndm_native_coordinate_grid(
     if normalized_domain == "timesteps":
         anchor_timesteps = _collapse_repeated_values(
             scheduler.timesteps.detach().cpu().float().numpy(),
-            expected_length=plan.solver_steps,
         )
-        return np.concatenate([anchor_timesteps, np.asarray([0.0], dtype=np.float64)])
+        return _collapse_repeated_values(
+            np.concatenate([anchor_timesteps, np.asarray([_terminal_timestep_coordinate(scheduler)], dtype=np.float64)])
+        )
 
     raw_sigmas = getattr(scheduler, "sigmas", None)
     if raw_sigmas is None:
@@ -724,7 +844,7 @@ def build_pndm_native_coordinate_grid(
     sigma_grid = np.concatenate([anchor_sigmas, np.asarray([terminal_sigma], dtype=np.float64)])
 
     if normalized_domain == "sigmas":
-        return sigma_grid
+        return _collapse_repeated_values(sigma_grid)
     raise ValueError(f"Unsupported PNDM coordinate domain: {coordinate_domain}")
 
 
@@ -1136,6 +1256,105 @@ def _evaluate_scheduler_model_output(
     return model(model_input, model_timestep)
 
 
+def _alpha_cumprod_at_timestep_torch(
+    scheduler,
+    timestep_value: float | torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    terminal_if_nonpositive: bool = False,
+) -> torch.Tensor:
+    alphas = scheduler.alphas_cumprod.detach().to(device=device, dtype=dtype)
+    query = torch.as_tensor(timestep_value, device=device, dtype=dtype)
+    terminal = torch.as_tensor(float(scheduler.final_alpha_cumprod), device=device, dtype=dtype)
+    clipped = torch.clamp(query, min=0.0, max=float(len(alphas) - 1))
+    lookup = torch.arange(len(alphas), device=device, dtype=dtype)
+    interpolated = _torch_interp_1d(clipped, lookup, alphas)
+    if terminal_if_nonpositive:
+        interpolated = torch.where(query <= 0.0, terminal, interpolated)
+    return interpolated
+
+
+def _ddim_step_between_timesteps(
+    model: torch.nn.Module,
+    scheduler,
+    sample: torch.Tensor,
+    timestep_start: float,
+    timestep_end: float,
+    *,
+    model_output_type: str = "epsilon",
+) -> torch.Tensor:
+    device = sample.device
+    dtype = sample.dtype
+    start_tensor = torch.as_tensor(float(timestep_start), device=device, dtype=dtype)
+    end_tensor = torch.as_tensor(float(timestep_end), device=device, dtype=dtype)
+    model_timestep = start_tensor.to(dtype=torch.float32).reshape(()).expand(sample.shape[0])
+    model_input = sample
+    if hasattr(scheduler, "scale_model_input"):
+        model_input = scheduler.scale_model_input(sample, start_tensor)
+    raw_model_output = model(model_input, model_timestep)
+
+    alpha_start = _alpha_cumprod_at_timestep_torch(
+        scheduler,
+        start_tensor,
+        device=device,
+        dtype=dtype,
+        terminal_if_nonpositive=False,
+    )
+    alpha_end = _alpha_cumprod_at_timestep_torch(
+        scheduler,
+        end_tensor,
+        device=device,
+        dtype=dtype,
+        terminal_if_nonpositive=True,
+    )
+    beta_start = torch.clamp(1.0 - alpha_start, min=0.0)
+    normalized_output_type = _normalize_model_output_type(model_output_type)
+    if normalized_output_type == "epsilon":
+        pred_epsilon = raw_model_output
+        pred_original = (sample - beta_start.sqrt() * pred_epsilon) / torch.clamp(alpha_start.sqrt(), min=1.0e-12)
+    elif normalized_output_type == "v_prediction":
+        pred_original = alpha_start.sqrt() * sample - beta_start.sqrt() * raw_model_output
+        pred_epsilon = alpha_start.sqrt() * raw_model_output + beta_start.sqrt() * sample
+    else:
+        raise ValueError("DDIM PNDM calibration supports epsilon or v_prediction outputs.")
+
+    if getattr(scheduler.config, "thresholding", False):
+        pred_original = scheduler._threshold_sample(pred_original)
+    elif getattr(scheduler.config, "clip_sample", False):
+        pred_original = pred_original.clamp(
+            -float(getattr(scheduler.config, "clip_sample_range", 1.0)),
+            float(getattr(scheduler.config, "clip_sample_range", 1.0)),
+        )
+    beta_end = torch.clamp(1.0 - alpha_end, min=0.0)
+    return alpha_end.sqrt() * pred_original + beta_end.sqrt() * pred_epsilon
+
+
+def _build_ddim_stepper(
+    *,
+    model: torch.nn.Module,
+    scheduler,
+    model_output_type: str,
+):
+    def step(
+        sample: torch.Tensor,
+        coordinate_start: float,
+        coordinate_end: float,
+        _sample_start: int,
+        _sample_stop: int | None,
+    ) -> torch.Tensor:
+        return _ddim_step_between_timesteps(
+            model,
+            scheduler,
+            sample,
+            float(coordinate_start),
+            float(coordinate_end),
+            model_output_type=model_output_type,
+        )
+
+    return step
+
+
 def _build_native_scheduler_stepper(
     *,
     model: torch.nn.Module,
@@ -1157,13 +1376,15 @@ def _build_native_scheduler_stepper(
         kwargs: dict[str, object] = {"num_inference_steps": 2, "device": device}
         if _stork_uses_flow_prediction(scheduler):
             kwargs["sigmas"] = [sigma_start, sigma_end]
-        elif coordinate_domain == "sigmas" and scheduler_accepts(scheduler, "sigmas"):
+        elif isinstance(scheduler, STORKScheduler) and coordinate_domain == "sigmas" and scheduler_accepts(scheduler, "sigmas"):
             kwargs["sigmas"] = [sigma_start, sigma_end]
             if scheduler_accepts(scheduler, "timesteps"):
                 kwargs["timesteps"] = _schedule_timesteps_arg(
                     scheduler,
                     np.asarray([timestep_start, timestep_end], dtype=np.float64),
                 )
+        elif coordinate_domain == "sigmas" and scheduler_accepts(scheduler, "sigmas"):
+            kwargs["sigmas"] = [sigma_start, sigma_end]
         elif scheduler_accepts(scheduler, "timesteps"):
             kwargs["timesteps"] = _schedule_timesteps_arg(
                 scheduler,
@@ -1205,6 +1426,10 @@ def _reset_scheduler_history(scheduler) -> None:
         "timestep_list": [None] * solver_order,
         "lower_order_nums": 0,
         "last_sample": None,
+        "ets": [],
+        "counter": 0,
+        "cur_model_output": 0,
+        "cur_sample": None,
         "_step_index": None,
         "_begin_index": None,
         "noise_predictions": [],
@@ -1212,6 +1437,58 @@ def _reset_scheduler_history(scheduler) -> None:
     }.items():
         if hasattr(scheduler, name):
             setattr(scheduler, name, value)
+
+
+_REPLAY_HISTORY_NAMES = (
+    "model_outputs",
+    "timestep_list",
+    "lower_order_nums",
+    "last_sample",
+    "ets",
+    "counter",
+    "cur_model_output",
+    "cur_sample",
+    "noise_predictions",
+    "velocity_predictions",
+    "adaptive_s_requested_per_step",
+    "adaptive_s_used_per_step",
+    "adaptive_s_requested_max",
+    "adaptive_s_used_max",
+)
+
+
+def _clone_scheduler_value(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone()
+    if isinstance(value, list):
+        return [_clone_scheduler_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_scheduler_value(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _clone_scheduler_value(item) for key, item in value.items()}
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    return copy.deepcopy(value)
+
+
+def _snapshot_scheduler_history(scheduler) -> dict[str, object]:
+    return {
+        name: _clone_scheduler_value(getattr(scheduler, name))
+        for name in _REPLAY_HISTORY_NAMES
+        if hasattr(scheduler, name)
+    }
+
+
+def _restore_scheduler_replay_history(scheduler, snapshot: dict[str, object]) -> None:
+    for name, value in snapshot.items():
+        if hasattr(scheduler, name):
+            setattr(scheduler, name, _clone_scheduler_value(value))
+    if hasattr(scheduler, "_step_index"):
+        scheduler._step_index = None
+    if hasattr(scheduler, "_begin_index"):
+        scheduler._begin_index = None
+    if hasattr(scheduler, "is_scale_input_called"):
+        scheduler.is_scale_input_called = False
 
 
 def _configured_scheduler_coordinate_nodes(
@@ -1226,7 +1503,7 @@ def _configured_scheduler_coordinate_nodes(
         normalized_domain = "sigmas"
     if normalized_domain == "timesteps":
         timesteps = scheduler.timesteps.detach().cpu().float().numpy()
-        return np.concatenate([timesteps.astype(np.float64), np.asarray([0.0], dtype=np.float64)])
+        return np.concatenate([timesteps.astype(np.float64), np.asarray([_terminal_timestep_coordinate(scheduler)], dtype=np.float64)])
     if normalized_domain == "sigmas":
         raw_sigmas = getattr(scheduler, "sigmas", None)
         if raw_sigmas is None:
@@ -1272,6 +1549,127 @@ def _trajectory_init_sigma(scheduler) -> float:
     return 1.0
 
 
+def _refined_window_nodes(window_nodes: np.ndarray, factor: int) -> np.ndarray:
+    nodes = np.asarray(window_nodes, dtype=np.float64)
+    if nodes.ndim != 1 or len(nodes) < 2:
+        raise ValueError("window_nodes must be a 1D array with at least two nodes.")
+    if int(factor) <= 0:
+        raise ValueError("factor must be positive.")
+    refined = [float(nodes[0])]
+    for index in range(len(nodes) - 1):
+        refined.extend(np.linspace(float(nodes[index]), float(nodes[index + 1]), int(factor) + 1)[1:].tolist())
+    return np.asarray(refined, dtype=np.float64)
+
+
+def _local_scheduler_step_count_from_timesteps(time_grid: np.ndarray, scheduler) -> int:
+    values = np.asarray(time_grid, dtype=np.float64)
+    gaps = np.abs(np.diff(values))
+    gaps = gaps[gaps > 1.0e-8]
+    if len(gaps) == 0:
+        return max(len(values) - 1, 1)
+    train_steps = float(getattr(getattr(scheduler, "config", None), "num_train_timesteps", 1000))
+    return max(int(round(train_steps / float(np.median(gaps)))), len(values) - 1, 1)
+
+
+def _set_stork_replay_state(
+    scheduler,
+    *,
+    time_grid: np.ndarray,
+    sigma_grid: np.ndarray,
+    device: torch.device,
+) -> None:
+    start_timesteps = np.asarray(time_grid[:-1], dtype=np.float64)
+    if np.any(np.diff(start_timesteps) >= 0):
+        raise ValueError("STORK replay timesteps must be strictly descending.")
+    if np.any(np.diff(sigma_grid) >= 0):
+        raise ValueError("STORK replay sigmas must be strictly descending.")
+    total_steps = float(getattr(scheduler.config, "num_train_timesteps", 1000))
+    normalized_grid = np.asarray(time_grid, dtype=np.float64) / total_steps
+    dt_list = normalized_grid[:-1] - normalized_grid[1:]
+    scheduler.num_inference_steps = len(start_timesteps)
+    scheduler._timesteps = start_timesteps.astype(np.float32)
+    scheduler.timesteps = torch.from_numpy(start_timesteps.astype(np.float32)).to(dtype=scheduler.dtype, device=device)
+    scheduler.sigmas = torch.from_numpy(np.asarray(sigma_grid, dtype=np.float32)).to(dtype=scheduler.dtype, device=device)
+    scheduler.dt_list = torch.from_numpy(dt_list.astype(np.float32)).to(dtype=scheduler.dtype, device=device)
+    scheduler.dt = float(dt_list[0]) if len(dt_list) else 0.0
+    scheduler.base_dt = 1.0 / max(int(scheduler.num_inference_steps), 1)
+    scheduler.dt_max = float(scheduler.dt_list.max().item()) if len(scheduler.dt_list) else 0.0
+    scheduler.dt_min = float(scheduler.dt_list.min().item()) if len(scheduler.dt_list) else 0.0
+    scheduler._step_index = None
+    scheduler._begin_index = None
+
+
+def _set_replay_scheduler_nodes(
+    scheduler,
+    nodes: np.ndarray,
+    *,
+    coordinate_domain: str,
+    device: torch.device,
+) -> None:
+    grid = np.asarray(nodes, dtype=np.float64)
+    if grid.ndim != 1 or len(grid) < 2:
+        raise ValueError("Replay grid must contain at least two nodes.")
+    if np.any(np.diff(grid) >= 0):
+        raise ValueError("Replay grid must be strictly descending.")
+
+    normalized_domain = str(coordinate_domain).lower().strip()
+    if normalized_domain == "timestep":
+        normalized_domain = "timesteps"
+    if normalized_domain == "sigma":
+        normalized_domain = "sigmas"
+
+    if normalized_domain == "timesteps":
+        time_grid = grid
+        sigma_grid = _interp_sigmas_for_timesteps(scheduler, time_grid)
+    elif normalized_domain == "sigmas":
+        sigma_grid = grid
+        time_grid = _interp_timesteps_for_sigmas(
+            scheduler,
+            sigma_grid,
+            round_output=not isinstance(scheduler, STORKScheduler),
+            force_log_sigma=isinstance(scheduler, DPMSolverMultistepScheduler),
+        )
+    else:
+        raise ValueError(f"Unsupported replay coordinate domain: {coordinate_domain}")
+
+    start_timesteps = np.asarray(time_grid[:-1], dtype=np.float64)
+    step_count = len(start_timesteps)
+    if isinstance(scheduler, STORKScheduler):
+        _set_stork_replay_state(scheduler, time_grid=time_grid, sigma_grid=sigma_grid, device=device)
+        return
+
+    if isinstance(scheduler, PNDMScheduler):
+        scheduler.timesteps = torch.from_numpy(np.round(start_timesteps).astype(np.int64)).to(device=device)
+        scheduler.prk_timesteps = np.round(start_timesteps).astype(np.int64)
+        scheduler.plms_timesteps = np.round(start_timesteps).astype(np.int64)
+        scheduler.num_inference_steps = _local_scheduler_step_count_from_timesteps(time_grid, scheduler)
+        return
+
+    if isinstance(scheduler, (DDIMScheduler,)):
+        scheduler.timesteps = torch.from_numpy(np.round(start_timesteps).astype(np.int64)).to(device=device)
+        scheduler.num_inference_steps = _local_scheduler_step_count_from_timesteps(time_grid, scheduler)
+        return
+
+    scheduler.timesteps = torch.from_numpy(start_timesteps.astype(np.float32)).to(device=device)
+    scheduler.sigmas = torch.from_numpy(np.asarray(sigma_grid, dtype=np.float32)).to("cpu")
+    scheduler.num_inference_steps = step_count
+    if hasattr(scheduler, "model_outputs"):
+        solver_order = int(getattr(getattr(scheduler, "config", None), "solver_order", 1))
+        scheduler.model_outputs = [None] * solver_order
+    if hasattr(scheduler, "timestep_list"):
+        solver_order = int(getattr(getattr(scheduler, "config", None), "solver_order", 1))
+        scheduler.timestep_list = [None] * solver_order
+    if hasattr(scheduler, "lower_order_nums"):
+        scheduler.lower_order_nums = 0
+    if hasattr(scheduler, "last_sample"):
+        scheduler.last_sample = None
+    if hasattr(scheduler, "_step_index"):
+        scheduler._step_index = None
+    if hasattr(scheduler, "_begin_index"):
+        scheduler._begin_index = None
+    _move_unipc_sigmas_to_device(scheduler, device)
+
+
 def _run_pndm_base_trajectory(
     *,
     model: torch.nn.Module,
@@ -1312,7 +1710,296 @@ def _run_pndm_base_trajectory(
     return _collapse_adjacent_trajectory_nodes(coordinate_nodes, states, eps=eps)
 
 
-def collect_trajectory_window_calibration_stats(
+def _run_pndm_anchor_trajectory(
+    *,
+    model: torch.nn.Module,
+    scheduler,
+    solver: str,
+    effective_nfe: int,
+    initial_sample: torch.Tensor,
+    coordinate_domain: str,
+    eps: float,
+) -> tuple[np.ndarray, torch.Tensor, list[dict[str, object]]]:
+    device = initial_sample.device
+    plan = resolve_effective_nfe_plan(solver, int(effective_nfe))
+    scheduler.set_timesteps(plan.solver_steps, device=device)
+    _force_zero_terminal_sigma(scheduler)
+    _move_unipc_sigmas_to_device(scheduler, device)
+    _reset_scheduler_history(scheduler)
+    coordinate_nodes = _configured_scheduler_coordinate_nodes(scheduler, coordinate_domain=coordinate_domain)
+    states = [initial_sample.detach().clone()]
+    history = [_snapshot_scheduler_history(scheduler)]
+    sample = initial_sample.detach().clone()
+    with torch.inference_mode():
+        for timestep in scheduler.timesteps:
+            model_output = _evaluate_scheduler_model_output(model, scheduler, sample, timestep)
+            step_output = scheduler.step(model_output, timestep, sample)
+            sample = step_output.prev_sample
+            states.append(sample.detach().clone())
+            history.append(_snapshot_scheduler_history(scheduler))
+    grid, state_tensor = _collapse_adjacent_trajectory_nodes(coordinate_nodes, states, eps=eps)
+    if len(grid) != len(history):
+        # Repeated scheduler nodes are collapsed only for state geometry; keep the
+        # matching latest history snapshot for each remaining node.
+        collapsed_history: list[dict[str, object]] = []
+        collapsed_nodes: list[float] = []
+        for node, snapshot in zip(np.asarray(coordinate_nodes, dtype=np.float64).tolist(), history):
+            if collapsed_nodes and abs(float(node) - collapsed_nodes[-1]) <= float(eps):
+                collapsed_nodes[-1] = float(node)
+                collapsed_history[-1] = snapshot
+            else:
+                collapsed_nodes.append(float(node))
+                collapsed_history.append(snapshot)
+        history = collapsed_history
+    return grid, state_tensor, history
+
+
+def _replay_pndm_window_endpoint(
+    *,
+    model: torch.nn.Module,
+    scheduler,
+    coordinate_nodes: np.ndarray,
+    coordinate_domain: str,
+    anchor_sample: torch.Tensor,
+    anchor_history: dict[str, object],
+) -> torch.Tensor:
+    device = anchor_sample.device
+    _set_replay_scheduler_nodes(
+        scheduler,
+        coordinate_nodes,
+        coordinate_domain=coordinate_domain,
+        device=device,
+    )
+    _restore_scheduler_replay_history(scheduler, anchor_history)
+    sample = anchor_sample.detach().clone()
+    with torch.inference_mode():
+        for timestep in scheduler.timesteps:
+            model_output = _evaluate_scheduler_model_output(model, scheduler, sample, timestep)
+            try:
+                step_output = scheduler.step(model_output, timestep, sample)
+            except (IndexError, ValueError) as error:
+                if not isinstance(scheduler, PNDMScheduler):
+                    raise
+                _reset_scheduler_history(scheduler)
+                _set_replay_scheduler_nodes(
+                    scheduler,
+                    coordinate_nodes,
+                    coordinate_domain=coordinate_domain,
+                    device=device,
+                )
+                sample = anchor_sample.detach().clone()
+                model_output = _evaluate_scheduler_model_output(model, scheduler, sample, scheduler.timesteps[0])
+                step_output = scheduler.step(model_output, scheduler.timesteps[0], sample)
+                remaining_timesteps = scheduler.timesteps[1:]
+                for retry_timestep in remaining_timesteps:
+                    model_output = _evaluate_scheduler_model_output(
+                        model,
+                        scheduler,
+                        step_output.prev_sample,
+                        retry_timestep,
+                    )
+                    step_output = scheduler.step(model_output, retry_timestep, step_output.prev_sample)
+                return step_output.prev_sample.detach().clone()
+            sample = step_output.prev_sample
+    return sample.detach().clone()
+
+
+def _anchored_replay_cost_per_sample(interval_count: int, window_size: int) -> int:
+    return int(interval_count) * (4 + 7 * int(window_size))
+
+
+def _build_velocity_replay_components(
+    *,
+    model: torch.nn.Module,
+    scheduler,
+    coordinate_domain: str,
+    model_output_type: str,
+    eps: float,
+):
+    if coordinate_domain == "timesteps":
+        velocity_fn = build_velocity_oracle(
+            model,
+            scheduler,
+            model_output_type=model_output_type,
+            sigma_floor=eps,
+        )
+    elif coordinate_domain == "sigmas":
+        velocity_fn = build_sigma_derivative_oracle(
+            model,
+            scheduler,
+            model_output_type=model_output_type,
+        )
+    else:
+        raise ValueError(f"Unsupported velocity replay coordinate domain: {coordinate_domain}")
+    return velocity_fn, build_velocity_stepper(velocity_fn, "euler")
+
+
+def _collect_velocity_quarter_anchor_batch(
+    *,
+    initial_sample: torch.Tensor,
+    physical_grid: np.ndarray,
+    step_fn,
+    window_size: int,
+    observation_microbatch: int | None,
+    q_min: float,
+    q_max: float,
+    eps: float,
+) -> tuple[FPTrajectoryStats, object]:
+    grid = np.asarray(physical_grid, dtype=np.float64)
+    current = initial_sample.detach()
+    reference_states: list[torch.Tensor] = [current.detach().clone()]
+    replay_endpoints: dict[int, list[torch.Tensor]] = {1: [], 2: [], 4: []}
+    interval_count = len(grid) - 1
+
+    with torch.inference_mode():
+        for index in range(interval_count):
+            start = float(grid[index])
+            interval_end = float(grid[index + 1])
+            stop_index = min(index + int(window_size), interval_count)
+            window_end = float(grid[stop_index])
+
+            for factor in (1, 2, 4):
+                endpoint = _microbatch_map(
+                    current,
+                    microbatch_size=observation_microbatch,
+                    fn=lambda batch, batch_start, batch_stop, s=start, e=window_end, f=factor: _refined_step(
+                        step_fn,
+                        batch,
+                        s,
+                        e,
+                        f,
+                        batch_start,
+                        batch_stop,
+                    ),
+                )
+                replay_endpoints[factor].append(endpoint.detach())
+
+            current = _microbatch_map(
+                current,
+                microbatch_size=observation_microbatch,
+                fn=lambda batch, batch_start, batch_stop, s=start, e=interval_end: _refined_step(
+                    step_fn,
+                    batch,
+                    s,
+                    e,
+                    4,
+                    batch_start,
+                    batch_stop,
+                ),
+            ).detach()
+            reference_states.append(current.detach().clone())
+
+    return collect_anchored_replay_stats(
+        physical_grid=grid,
+        reference_states=torch.stack(reference_states, dim=0),
+        replay_1x_endpoints=torch.stack(replay_endpoints[1], dim=0),
+        replay_2x_endpoints=torch.stack(replay_endpoints[2], dim=0),
+        replay_4x_endpoints=torch.stack(replay_endpoints[4], dim=0),
+        window_size=int(window_size),
+        q_min=q_min,
+        q_max=q_max,
+        eps=eps,
+    )
+
+
+def _run_scheduler_quarter_reference_on_grid(
+    *,
+    model: torch.nn.Module,
+    scheduler,
+    initial_sample: torch.Tensor,
+    coarse_grid: np.ndarray,
+    coordinate_domain: str,
+    refinement_factor: int,
+    eps: float,
+) -> tuple[torch.Tensor, list[dict[str, object]]]:
+    device = initial_sample.device
+    fine_grid = _refined_window_nodes(np.asarray(coarse_grid, dtype=np.float64), int(refinement_factor))
+    _set_replay_scheduler_nodes(scheduler, fine_grid, coordinate_domain=coordinate_domain, device=device)
+    _reset_scheduler_history(scheduler)
+    expected_steps = len(fine_grid) - 1
+    if len(scheduler.timesteps) != expected_steps:
+        raise ValueError(
+            f"History-aware anchored replay requires one scheduler step per refined interval; "
+            f"got {len(scheduler.timesteps)} scheduler steps for {expected_steps} intervals."
+        )
+
+    states: list[torch.Tensor] = [initial_sample.detach().clone()]
+    history: list[dict[str, object]] = [_snapshot_scheduler_history(scheduler)]
+    sample = initial_sample.detach().clone()
+    with torch.inference_mode():
+        for step_index, timestep in enumerate(scheduler.timesteps):
+            model_output = _evaluate_scheduler_model_output(model, scheduler, sample, timestep)
+            step_output = scheduler.step(model_output, timestep, sample)
+            sample = step_output.prev_sample
+            if (step_index + 1) % int(refinement_factor) == 0:
+                states.append(sample.detach().clone())
+                history.append(_snapshot_scheduler_history(scheduler))
+
+    if len(states) != len(coarse_grid):
+        raise RuntimeError(
+            f"Quarter reference recorded {len(states)} coarse states for {len(coarse_grid)} coarse nodes."
+        )
+    if len(history) != len(coarse_grid):
+        raise RuntimeError("Quarter reference history count does not match coarse grid.")
+    return torch.stack(states, dim=0), history
+
+
+def _collect_scheduler_history_quarter_anchor_batch(
+    *,
+    model: torch.nn.Module,
+    scheduler,
+    initial_sample: torch.Tensor,
+    physical_grid: np.ndarray,
+    coordinate_domain: str,
+    window_size: int,
+    q_min: float,
+    q_max: float,
+    eps: float,
+) -> tuple[FPTrajectoryStats, object]:
+    grid = np.asarray(physical_grid, dtype=np.float64)
+    reference_states, reference_history = _run_scheduler_quarter_reference_on_grid(
+        model=model,
+        scheduler=scheduler,
+        initial_sample=initial_sample,
+        coarse_grid=grid,
+        coordinate_domain=coordinate_domain,
+        refinement_factor=4,
+        eps=eps,
+    )
+    interval_count = len(grid) - 1
+    replay_endpoints: dict[int, list[torch.Tensor]] = {1: [], 2: [], 4: []}
+    with torch.inference_mode():
+        for start in range(interval_count):
+            stop = min(start + int(window_size), interval_count)
+            window_nodes = grid[start : stop + 1]
+            anchor_sample = reference_states[start]
+            anchor_history = reference_history[start]
+            for factor in (1, 2, 4):
+                replay_nodes = _refined_window_nodes(window_nodes, int(factor))
+                endpoint = _replay_pndm_window_endpoint(
+                    model=model,
+                    scheduler=scheduler,
+                    coordinate_nodes=replay_nodes,
+                    coordinate_domain=coordinate_domain,
+                    anchor_sample=anchor_sample,
+                    anchor_history=anchor_history,
+                )
+                replay_endpoints[factor].append(endpoint.detach())
+
+    return collect_anchored_replay_stats(
+        physical_grid=grid,
+        reference_states=reference_states,
+        replay_1x_endpoints=torch.stack(replay_endpoints[1], dim=0),
+        replay_2x_endpoints=torch.stack(replay_endpoints[2], dim=0),
+        replay_4x_endpoints=torch.stack(replay_endpoints[4], dim=0),
+        window_size=int(window_size),
+        q_min=q_min,
+        q_max=q_max,
+        eps=eps,
+    )
+
+
+def collect_anchored_replay_calibration_stats(
     *,
     model: torch.nn.Module,
     scheduler,
@@ -1321,27 +2008,26 @@ def collect_trajectory_window_calibration_stats(
     batch_size: int,
     num_batches: int,
     seed: int,
-    multires_nfes: Sequence[int] = (16, 32, 64),
+    anchor_nfe: int = 16,
     window_size: int | None = None,
     observation_microbatch: int | None = None,
     coordinate_domain: str | None = None,
+    model_output_type: str = "epsilon",
     q_min: float = 1.05,
     q_max: float = 6.0,
     eps: float = 1.0e-12,
 ) -> tuple[np.ndarray, FPTrajectoryStats, dict[str, object]]:
+    normalized_solver = normalize_solver_name(solver)
     spec = get_solver_native_spec("pndm", solver)
     if not spec.supports_base_trajectory_recording:
-        raise ValueError(f"PNDM solver `{solver}` does not support trajectory-window FP calibration: {spec.notes}")
-    nfes = tuple(int(value) for value in multires_nfes)
-    if len(nfes) != 3 or nfes[1] != 2 * nfes[0] or nfes[2] != 2 * nfes[1]:
-        raise ValueError("trajectory-window FP calibration expects multires_nfes=[N,2N,4N].")
+        raise ValueError(f"PNDM solver `{solver}` does not support anchored replay FP calibration: {spec.notes}")
     active_domain = str(coordinate_domain or spec.native_coordinate).lower().strip()
     if active_domain == "timestep":
         active_domain = "timesteps"
     if active_domain == "sigma":
         active_domain = "sigmas"
     if active_domain not in {"timesteps", "sigmas"}:
-        raise ValueError(f"Unsupported PNDM trajectory coordinate domain: {active_domain}")
+        raise ValueError(f"Unsupported PNDM anchored replay coordinate domain: {active_domain}")
     active_window = int(window_size or spec.recommended_window_len)
     if active_window < int(spec.solver_order):
         raise ValueError("window_size must be at least the solver order/history length.")
@@ -1350,12 +2036,24 @@ def collect_trajectory_window_calibration_stats(
     generator = torch.Generator(device=device).manual_seed(seed)
     batches: list[FPTrajectoryStats] = []
     details: list[dict[str, object]] = []
-    coarse_grid_reference: np.ndarray | None = None
+    grid_reference: np.ndarray | None = None
+    cost_per_sample: int | None = None
 
     with torch.inference_mode():
         for _ in range(num_batches):
-            scheduler.set_timesteps(resolve_effective_nfe_plan(solver, nfes[0]).solver_steps, device=device)
+            scheduler.set_timesteps(resolve_effective_nfe_plan(solver, int(anchor_nfe)).solver_steps, device=device)
             _force_zero_terminal_sigma(scheduler)
+            _move_unipc_sigmas_to_device(scheduler, device)
+            physical_grid = build_pndm_native_coordinate_grid(
+                scheduler,
+                solver_name=solver,
+                effective_nfe=int(anchor_nfe),
+                coordinate_domain=active_domain,
+            )
+            if grid_reference is None:
+                grid_reference = physical_grid
+            elif not np.allclose(grid_reference, physical_grid, rtol=0.0, atol=max(float(eps), 1.0e-8)):
+                raise RuntimeError("Velocity anchored replay grids changed across calibration batches.")
             init_sigma = _trajectory_init_sigma(scheduler)
             initial_sample = torch.randn(
                 (batch_size, model.in_channels, image_size, image_size),
@@ -1368,57 +2066,104 @@ def collect_trajectory_window_calibration_stats(
             for start in range(0, batch_size, micro):
                 stop = min(start + micro, batch_size)
                 sample_slice = initial_sample[start:stop]
-                trajectories = [
-                    _run_pndm_base_trajectory(
+                interval_count = len(physical_grid) - 1
+                cost_per_sample = _anchored_replay_cost_per_sample(interval_count, active_window)
+                if normalized_solver == "euler":
+                    _velocity_fn, step_fn = _build_velocity_replay_components(
                         model=model,
                         scheduler=scheduler,
-                        solver=solver,
-                        effective_nfe=nfe,
-                        initial_sample=sample_slice,
                         coordinate_domain=active_domain,
+                        model_output_type=model_output_type,
                         eps=eps,
                     )
-                    for nfe in nfes
-                ]
-                stats, window_details = collect_trajectory_window_stats(
-                    coarse_grid=trajectories[0][0],
-                    coarse_states=trajectories[0][1],
-                    mid_grid=trajectories[1][0],
-                    mid_states=trajectories[1][1],
-                    fine_grid=trajectories[2][0],
-                    fine_states=trajectories[2][1],
-                    window_size=active_window,
-                    q_min=q_min,
-                    q_max=q_max,
-                    eps=eps,
-                )
-                if coarse_grid_reference is None:
-                    coarse_grid_reference = trajectories[0][0]
-                elif not np.allclose(coarse_grid_reference, trajectories[0][0], rtol=0.0, atol=max(float(eps), 1.0e-8)):
-                    raise RuntimeError("Official-base coarse grids changed across trajectory-window calibration batches.")
+                    stats, replay_details = _collect_velocity_quarter_anchor_batch(
+                        initial_sample=sample_slice,
+                        physical_grid=physical_grid,
+                        step_fn=step_fn,
+                        window_size=active_window,
+                        observation_microbatch=observation_microbatch,
+                        q_min=q_min,
+                        q_max=q_max,
+                        eps=eps,
+                    )
+                elif normalized_solver == "ddim":
+                    if active_domain != "timesteps":
+                        raise ValueError("DDIM anchored replay requires timestep-domain coordinates.")
+                    step_fn = _build_ddim_stepper(
+                        model=model,
+                        scheduler=scheduler,
+                        model_output_type=model_output_type,
+                    )
+                    stats, replay_details = _collect_velocity_quarter_anchor_batch(
+                        initial_sample=sample_slice,
+                        physical_grid=physical_grid,
+                        step_fn=step_fn,
+                        window_size=1,
+                        observation_microbatch=observation_microbatch,
+                        q_min=q_min,
+                        q_max=q_max,
+                        eps=eps,
+                    )
+                elif normalized_solver == "pndm":
+                    raise ValueError(
+                        "PNDM/PLMS anchored_replay still needs a custom nonuniform PRK/PLMS production runner; "
+                        "the current path does not export a valid FP_CLOCK schedule for pndm."
+                    )
+                else:
+                    stats, replay_details = _collect_scheduler_history_quarter_anchor_batch(
+                        model=model,
+                        scheduler=scheduler,
+                        initial_sample=sample_slice,
+                        physical_grid=physical_grid,
+                        coordinate_domain=active_domain,
+                        window_size=active_window,
+                        q_min=q_min,
+                        q_max=q_max,
+                        eps=eps,
+                    )
                 batches.append(stats)
                 details.append(
                     {
-                        "window_size": int(window_details.window_size),
-                        "mean_window_residual_perp_norm": float(np.mean(window_details.window_residual_perp_norm)),
-                        "mean_window_delta_s": float(np.mean(window_details.window_delta_s)),
-                        "mean_window_effective_order": float(np.mean(window_details.window_effective_order)),
+                        "window_size": int(replay_details.window_size),
+                        "mean_window_residual_perp_norm": float(np.mean(replay_details.window_residual_perp_norm)),
+                        "mean_window_delta_s": float(np.mean(replay_details.window_delta_s)),
+                        "mean_window_effective_order": float(np.mean(replay_details.window_effective_order)),
                     }
                 )
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-    if coarse_grid_reference is None:
-        raise RuntimeError("No PNDM trajectory-window calibration batches were collected.")
+    if grid_reference is None:
+        raise RuntimeError("No PNDM anchored replay calibration batches were collected.")
     stats = concatenate_fp_clock_stats(batches)
     detail_meta = {
-        "window_size": active_window,
+        "anchor_nfe": int(anchor_nfe),
+        "window_size": int(active_window),
+        "window_len": int(active_window),
         "solver_order": int(spec.solver_order),
         "coordinate_domain": active_domain,
-        "multires_nfes": list(nfes),
-        "trajectory_window_batch_summaries": details,
+        "native_coordinate": active_domain,
+        "replay_backend": (
+            "velocity_quarter_anchor"
+            if normalized_solver == "euler"
+            else "ddim_continuous_quarter_anchor"
+            if normalized_solver == "ddim"
+            else "scheduler_history_quarter_anchor"
+        ),
+        "reference_path": (
+            "quarter_refined_velocity"
+            if normalized_solver == "euler"
+            else "quarter_refined_ddim"
+            if normalized_solver == "ddim"
+            else "quarter_refined_target_scheduler"
+        ),
+        "q_estimator": "full_l2_replay_ratio",
+        "residual_metric": "frenet_normal_replay_residual",
+        "multistep_history_aware": bool(normalized_solver not in {"euler", "ddim"}),
+        "anchored_replay_batch_summaries": details,
+        "calibration_cost_per_sample": int(cost_per_sample or 0),
     }
-    return coarse_grid_reference, stats, detail_meta
+    return grid_reference, stats, detail_meta
 
 
 def collect_stork_refinement_stats_stateful(
@@ -1921,6 +2666,41 @@ def _run_budgeted_heun(
     return ((image.clamp(-1, 1) + 1) / 2).cpu()
 
 
+def _run_custom_ddim(
+    *,
+    model: torch.nn.Module,
+    scheduler,
+    latents: torch.Tensor,
+    schedule_bundle: ScheduleBundle,
+) -> torch.Tensor:
+    if schedule_bundle.time_grid is None:
+        raise ValueError("Custom DDIM execution requires a full time_grid.")
+    time_grid = np.asarray(schedule_bundle.time_grid, dtype=np.float64)
+    if time_grid.ndim != 1 or len(time_grid) < 2:
+        raise ValueError("Custom DDIM time_grid must contain at least two nodes.")
+    if np.any(np.diff(time_grid) >= 0.0):
+        raise ValueError("Custom DDIM time_grid must be strictly descending.")
+    model_output_type = str(
+        schedule_bundle.meta.get(
+            "clock_model_output_type",
+            schedule_bundle.meta.get("model_output_type", getattr(scheduler.config, "prediction_type", "epsilon")),
+        )
+    )
+    scheduler.num_inference_steps = len(time_grid) - 1
+    scheduler.timesteps = torch.from_numpy(time_grid[:-1].astype(np.float32)).to(device=latents.device)
+    image = latents
+    for index in range(len(time_grid) - 1):
+        image = _ddim_step_between_timesteps(
+            model,
+            scheduler,
+            image,
+            float(time_grid[index]),
+            float(time_grid[index + 1]),
+            model_output_type=model_output_type,
+        )
+    return ((image.clamp(-1, 1) + 1) / 2).cpu()
+
+
 class PndmGenerationPipeline:
     def __init__(self, model: torch.nn.Module, scheduler) -> None:
         self.model = model
@@ -1956,6 +2736,14 @@ class PndmGenerationPipeline:
         init_noise_sigma = getattr(self.scheduler, "init_noise_sigma", None)
         if init_noise_sigma is not None:
             latents = latents * torch.as_tensor(init_noise_sigma, device=device, dtype=latents.dtype)
+
+        if isinstance(self.scheduler, DDIMScheduler) and schedule_bundle is not None:
+            return _run_custom_ddim(
+                model=self.model,
+                scheduler=self.scheduler,
+                latents=latents,
+                schedule_bundle=schedule_bundle,
+            )
 
         image = latents
         for timestep in self.scheduler.timesteps:

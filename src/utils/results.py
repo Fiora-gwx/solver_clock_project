@@ -25,6 +25,7 @@ SUMMARY_FIELDNAMES: tuple[str, ...] = (
     "metric_name",
     "metric_value",
     "fid",
+    "kid",
     "clip_score",
     "image_reward",
     "status",

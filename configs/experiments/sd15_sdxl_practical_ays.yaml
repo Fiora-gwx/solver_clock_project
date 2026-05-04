@@ -2,7 +2,7 @@ name: sd15_sdxl_practical_ays
 backend: diffusers
 base_config:
   prompt_asset: diffusers_practical_prompts
-  seeds: [0, 1, 2]
+  seeds: [0]
   num_gpus: 4
   prepare_schedules_first: true
   materialize_schedules: false
@@ -15,5 +15,6 @@ solvers:
 schedules:
   - base
   - AYS
+  - FP_CLOCK
 eval_nfes: [10]
 metrics: [clipscore, imagereward]
