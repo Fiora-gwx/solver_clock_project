@@ -9,7 +9,7 @@ import numpy as np
 from src.utils.schedule_bundle import ScheduleBundle
 
 from .config import repo_path
-from .schedules import GOES_SCHEDULE_IMPLEMENTATION_VERSION
+from .schedules import GPDE_SCHEDULE_IMPLEMENTATION_VERSION, GOES_SCHEDULE_IMPLEMENTATION_VERSION
 from .verify import verify_schedule_payload
 
 
@@ -23,8 +23,9 @@ def schedule_json_to_bundle(
     path = repo_path(schedule_json)
     with path.open("r", encoding="utf-8") as handle:
         payload: dict[str, Any] = json.load(handle)
-    if payload.get("method") != "GOES":
-        raise ValueError("Expected a GOES schedule.json payload.")
+    method = str(payload.get("method", ""))
+    if method not in {"GPDE", "GOES"}:
+        raise ValueError("Expected a GPDE or GOES schedule.json payload.")
     verify_schedule_payload(payload)
     native = np.asarray(payload["native_schedule"], dtype=np.float64)
     if native.ndim != 1 or native.size < 2:
@@ -32,11 +33,13 @@ def schedule_json_to_bundle(
     target_nfe = int(payload["target_nfe"])
     if native.size != target_nfe + 1:
         raise ValueError(
-            f"GOES native_schedule should contain target_nfe + 1 nodes, got {native.size} for NFE {target_nfe}."
+            f"{method} native_schedule should contain target_nfe + 1 nodes, got {native.size} for NFE {target_nfe}."
         )
+    version = GPDE_SCHEDULE_IMPLEMENTATION_VERSION if method == "GPDE" else GOES_SCHEDULE_IMPLEMENTATION_VERSION
     meta = {
-        "schedule_family": "GOES",
-        "schedule_implementation_version": GOES_SCHEDULE_IMPLEMENTATION_VERSION,
+        "schedule_family": method,
+        "legacy_schedule_family_alias": "GOES" if method == "GPDE" else "",
+        "schedule_implementation_version": version,
         "backend": backend,
         "solver": solver or payload.get("solver", ""),
         "representation": representation,
@@ -47,7 +50,9 @@ def schedule_json_to_bundle(
         "metric": payload.get("metric", {}),
         "aggregation": payload.get("aggregation", ""),
         "edge_objective": payload.get("edge_objective", ""),
+        "monitor_objective": payload.get("monitor_objective", ""),
         "selected_edge_costs": payload.get("selected_edge_costs", []),
+        "selected_monitor_masses": payload.get("selected_monitor_masses", []),
         "schedule_hash": payload.get("schedule_hash", ""),
         "effective_nfe": target_nfe,
         "solver_steps": target_nfe,

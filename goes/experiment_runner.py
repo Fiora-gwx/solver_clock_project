@@ -13,14 +13,19 @@ import numpy as np
 from .aggregation import aggregation_label
 from .config import load_config, repo_path, stable_hash, write_config
 from .coordinate import make_coordinate_adapter
-from .dp_minimax import MinimaxPath, solve_minimax_schedule
-from .edge_evaluator import EdgeCostTable, ReplayMetrics, evaluate_edge_table, evaluate_replay_metrics
+from .edge_evaluator import ReplayMetrics, evaluate_replay_metrics
+from .gpde import (
+    default_q_for_solver,
+    evaluate_gpde_profile,
+    make_probe_grid,
+    make_probe_steps,
+    materialize_gpde_schedule,
+)
 from .logging_utils import dump_json, make_run_dir, maybe_write_nfe_quality_curve, maybe_write_plots, runtime_metadata, write_csv
 from .metrics import Metric, make_metric
 from .oracle import OracleData
 from .oracle_cache import OracleCacheResult, build_or_load_oracle
-from .replay_refinement import refine_schedule_blackbox
-from .schedules import save_schedule_outputs, schedule_payload
+from .schedules import gpde_schedule_payload, save_schedule_outputs
 from .toy import make_solver, make_toy_model
 from .verify import verify_schedule_payload
 
@@ -163,7 +168,7 @@ def _evaluate_common_schedules(
     coordinate = make_coordinate_adapter(config["coordinate"])
     uniform_schedule = np.linspace(coordinate.u_min, coordinate.u_max, target_nfe + 1, dtype=np.float64)
     schedules = {
-        "GOES": (goes_schedule, goes_hash),
+        "GPDE": (goes_schedule, goes_hash),
         "uniform_in_u": (uniform_schedule, stable_hash(uniform_schedule.tolist())),
     }
     calibration_rows: list[dict[str, Any]] = []
@@ -314,21 +319,34 @@ def _write_failure_cases(
     write_csv(rows, run_dir / "failure_cases.csv")
 
 
-def _save_edge_table(edge_table: EdgeCostTable, run_dir: Path) -> None:
+def _save_probe_profile(profile: Any, run_dir: Path) -> None:
     np.savez_compressed(
-        run_dir / "edge_costs.npz",
-        candidate_grid=edge_table.candidate_grid,
-        edge_costs=edge_table.edge_costs,
-        per_sample_costs=edge_table.per_sample_costs,
-        fallback_counts=edge_table.fallback_counts,
+        run_dir / "probe_defects.npz",
+        probe_grid=profile.probe_grid,
+        probe_steps=profile.probe_steps,
+        defects=profile.defects,
+        coefficient_per_sample=profile.coefficient_per_sample,
+        aggregate_coefficient=profile.aggregate_coefficient,
+        monitor_density=profile.monitor_density,
+        fallback_counts=profile.fallback_counts,
     )
-
-
-def _path_from_indices(edge_costs: np.ndarray, indices: list[int]) -> MinimaxPath:
-    selected = [float(edge_costs[start, end]) for start, end in zip(indices[:-1], indices[1:])]
-    objective = float(np.max(selected)) if selected else 0.0
-    total_cost = float(np.sum(selected)) if selected else 0.0
-    return MinimaxPath(indices=indices, objective=objective, total_cost=total_cost, edge_costs=selected)
+    rows = []
+    for index, u in enumerate(profile.probe_grid):
+        rows.append(
+            {
+                "probe_index": int(index),
+                "u": float(u),
+                "aggregate_coefficient": float(profile.aggregate_coefficient[index]),
+                "monitor_density": float(profile.monitor_density[index]),
+                "q_estimate": float(profile.q_estimate),
+            }
+        )
+    write_csv(
+        rows,
+        run_dir / "monitor_profile.csv",
+        ["probe_index", "u", "aggregate_coefficient", "monitor_density", "q_estimate"],
+    )
+    dump_json(profile.metadata, run_dir / "q_estimate.json")
 
 
 def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command: str = "search") -> dict[str, Any]:
@@ -345,62 +363,55 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
     oracle_result = build_or_load_oracle(config, split_section="calibration")
     heldout_result = build_or_load_oracle(config, split_section="heldout")
     metric = make_metric(config["metric"], oracle=oracle_result.oracle, coordinate=coordinate)
-    candidate_grid = coordinate.candidate_grid(
-        int(config["candidate_grid"]["size"]),
-        str(config["candidate_grid"].get("type", "uniform_in_u")),
+    probe_config = config.get("probe_grid") or config.get("candidate_grid", {})
+    probe_size = int(probe_config.get("size", config.get("candidate_grid", {}).get("size", 64)))
+    probe_grid = make_probe_grid(coordinate.u_min, coordinate.u_max, probe_size)
+    probe_steps = make_probe_steps(
+        u_min=coordinate.u_min,
+        u_max=coordinate.u_max,
+        probe_grid_size=probe_size,
+        multipliers=config.get("probe_steps", {}).get("multipliers", [1.0, 2.0, 4.0]),
+        absolute_steps=config.get("probe_steps", {}).get("absolute"),
     )
-    edge_started = time.time()
-    edge_table = evaluate_edge_table(
+    profile_started = time.time()
+    profile = evaluate_gpde_profile(
         solver,
         oracle_result.oracle,
-        candidate_grid,
+        probe_grid,
+        probe_steps,
         metric,
         rho=float(config["mixed_defect"]["rho"]),
         aggregation=config["aggregation"],
+        q_mode=str(config.get("q_estimation", {}).get("mode", "global_fit")),
+        fixed_q=config.get("q_estimation", {}).get("fixed_q"),
+        default_q=default_q_for_solver(solver.name),
+        min_q=float(config.get("q_estimation", {}).get("min_q", 0.25)),
+        max_q=float(config.get("q_estimation", {}).get("max_q", 12.0)),
+        coefficient_floor=float(config.get("monitor", {}).get("epsilon_a", 1.0e-12)),
+        monitor_smoothing_window=int(config.get("monitor", {}).get("smoothing_window", 3)),
+        monitor_exponent=str(config.get("monitor", {}).get("exponent", "q_root")),
         eps=float(config["mixed_defect"].get("eps", 1.0e-12)),
         fallback_full_residual_on_tiny_tangent=bool(
             config["mixed_defect"].get("fallback_full_residual_on_tiny_tangent", True)
         ),
     )
-    edge_seconds = time.time() - edge_started
-    dp_started = time.time()
-    path = solve_minimax_schedule(
-        edge_table.edge_costs,
+    profile_seconds = time.time() - profile_started
+    search_started = time.time()
+    admissible_grid = None
+    admissible_config = config.get("admissible_grid", {})
+    if bool(admissible_config.get("enabled", False)):
+        admissible_size = int(admissible_config.get("size") or max(probe_size, int(config["solver"]["target_nfe"]) + 1))
+        admissible_grid = make_probe_grid(coordinate.u_min, coordinate.u_max, admissible_size)
+    schedule = materialize_gpde_schedule(
+        profile.probe_grid,
+        profile.monitor_density,
         int(config["solver"]["target_nfe"]),
-        tie_break_sum_cost=bool(config["optimizer"].get("tie_break_sum_cost", True)),
-        tie_tolerance=float(config["optimizer"].get("tie_tolerance", 1.0e-12)),
+        admissible_grid=admissible_grid,
     )
-    dp_seconds = time.time() - dp_started
-    u_schedule = candidate_grid[path.indices]
+    search_seconds = time.time() - search_started
+    u_schedule = schedule.u_schedule
 
-    refinement_history: list[dict[str, float]] = []
-    pre_refinement_path: MinimaxPath | None = None
-    if bool(config.get("replay_refinement", {}).get("enabled", False)):
-        pre_refinement_path = path
-        refinement = refine_schedule_blackbox(
-            solver,
-            oracle_result.oracle,
-            u_schedule,
-            candidate_grid,
-            metric,
-            rho=float(config["mixed_defect"]["rho"]),
-            aggregation=config["aggregation"],
-            rounds=int(config["replay_refinement"].get("rounds", 3)),
-            local_window=int(config["replay_refinement"].get("local_window", 8)),
-            lambda_final=float(config["replay_refinement"].get("lambda_final", 0.0)),
-            mu_smooth=float(config["replay_refinement"].get("mu_smooth", 0.0)),
-            fallback_full_residual_on_tiny_tangent=bool(
-                config["mixed_defect"].get("fallback_full_residual_on_tiny_tangent", True)
-            ),
-        )
-        u_schedule = refinement.u_schedule
-        refinement_history = refinement.history
-        path = _path_from_indices(
-            edge_table.edge_costs,
-            [int(np.argmin(np.abs(candidate_grid - item))) for item in u_schedule],
-        )
-
-    payload = schedule_payload(
+    payload = gpde_schedule_payload(
         solver_name=solver.name,
         target_nfe=int(config["solver"]["target_nfe"]),
         coordinate=coordinate,
@@ -409,15 +420,19 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
         metric_metadata=metric.metadata(),
         aggregation_config=config["aggregation"],
         oracle_cache_key=oracle_result.cache_key,
-        path=path,
+        profile_metadata=profile.metadata,
+        schedule_metadata=schedule.metadata,
+        selected_indices=schedule.selected_indices,
+        interval_monitor_masses=schedule.interval_monitor_masses,
+        snap_errors=schedule.snap_errors,
     )
     save_schedule_outputs(
         run_dir,
         payload=payload,
-        selected_indices=path.indices,
-        selected_edge_costs=path.edge_costs,
+        selected_indices=schedule.selected_indices,
+        selected_edge_costs=schedule.interval_monitor_masses,
     )
-    _save_edge_table(edge_table, run_dir)
+    _save_probe_profile(profile, run_dir)
     config_resolved_path = write_config(config, run_dir / "config.resolved.yaml")
     dump_json(oracle_result.oracle.metadata, run_dir / "oracle_metadata.json")
 
@@ -438,8 +453,8 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
         heldout_oracle=heldout_result.oracle,
         goes_schedule=u_schedule,
         uniform_schedule=uniform_schedule,
-        edge_objective=path.objective,
-        tiny_tangent_fallback_fraction=edge_table.fallback_fraction,
+        edge_objective=schedule.objective,
+        tiny_tangent_fallback_fraction=profile.fallback_fraction,
     )
     metric_fields = [
         "split",
@@ -472,9 +487,9 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
                 "rho": float(config["mixed_defect"]["rho"]),
                 "metric": metric.metadata()["name"],
                 "aggregation": aggregation_label(config["aggregation"]),
-                "edge_objective": path.objective,
+                "edge_objective": schedule.objective,
                 "heldout_final_latent_mse": next(
-                    row["final_latent_mse"] for row in heldout_rows if row["schedule"] == "GOES"
+                    row["final_latent_mse"] for row in heldout_rows if row["schedule"] == "GPDE"
                 ),
             }
         ],
@@ -489,8 +504,8 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
                 "separate_oracle_builds": 1,
                 "oracle_loaded_from_cache": oracle_result.loaded_from_cache,
                 "oracle_build_or_load_seconds": oracle_result.elapsed_seconds,
-                "edge_evaluation_seconds": edge_seconds,
-                "search_dp_seconds": dp_seconds,
+                "probe_evaluation_seconds": profile_seconds,
+                "search_seconds": search_seconds,
             }
         ],
         run_dir / "paper_tables" / "oracle_reuse_cost.csv",
@@ -499,10 +514,8 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
     if bool(config.get("output", {}).get("save_plots", True)):
         plots_written = maybe_write_plots(
             run_dir,
-            candidate_grid=candidate_grid,
-            edge_costs=edge_table.edge_costs,
             u_schedule=u_schedule,
-            selected_edge_costs=np.asarray(path.edge_costs, dtype=np.float64),
+            selected_edge_costs=np.asarray(schedule.interval_monitor_masses, dtype=np.float64),
         )
     else:
         plots_written = []
@@ -522,13 +535,14 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
         "heldout_oracle_cache_key": heldout_result.cache_key,
         "heldout_oracle_build_or_load_seconds": heldout_result.elapsed_seconds,
         "heldout_oracle_loaded_from_cache": heldout_result.loaded_from_cache,
-        "edge_evaluation_seconds": edge_seconds,
-        "dp_seconds": dp_seconds,
+        "probe_evaluation_seconds": profile_seconds,
+        "search_seconds": search_seconds,
         "total_seconds": time.time() - started,
-        "edge_table": edge_table.metadata,
+        "probe_profile": profile.metadata,
+        "schedule_materialization": schedule.metadata,
         "mixed_defect": {
             "rho": float(config["mixed_defect"]["rho"]),
-            "tiny_tangent_fallback_fraction": edge_table.fallback_fraction,
+            "tiny_tangent_fallback_fraction": profile.fallback_fraction,
         },
         "baselines": {
             "run": ["uniform_in_u"],
@@ -553,9 +567,9 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
         "heldout_noise_seeds": heldout_result.oracle.metadata.get("noise_seeds"),
         "schedule_hash": payload["schedule_hash"],
         "plots_written": plots_written,
-        "refinement_history": refinement_history,
-        "pre_refinement_edge_objective": None if pre_refinement_path is None else pre_refinement_path.objective,
-        "pre_refinement_schedule_indices": None if pre_refinement_path is None else pre_refinement_path.indices,
+        "refinement_history": [],
+        "pre_refinement_edge_objective": None,
+        "pre_refinement_schedule_indices": None,
     }
     dump_json(run_metadata, run_dir / "run_metadata.json")
     return {
@@ -643,7 +657,7 @@ def evaluate_command(config: dict[str, Any], schedule_path: str | Path) -> dict[
     )
     row = _metrics_row(
         split="heldout",
-        schedule_name=schedule.get("method", "GOES"),
+        schedule_name=schedule.get("method", "GPDE"),
         solver_name=solver.name,
         target_nfe=int(config["solver"]["target_nfe"]),
         metrics=metrics,
@@ -730,8 +744,8 @@ def ablate_rho_command(config: dict[str, Any], values: list[float]) -> dict[str,
         cfg["mixed_defect"]["rho"] = float(rho)
         subdir = run_dir / f"rho_{rho:g}"
         result = _search_once(cfg, subdir, command="ablate_rho")
-        goes_row = next(row for row in result["heldout_rows"] if row["schedule"] == "GOES")
-        calibration_row = next(row for row in result["calibration_rows"] if row["schedule"] == "GOES")
+        goes_row = next(row for row in result["heldout_rows"] if row["schedule"] == "GPDE")
+        calibration_row = next(row for row in result["calibration_rows"] if row["schedule"] == "GPDE")
         rows.append(
             {
                 "ablation": "rho",
@@ -767,8 +781,8 @@ def ablate_metric_command(config: dict[str, Any], values: list[str]) -> dict[str
         cfg["metric"]["name"] = metric_name
         subdir = run_dir / f"metric_{metric_name}"
         result = _search_once(cfg, subdir, command="ablate_metric")
-        goes_row = next(row for row in result["heldout_rows"] if row["schedule"] == "GOES")
-        calibration_row = next(row for row in result["calibration_rows"] if row["schedule"] == "GOES")
+        goes_row = next(row for row in result["heldout_rows"] if row["schedule"] == "GPDE")
+        calibration_row = next(row for row in result["calibration_rows"] if row["schedule"] == "GPDE")
         rows.append(
             {
                 "ablation": "metric",
@@ -800,7 +814,7 @@ def oracle_convergence_command(config: dict[str, Any], values: list[int]) -> dic
     run_dir = make_run_dir(config, "oracle_convergence")
     rows: list[dict[str, Any]] = []
     schedules: dict[int, np.ndarray] = {}
-    edge_costs: dict[int, np.ndarray] = {}
+    monitor_profiles: dict[int, np.ndarray] = {}
     for ref_nfe in values:
         cfg = copy.deepcopy(config)
         cfg["oracle"]["ref_nfe"] = int(ref_nfe)
@@ -809,9 +823,9 @@ def oracle_convergence_command(config: dict[str, Any], values: list[int]) -> dic
         result = _search_once(cfg, subdir, command="oracle_convergence")
         schedule = np.asarray(result["schedule"]["u_schedule"], dtype=np.float64)
         schedules[int(ref_nfe)] = schedule
-        with np.load(subdir / "edge_costs.npz") as payload:
-            edge_costs[int(ref_nfe)] = payload["edge_costs"]
-        goes_row = next(row for row in result["heldout_rows"] if row["schedule"] == "GOES")
+        with np.load(subdir / "probe_defects.npz") as payload:
+            monitor_profiles[int(ref_nfe)] = payload["monitor_density"]
+        goes_row = next(row for row in result["heldout_rows"] if row["schedule"] == "GPDE")
         rows.append(
             {
                 "ref_nfe": int(ref_nfe),
@@ -827,22 +841,22 @@ def oracle_convergence_command(config: dict[str, Any], values: list[int]) -> dic
         )
     highest = max(values)
     reference_schedule = schedules[highest]
-    reference_edges = edge_costs[highest]
+    reference_monitor = monitor_profiles[highest]
     for row in rows:
         ref_nfe = int(row["ref_nfe"])
         row["schedule_l1_to_highest_ref"] = float(np.mean(np.abs(schedules[ref_nfe] - reference_schedule)))
-        finite = np.isfinite(edge_costs[ref_nfe]) & np.isfinite(reference_edges)
+        finite = np.isfinite(monitor_profiles[ref_nfe]) & np.isfinite(reference_monitor)
         if np.count_nonzero(finite) > 1:
-            row["edge_cost_correlation_to_highest_ref"] = float(
-                np.corrcoef(edge_costs[ref_nfe][finite], reference_edges[finite])[0, 1]
+            row["monitor_correlation_to_highest_ref"] = float(
+                np.corrcoef(monitor_profiles[ref_nfe][finite], reference_monitor[finite])[0, 1]
             )
-            row["edge_cost_rank_correlation_to_highest_ref"] = _rank_correlation(
-                edge_costs[ref_nfe][finite],
-                reference_edges[finite],
+            row["monitor_rank_correlation_to_highest_ref"] = _rank_correlation(
+                monitor_profiles[ref_nfe][finite],
+                reference_monitor[finite],
             )
         else:
-            row["edge_cost_correlation_to_highest_ref"] = ""
-            row["edge_cost_rank_correlation_to_highest_ref"] = ""
+            row["monitor_correlation_to_highest_ref"] = ""
+            row["monitor_rank_correlation_to_highest_ref"] = ""
     write_csv(rows, run_dir / "paper_tables" / "oracle_convergence.csv")
     _write_top_level_run_metadata(
         config,
@@ -861,7 +875,10 @@ def nfe_sweep_command(config: dict[str, Any], values: list[int]) -> dict[str, An
     for nfe in values:
         cfg = copy.deepcopy(config)
         cfg["solver"]["target_nfe"] = int(nfe)
-        cfg["candidate_grid"]["size"] = max(int(cfg["candidate_grid"]["size"]), int(nfe))
+        cfg.setdefault("probe_grid", {})["size"] = max(
+            int(cfg.get("probe_grid", {}).get("size", cfg.get("candidate_grid", {}).get("size", 64))),
+            int(nfe) + 1,
+        )
         subdir = run_dir / f"nfe_{nfe}"
         result = _search_once(cfg, subdir, command="nfe_sweep")
         for row in result["heldout_rows"]:
@@ -869,8 +886,8 @@ def nfe_sweep_command(config: dict[str, Any], values: list[int]) -> dict[str, An
                 {
                     **row,
                     "total_seconds": result["run_metadata"]["total_seconds"],
-                    "edge_evaluation_seconds": result["run_metadata"]["edge_evaluation_seconds"],
-                    "search_dp_seconds": result["run_metadata"]["dp_seconds"],
+                    "probe_evaluation_seconds": result["run_metadata"]["probe_evaluation_seconds"],
+                    "search_seconds": result["run_metadata"]["search_seconds"],
                     "run_dir": result["run_dir"],
                 }
             )
@@ -900,8 +917,8 @@ def calibration_size_ablation_command(config: dict[str, Any], values: list[int])
         cfg["calibration"]["num_samples"] = int(size)
         subdir = run_dir / f"calibration_k_{size}"
         result = _search_once(cfg, subdir, command="calibration_size")
-        goes_row = next(row for row in result["heldout_rows"] if row["schedule"] == "GOES")
-        calibration_row = next(row for row in result["calibration_rows"] if row["schedule"] == "GOES")
+        goes_row = next(row for row in result["heldout_rows"] if row["schedule"] == "GPDE")
+        calibration_row = next(row for row in result["calibration_rows"] if row["schedule"] == "GPDE")
         schedules[int(size)] = np.asarray(result["schedule"]["u_schedule"], dtype=np.float64)
         rows.append(
             {
@@ -942,22 +959,22 @@ def candidate_grid_ablation_command(config: dict[str, Any], values: list[int]) -
     schedules: dict[int, np.ndarray] = {}
     for size in values:
         cfg = copy.deepcopy(config)
-        cfg["candidate_grid"]["size"] = max(int(size), int(cfg["solver"]["target_nfe"]))
+        cfg.setdefault("probe_grid", {})["size"] = max(int(size), int(cfg["solver"]["target_nfe"]) + 1)
         subdir = run_dir / f"candidate_grid_{size}"
         result = _search_once(cfg, subdir, command="candidate_grid")
-        goes_row = next(row for row in result["heldout_rows"] if row["schedule"] == "GOES")
-        actual_size = int(cfg["candidate_grid"]["size"])
+        goes_row = next(row for row in result["heldout_rows"] if row["schedule"] == "GPDE")
+        actual_size = int(cfg["probe_grid"]["size"])
         schedules[actual_size] = np.asarray(result["schedule"]["u_schedule"], dtype=np.float64)
         rows.append(
             {
-                "ablation": "candidate_grid",
-                "candidate_grid_size": actual_size,
+                "ablation": "probe_grid",
+                "probe_grid_size": actual_size,
                 "solver": cfg["solver"]["name"],
                 "nfe": int(cfg["solver"]["target_nfe"]),
                 "edge_objective": result["schedule"]["edge_objective"],
                 "heldout_final_latent_mse": goes_row["final_latent_mse"],
-                "edge_evaluation_seconds": result["run_metadata"]["edge_evaluation_seconds"],
-                "search_dp_seconds": result["run_metadata"]["dp_seconds"],
+                "probe_evaluation_seconds": result["run_metadata"]["probe_evaluation_seconds"],
+                "search_seconds": result["run_metadata"]["search_seconds"],
                 "total_seconds": result["run_metadata"]["total_seconds"],
                 "schedule_hash": result["schedule"]["schedule_hash"],
                 "run_dir": result["run_dir"],
@@ -966,9 +983,9 @@ def candidate_grid_ablation_command(config: dict[str, Any], values: list[int]) -
     largest = max(schedules)
     reference_schedule = schedules[largest]
     for row in rows:
-        size = int(row["candidate_grid_size"])
-        row["schedule_l1_to_largest_candidate_grid"] = float(np.mean(np.abs(schedules[size] - reference_schedule)))
-    write_csv(rows, run_dir / "paper_tables" / "candidate_grid_ablation.csv")
+        size = int(row["probe_grid_size"])
+        row["schedule_l1_to_largest_probe_grid"] = float(np.mean(np.abs(schedules[size] - reference_schedule)))
+    write_csv(rows, run_dir / "paper_tables" / "probe_grid_ablation.csv")
     _write_top_level_run_metadata(
         config,
         run_dir,
@@ -1008,8 +1025,8 @@ def cross_solver_reuse_command(config: dict[str, Any], solvers: list[str]) -> di
                     "separate_oracle_builds": len(solvers),
                     "shared_oracle_build_or_load_seconds": oracle_result.elapsed_seconds,
                     "solver_oracle_build_or_load_seconds": "",
-                    "edge_evaluation_seconds": "",
-                    "search_dp_seconds": "",
+                    "probe_evaluation_seconds": "",
+                    "search_seconds": "",
                     "total_solver_search_seconds": "",
                     "edge_objective": "",
                     "heldout_final_latent_mse": "",
@@ -1017,7 +1034,7 @@ def cross_solver_reuse_command(config: dict[str, Any], solvers: list[str]) -> di
                 }
             )
             continue
-        goes_row = next(row for row in result["heldout_rows"] if row["schedule"] == "GOES")
+        goes_row = next(row for row in result["heldout_rows"] if row["schedule"] == "GPDE")
         run_metadata = result["run_metadata"]
         rows.append(
             {
@@ -1031,8 +1048,8 @@ def cross_solver_reuse_command(config: dict[str, Any], solvers: list[str]) -> di
                 "separate_oracle_builds": len(solvers),
                 "shared_oracle_build_or_load_seconds": oracle_result.elapsed_seconds,
                 "solver_oracle_build_or_load_seconds": run_metadata["oracle_build_or_load_seconds"],
-                "edge_evaluation_seconds": run_metadata["edge_evaluation_seconds"],
-                "search_dp_seconds": run_metadata["dp_seconds"],
+                "probe_evaluation_seconds": run_metadata["probe_evaluation_seconds"],
+                "search_seconds": run_metadata["search_seconds"],
                 "total_solver_search_seconds": run_metadata["total_seconds"],
                 "edge_objective": result["schedule"]["edge_objective"],
                 "heldout_final_latent_mse": goes_row["final_latent_mse"],
@@ -1053,11 +1070,11 @@ def cross_solver_reuse_command(config: dict[str, Any], solvers: list[str]) -> di
             row["estimated_shared_total_solver_seconds"] = ""
             row["estimated_separate_total_solver_seconds"] = ""
             continue
-        edge_seconds = float(row["edge_evaluation_seconds"])
-        dp_seconds = float(row["search_dp_seconds"])
+        probe_seconds = float(row["probe_evaluation_seconds"])
+        search_seconds = float(row["search_seconds"])
         row["shared_oracle_amortized_build_or_load_seconds"] = shared_oracle_amortized_seconds
-        row["estimated_shared_total_solver_seconds"] = shared_oracle_amortized_seconds + edge_seconds + dp_seconds
-        row["estimated_separate_total_solver_seconds"] = shared_oracle_seconds + edge_seconds + dp_seconds
+        row["estimated_shared_total_solver_seconds"] = shared_oracle_amortized_seconds + probe_seconds + search_seconds
+        row["estimated_separate_total_solver_seconds"] = shared_oracle_seconds + probe_seconds + search_seconds
     write_csv(rows, run_dir / "paper_tables" / "oracle_reuse_cost.csv")
     _write_top_level_run_metadata(
         config,
@@ -1074,11 +1091,11 @@ def cross_solver_reuse_command(config: dict[str, Any], solvers: list[str]) -> di
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="GOES experiment runner")
+    parser = argparse.ArgumentParser(description="GPDE experiment runner")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_config_arg(subparser: argparse.ArgumentParser) -> None:
-        subparser.add_argument("--config", required=True, help="Path to a GOES YAML/JSON config.")
+        subparser.add_argument("--config", required=True, help="Path to a GPDE YAML/JSON config.")
 
     for name in [
         "build-oracle",
@@ -1089,6 +1106,7 @@ def main(argv: list[str] | None = None) -> None:
         "nfe-sweep",
         "calibration-size-ablation",
         "candidate-grid-ablation",
+        "probe-grid-ablation",
         "cross-solver-reuse",
     ]:
         sub = subparsers.add_parser(name)
@@ -1103,8 +1121,8 @@ def main(argv: list[str] | None = None) -> None:
             sub.add_argument("--values", default=None, help="Comma-separated target NFE values.")
         elif name == "calibration-size-ablation":
             sub.add_argument("--values", default=None, help="Comma-separated calibration sample counts.")
-        elif name == "candidate-grid-ablation":
-            sub.add_argument("--values", default=None, help="Comma-separated candidate grid sizes.")
+        elif name in {"candidate-grid-ablation", "probe-grid-ablation"}:
+            sub.add_argument("--values", default=None, help="Comma-separated probe grid sizes.")
         elif name == "cross-solver-reuse":
             sub.add_argument("--solvers", default=None, help="Comma-separated solver names.")
 
@@ -1135,7 +1153,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "calibration-size-ablation":
         values = _sweep_values(args.values, [4, 8, 16, 32, 64, 128], int)
         result = calibration_size_ablation_command(config, values)
-    elif args.command == "candidate-grid-ablation":
+    elif args.command in {"candidate-grid-ablation", "probe-grid-ablation"}:
         values = _sweep_values(args.values, [64, 128, 256, 512, 1024], int)
         result = candidate_grid_ablation_command(config, values)
     elif args.command == "cross-solver-reuse":

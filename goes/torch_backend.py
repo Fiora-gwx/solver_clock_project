@@ -33,6 +33,13 @@ def _array_hash(values: np.ndarray) -> str:
     return digest.hexdigest()[:16]
 
 
+def _tensor_to_numpy(values: torch.Tensor) -> np.ndarray:
+    tensor = values.detach().cpu()
+    if tensor.dtype == torch.bfloat16:
+        tensor = tensor.float()
+    return tensor.numpy()
+
+
 def _microbatch_velocity(
     velocity_fn: VelocityFn,
     sample: torch.Tensor,
@@ -133,8 +140,8 @@ def build_torch_velocity_oracle(
             tangents.append(tangent.detach().clone())
         tangents_by_node = torch.stack(tangents, dim=0)
 
-    states = states_by_node.detach().cpu().numpy().transpose((1, 0) + tuple(range(2, states_by_node.ndim)))
-    tangent_values = tangents_by_node.detach().cpu().numpy().transpose(
+    states = _tensor_to_numpy(states_by_node).transpose((1, 0) + tuple(range(2, states_by_node.ndim)))
+    tangent_values = _tensor_to_numpy(tangents_by_node).transpose(
         (1, 0) + tuple(range(2, tangents_by_node.ndim))
     )
     batch = initial_sample.shape[0]
@@ -153,13 +160,14 @@ def build_torch_velocity_oracle(
     payload = dict(metadata)
     payload.update(
         {
-            "method": "GOES",
+            "method": "GPDE",
+            "legacy_method_alias": "GOES",
             "ref_integrator": str(ref_integrator),
             "interpolation": "linear",
             "ref_nfe": int(ref_nfe),
             "ref_grid_size": int(len(grid)),
             "ref_grid_hash": stable_hash(grid.tolist()),
-            "initial_noise_hash": _array_hash(initial_sample.detach().cpu().numpy()),
+            "initial_noise_hash": _array_hash(_tensor_to_numpy(initial_sample)),
             "condition_split_hash": _array_hash(np.asarray(conditions_array)),
             "noise_seed_hash": stable_hash(noise_seed_array.tolist()),
             "noise_seeds": [int(item) for item in noise_seed_array.tolist()],
@@ -219,7 +227,7 @@ def build_or_load_torch_velocity_oracle(
             "ref_nfe": int(ref_nfe),
             "ref_grid_size": int(len(grid)),
             "ref_grid_hash": stable_hash(grid.tolist()),
-            "initial_noise_hash": _array_hash(initial_sample.detach().cpu().numpy()),
+            "initial_noise_hash": _array_hash(_tensor_to_numpy(initial_sample)),
             "condition_split_hash": _array_hash(conditions_array),
             "noise_seed_hash": stable_hash(noise_seed_array.tolist()),
             "dtype": str(initial_sample.dtype).replace("torch.", ""),
@@ -273,7 +281,7 @@ class TorchStepSolver:
         sample = torch.as_tensor(x_a, device=self.device, dtype=self.dtype)
         with torch.no_grad():
             result = _call_step(self.step_fn, sample, float(a), float(b), 0, sample.shape[0])
-        return result.detach().cpu().numpy()
+        return _tensor_to_numpy(result)
 
     def compatibility_metadata(self) -> dict[str, Any]:
         return {

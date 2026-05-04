@@ -1,4 +1,4 @@
-method: goes
+method: gpde
 model:
   name: toy_flow
   checkpoint: null
@@ -27,9 +27,12 @@ heldout:
   num_samples: 8
   seed: 456
   split: heldout
-candidate_grid:
+probe_grid:
   size: 64
   type: uniform_in_u
+probe_steps:
+  multipliers: [1.0, 2.0, 4.0]
+  absolute: null
 solver:
   name: euler
   target_nfe: 10
@@ -45,13 +48,24 @@ mixed_defect:
   eps: 1.0e-12
   fallback_full_residual_on_tiny_tangent: true
 aggregation:
-  name: trimmed_mean
+  name: cvar
   trim_ratio: 0.10
   alpha: 0.80
 optimizer:
-  name: dp_minimax
-  tie_break_sum_cost: true
-  tie_tolerance: 1.0e-12
+  name: monitor_inverse_cdf
+q_estimation:
+  mode: global_fit
+  fixed_q: null
+  min_q: 0.25
+  max_q: 12.0
+monitor:
+  epsilon_a: 1.0e-12
+  smoothing_window: 3
+  exponent: q_root
+admissible_grid:
+  enabled: false
+  size: null
+  type: uniform_in_u
 replay_refinement:
   enabled: false
   rounds: 3
@@ -61,7 +75,7 @@ replay_refinement:
   mu_smooth: 0.0
 output:
   root: ./outputs/goes
-  save_edge_table: true
+  save_probe_profile: true
   save_schedule: true
   save_images: false
   save_plots: true

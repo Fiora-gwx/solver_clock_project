@@ -1,4 +1,4 @@
-method: goes
+method: gpde
 solver:
   name: euler
   target_nfe: 10

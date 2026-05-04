@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "method": "goes",
+    "method": "gpde",
     "model": {
         "name": "toy_flow",
         "checkpoint": None,
@@ -50,6 +50,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "size": 64,
         "type": "uniform_in_u",
     },
+    "probe_grid": {
+        "size": 64,
+        "type": "uniform_in_u",
+    },
+    "probe_steps": {
+        "multipliers": [1.0, 2.0, 4.0],
+        "absolute": None,
+    },
     "solver": {
         "name": "euler",
         "target_nfe": 10,
@@ -68,14 +76,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "fallback_full_residual_on_tiny_tangent": True,
     },
     "aggregation": {
-        "name": "trimmed_mean",
+        "name": "cvar",
         "trim_ratio": 0.10,
         "alpha": 0.80,
     },
     "optimizer": {
-        "name": "dp_minimax",
-        "tie_break_sum_cost": True,
-        "tie_tolerance": 1.0e-12,
+        "name": "monitor_inverse_cdf",
+    },
+    "q_estimation": {
+        "mode": "global_fit",
+        "fixed_q": None,
+        "min_q": 0.25,
+        "max_q": 12.0,
+    },
+    "monitor": {
+        "epsilon_a": 1.0e-12,
+        "smoothing_window": 3,
+        "exponent": "q_root",
+    },
+    "admissible_grid": {
+        "enabled": False,
+        "size": None,
+        "type": "uniform_in_u",
     },
     "replay_refinement": {
         "enabled": False,
@@ -87,7 +109,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "output": {
         "root": "./outputs/goes",
-        "save_edge_table": True,
+        "save_probe_profile": True,
         "save_schedule": True,
         "save_images": False,
         "save_plots": True,
@@ -139,8 +161,8 @@ def load_config(path: str | Path | None = None, overrides: dict[str, Any] | None
 
 
 def validate_config(config: dict[str, Any]) -> None:
-    if config.get("method") != "goes":
-        raise ValueError("GOES configs must set method: goes.")
+    if str(config.get("method")) not in {"gpde", "goes"}:
+        raise ValueError("GPDE configs must set method: gpde.")
     state_shape = tuple(int(item) for item in config["model"].get("state_shape", [2]))
     if not state_shape or any(dim < 1 for dim in state_shape):
         raise ValueError("model.state_shape must contain positive dimensions.")
@@ -151,7 +173,8 @@ def validate_config(config: dict[str, Any]) -> None:
     if eps <= 0.0:
         raise ValueError("mixed_defect.eps must be positive.")
     target_nfe = int(config["solver"]["target_nfe"])
-    candidate_size = int(config["candidate_grid"]["size"])
+    probe_grid = config.get("probe_grid") or config.get("candidate_grid", {})
+    probe_size = int(probe_grid.get("size", config.get("candidate_grid", {}).get("size", 64)))
     if target_nfe < 1:
         raise ValueError("solver.target_nfe must be positive.")
     solver_name = str(config["solver"].get("name", "euler"))
@@ -160,10 +183,10 @@ def validate_config(config: dict[str, Any]) -> None:
     solver_mode = str(config["solver"].get("mode", "one_step"))
     if solver_mode not in {"one_step", "blackbox_multistep"}:
         raise ValueError("solver.mode must be one_step or blackbox_multistep.")
-    if candidate_size < target_nfe:
-        raise ValueError("candidate_grid.size must be at least solver.target_nfe.")
-    if str(config["candidate_grid"].get("type", "uniform_in_u")) != "uniform_in_u":
-        raise ValueError("candidate_grid.type must be 'uniform_in_u' for the CPU GOES runner.")
+    if probe_size < target_nfe + 1:
+        raise ValueError("probe_grid.size must be at least solver.target_nfe + 1.")
+    if str(probe_grid.get("type", "uniform_in_u")) != "uniform_in_u":
+        raise ValueError("probe_grid.type must be 'uniform_in_u' for the CPU GPDE runner.")
     u_min = float(config["coordinate"]["u_min"])
     u_max = float(config["coordinate"]["u_max"])
     coordinate_name = str(config["coordinate"].get("name", "t"))
@@ -200,7 +223,7 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("metric min_weight/max_weight must be positive and ordered.")
     aggregation_name = str(config["aggregation"].get("name", "trimmed_mean"))
     if aggregation_name not in {"mean", "median", "trimmed_mean", "trimmed_mean_10pct", "trimmed_mean_10", "cvar"}:
-        raise ValueError("aggregation.name is not supported by GOES.")
+        raise ValueError("aggregation.name is not supported by GPDE.")
     if aggregation_name == "trimmed_mean":
         trim_ratio = float(config["aggregation"].get("trim_ratio", 0.1))
         if not 0.0 <= trim_ratio < 0.5:
@@ -209,10 +232,26 @@ def validate_config(config: dict[str, Any]) -> None:
         alpha = float(config["aggregation"].get("alpha", 0.8))
         if not 0.0 <= alpha < 1.0:
             raise ValueError("aggregation.alpha must satisfy 0 <= alpha < 1 for cvar.")
-    if str(config["optimizer"].get("name", "dp_minimax")) != "dp_minimax":
-        raise ValueError("optimizer.name must be 'dp_minimax'.")
-    if float(config["optimizer"].get("tie_tolerance", 1.0e-12)) < 0.0:
-        raise ValueError("optimizer.tie_tolerance must be nonnegative.")
+    if str(config["optimizer"].get("name", "monitor_inverse_cdf")) != "monitor_inverse_cdf":
+        raise ValueError("optimizer.name must be 'monitor_inverse_cdf'.")
+    q_config = config.get("q_estimation", {})
+    q_mode = str(q_config.get("mode", "global_fit"))
+    if q_mode not in {"global_fit", "fixed"}:
+        raise ValueError("q_estimation.mode must be global_fit or fixed.")
+    fixed_q = q_config.get("fixed_q")
+    if q_mode == "fixed" and (fixed_q is None or float(fixed_q) <= 0.0):
+        raise ValueError("q_estimation.fixed_q must be positive when mode is fixed.")
+    if float(q_config.get("min_q", 0.25)) <= 0.0:
+        raise ValueError("q_estimation.min_q must be positive.")
+    if float(q_config.get("max_q", 12.0)) < float(q_config.get("min_q", 0.25)):
+        raise ValueError("q_estimation.max_q must be >= min_q.")
+    monitor = config.get("monitor", {})
+    if float(monitor.get("epsilon_a", 1.0e-12)) <= 0.0:
+        raise ValueError("monitor.epsilon_a must be positive.")
+    if int(monitor.get("smoothing_window", 3)) < 1:
+        raise ValueError("monitor.smoothing_window must be positive.")
+    if str(monitor.get("exponent", "q_root")) not in {"q_root", "identity", "a", "coefficient"}:
+        raise ValueError("monitor.exponent is not supported.")
     if int(config["replay_refinement"].get("rounds", 3)) < 0:
         raise ValueError("replay_refinement.rounds must be nonnegative.")
     if int(config["replay_refinement"].get("local_window", 8)) < 1:
@@ -228,9 +267,9 @@ def validate_config(config: dict[str, Any]) -> None:
     if bool(output.get("save_images", False)):
         raise ValueError("output.save_images is not supported by the CPU GOES runner.")
     if not bool(output.get("save_schedule", True)):
-        raise ValueError("output.save_schedule must remain true because GOES schedule files are required outputs.")
-    if not bool(output.get("save_edge_table", True)):
-        raise ValueError("output.save_edge_table must remain true because GOES edge tables are required outputs.")
+        raise ValueError("output.save_schedule must remain true because GPDE schedule files are required outputs.")
+    if not bool(output.get("save_probe_profile", True)):
+        raise ValueError("output.save_probe_profile must remain true because GPDE probe profiles are required outputs.")
 
 
 def write_config(config: dict[str, Any], path: str | Path) -> Path:

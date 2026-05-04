@@ -158,7 +158,9 @@ def build_comparisons(schedules: set[str]) -> list[tuple[str, str]]:
     adaptive_schedules = sorted(
         schedule
         for schedule in schedules
-        if schedule == "GOES"
+        if schedule == "GPDE"
+        or schedule.startswith("GPDE[")
+        or schedule == "GOES"
         or schedule.startswith("GOES[")
         or schedule == "LEGACY_SADB"
         or schedule.startswith("LEGACY_SADB[")

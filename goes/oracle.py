@@ -141,7 +141,8 @@ def build_universal_oracle(
         ref_grid_size=int(ref_grid_size),
     )
     metadata = {
-        "method": "GOES",
+        "method": "GPDE",
+        "legacy_method_alias": "GOES",
         "model_identifier": model.identifier,
         "ode_sampler_family": "toy_deterministic_flow_ode",
         "coordinate_mapping": coordinate_metadata,

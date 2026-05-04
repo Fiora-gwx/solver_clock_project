@@ -1,0 +1,46 @@
+name: gpde_pndm_probe_grid_ablation
+backend: pndm
+dataset: cifar10
+model_assets:
+  - pndm_model_ddim_cifar10
+solvers:
+  - euler
+schedules:
+  - base
+  - GPDE[probe_m64]
+  - GPDE[probe_m128]
+  - GPDE[probe_m256]
+  - GPDE[probe_m512]
+  - GPDE[probe_m1024]
+nfes:
+  - 10
+seeds:
+  - 0
+  - 1
+  - 2
+metrics:
+  - fid
+execution:
+  num_gpus: 1
+  materialize_schedules: false
+  prepare_schedules_first: true
+gpde:
+  batch_size: 8
+  num_batches: 8
+  microbatch_size: 4
+  ref_nfe: 256
+  ref_grid_size: 257
+  probe_grid_size: 512
+  coordinate_domain: timesteps
+  metric: channel_whitened
+  rho: 0.1
+  aggregation: cvar
+  trim_ratio: 0.10
+schedule_clock_configs:
+  GPDE:
+    variants:
+      probe_m64: configs/goes/variants/probe_m64.yaml
+      probe_m128: configs/goes/variants/probe_m128.yaml
+      probe_m256: configs/goes/variants/probe_m256.yaml
+      probe_m512: configs/goes/variants/probe_m512.yaml
+      probe_m1024: configs/goes/variants/probe_m1024.yaml

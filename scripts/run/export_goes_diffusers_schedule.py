@@ -20,14 +20,19 @@ if str(REPO_ROOT) not in sys.path:
 
 from goes.aggregation import aggregation_label
 from goes.config import stable_hash
-from goes.dp_minimax import solve_minimax_schedule
 from goes.edge_evaluator import evaluate_replay_metrics
+from goes.gpde import (
+    default_q_for_solver,
+    evaluate_gpde_profile,
+    make_probe_steps,
+    materialize_gpde_schedule,
+    parse_float_list,
+)
 from goes.logging_utils import dump_json, runtime_metadata, write_csv
 from goes.metrics import make_metric
-from goes.schedules import GOES_SCHEDULE_IMPLEMENTATION_VERSION, save_schedule_outputs
+from goes.schedules import GPDE_SCHEDULE_IMPLEMENTATION_VERSION, save_schedule_outputs
 from goes.torch_backend import (
     build_or_load_torch_velocity_oracle,
-    evaluate_torch_velocity_edge_table,
     make_torch_step_solver,
 )
 from src.adapters.diffusers import (
@@ -44,7 +49,7 @@ from src.utils.schedule_bundle import ScheduleBundle
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export a GOES schedule for a project diffusers pipeline.")
+    parser = argparse.ArgumentParser(description="Export a GPDE schedule for a project diffusers pipeline.")
     parser.add_argument("--manifest", default="configs/assets_manifest.yaml")
     parser.add_argument("--model-asset", required=True)
     parser.add_argument("--prompt-asset", default="diffusers_smoke_prompts")
@@ -63,7 +68,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance-scale", type=float, default=3.5)
     parser.add_argument("--ref-nfe", type=int, default=256)
     parser.add_argument("--ref-grid-size", type=int, default=257)
-    parser.add_argument("--candidate-grid-size", type=int, default=128)
+    parser.add_argument("--probe-grid-size", type=int, default=128)
+    parser.add_argument("--candidate-grid-size", type=int, default=None, help="Compatibility alias for --probe-grid-size.")
+    parser.add_argument("--probe-step-multipliers", default="1,2,4")
+    parser.add_argument("--q-mode", choices=["global_fit", "fixed"], default="global_fit")
+    parser.add_argument("--fixed-q", type=float)
+    parser.add_argument("--monitor-smoothing-window", type=int, default=3)
+    parser.add_argument("--monitor-epsilon", type=float, default=1.0e-12)
     parser.add_argument(
         "--physical-grid-mode",
         choices=["scheduler_sigmas", "linear_sigma", "log_sigma", "karras_sigma"],
@@ -72,12 +83,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metric", choices=["identity", "edm_scalar", "channel_whitened"], default="identity")
     parser.add_argument("--sigma-data", type=float, default=0.5)
     parser.add_argument("--rho", type=float, default=0.1)
-    parser.add_argument("--aggregation", choices=["mean", "median", "trimmed_mean", "cvar"], default="trimmed_mean")
+    parser.add_argument("--aggregation", choices=["mean", "median", "trimmed_mean", "cvar"], default="cvar")
     parser.add_argument("--trim-ratio", type=float, default=0.10)
     parser.add_argument("--cvar-alpha", type=float, default=0.80)
     parser.add_argument("--no-reuse-oracle", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Validate arguments and print the planned run without loading a pipeline.")
     return parser.parse_args()
+
+
+def _probe_grid_size(args: argparse.Namespace) -> int:
+    return int(args.probe_grid_size if args.candidate_grid_size is None else args.candidate_grid_size)
 
 
 def _load_prompt_batch(manifest: AssetManifest, prompt_asset_or_path: str, total_samples: int) -> list[str]:
@@ -108,8 +123,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--ref-nfe must be positive.")
     if int(args.ref_grid_size) < 2:
         raise ValueError("--ref-grid-size must be at least 2.")
-    if int(args.candidate_grid_size) < int(args.nfe):
-        raise ValueError("--candidate-grid-size must be at least --nfe.")
+    if _probe_grid_size(args) < int(args.nfe) + 1:
+        raise ValueError("--probe-grid-size must be at least --nfe + 1.")
+    if int(args.monitor_smoothing_window) < 1:
+        raise ValueError("--monitor-smoothing-window must be positive.")
+    if float(args.monitor_epsilon) <= 0.0:
+        raise ValueError("--monitor-epsilon must be positive.")
+    if args.q_mode == "fixed" and (args.fixed_q is None or float(args.fixed_q) <= 0.0):
+        raise ValueError("--fixed-q must be positive when --q-mode=fixed.")
     rho = float(args.rho)
     if not math.isfinite(rho) or not 0.0 <= rho <= 1.0:
         raise ValueError("--rho must be finite and in [0, 1].")
@@ -154,8 +175,8 @@ def _theory_coverage_for_pipeline(kind: str, solver: str) -> dict[str, Any]:
         return {
             "deterministic_oracle_theory": normalized_solver in {"flow_euler", "flow_heun"},
             "coverage_note": (
-                "Flow pipeline with velocity-style defect batch. GOES edge DP is strict for velocity one-step "
-                "Euler/Heun proxies; multistep solvers require replay refinement for full solver-history fidelity."
+                "Flow pipeline with velocity-style defect batch. GPDE monitor probes are strict for velocity one-step "
+                "Euler/Heun proxies; multistep solvers are outside this monitor-only implementation."
             ),
         }
     return {
@@ -174,18 +195,18 @@ def _validate_solver_pipeline_pair(kind: str, solver: str) -> str:
     if kind in flow_kinds:
         if normalized not in {"flow_euler", "flow_heun"}:
             raise ValueError(
-                f"GOES diffusers export for flow pipeline `{kind}` currently supports flow_euler/flow_heun only, "
+                f"GPDE diffusers export for flow pipeline `{kind}` currently supports flow_euler/flow_heun only, "
                 f"got `{solver}`. Multistep solvers require black-box replay refinement."
             )
         return "heun2" if normalized == "flow_heun" else "euler"
     if kind in vp_kinds:
         if normalized != "euler":
             raise ValueError(
-                f"GOES diffusers export for VP pipeline `{kind}` currently supports empirical euler only, "
+                f"GPDE diffusers export for VP pipeline `{kind}` currently supports empirical euler only, "
                 f"got `{solver}`. DPM/UniPC/SDE solvers need scheduler-history replay refinement."
             )
         return "euler"
-    raise ValueError(f"Unsupported diffusers pipeline kind for GOES export: {kind}")
+    raise ValueError(f"Unsupported diffusers pipeline kind for GPDE export: {kind}")
 
 
 def _schedule_bundle(native_sigmas: np.ndarray, meta: dict[str, Any]) -> ScheduleBundle:
@@ -207,14 +228,14 @@ def _goes_context_metadata(
 ) -> dict[str, Any]:
     microbatch_size = int(args.microbatch_size) if int(args.microbatch_size) > 0 else None
     calibration_samples = int(args.batch_size) * int(args.num_batches)
-    candidate_nodes = int(args.candidate_grid_size) + 1
-    candidate_edges = candidate_nodes * (candidate_nodes - 1) // 2
+    probe_nodes = _probe_grid_size(args)
+    probe_step_count = len(parse_float_list(args.probe_step_multipliers, default=(1.0, 2.0, 4.0)))
     normalized_solver = str(args.solver).lower().replace("-", "_")
     solver_evals_per_edge = 2 if normalized_solver == "flow_heun" else 1
     cfg_multiplier = 2 if float(args.guidance_scale) != 1.0 else 1
     oracle_cost_per_sample = 4 * int(args.ref_nfe) + int(args.ref_grid_size)
-    edge_cost_per_sample = candidate_edges * solver_evals_per_edge
-    calibration_cost = calibration_samples * cfg_multiplier * (oracle_cost_per_sample + edge_cost_per_sample)
+    probe_cost_per_sample = probe_nodes * probe_step_count * solver_evals_per_edge
+    calibration_cost = calibration_samples * cfg_multiplier * (oracle_cost_per_sample + probe_cost_per_sample)
     return {
         "model_asset": str(args.model_asset),
         "model_path": "" if model_path is None else str(model_path),
@@ -256,9 +277,14 @@ def _goes_context_metadata(
             "cache_dir": str(args.oracle_cache_dir),
             "reuse": not bool(args.no_reuse_oracle),
         },
-        "candidate_grid_config": {
-            "size": int(args.candidate_grid_size),
+        "probe_grid_config": {
+            "size": int(probe_nodes),
             "type": "uniform_in_negative_sigma",
+            "probe_step_multipliers": parse_float_list(args.probe_step_multipliers, default=(1.0, 2.0, 4.0)),
+            "q_mode": str(args.q_mode),
+            "fixed_q": None if args.fixed_q is None else float(args.fixed_q),
+            "monitor_smoothing_window": int(args.monitor_smoothing_window),
+            "monitor_epsilon": float(args.monitor_epsilon),
         },
         "calibration_cost_estimate": int(calibration_cost),
         "calibration_cost_unit": "model_evaluation_equivalents",
@@ -266,11 +292,12 @@ def _goes_context_metadata(
             "num_samples": calibration_samples,
             "cfg_multiplier": int(cfg_multiplier),
             "oracle_cost_per_sample": int(oracle_cost_per_sample),
-            "candidate_edges": int(candidate_edges),
+            "probe_nodes": int(probe_nodes),
+            "probe_step_count": int(probe_step_count),
             "solver_evals_per_edge": int(solver_evals_per_edge),
-            "edge_cost_per_sample": int(edge_cost_per_sample),
+            "probe_cost_per_sample": int(probe_cost_per_sample),
             "total_model_eval_equivalents": int(calibration_cost),
-            "note": "Estimated RK4 oracle drift calls plus one-step edge replay drift calls; CFG multiplier counts unconditional/conditional branches and excludes generation.",
+            "note": "Estimated RK4 oracle drift calls plus oracle-start GPDE probe drift calls; CFG multiplier counts unconditional/conditional branches and excludes generation.",
         },
     }
 
@@ -289,7 +316,7 @@ def _schedule_export_metric_rows(
     theory_covered: bool,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     base = {
-        "schedule": "GOES",
+        "schedule": "GPDE",
         "solver": str(solver),
         "nfe": int(nfe),
         "guidance_scale": float(guidance_scale),
@@ -305,7 +332,7 @@ def _schedule_export_metric_rows(
         "replay_loss": float(replay_loss),
         "fallback_fraction": float(fallback_fraction),
         "status": "OK",
-        "note": "Calibration replay metrics from GOES schedule export; not held-out image quality.",
+        "note": "Calibration replay metrics from GPDE schedule export; not held-out image quality.",
     }
     heldout_row = {
         **base,
@@ -375,7 +402,8 @@ def main() -> None:
                     "calibration_samples": int(args.batch_size) * int(args.num_batches),
                     "ref_nfe": int(args.ref_nfe),
                     "ref_grid_size": int(args.ref_grid_size),
-                    "candidate_grid_size": int(args.candidate_grid_size),
+                    "probe_grid_size": int(_probe_grid_size(args)),
+                    "probe_step_multipliers": args.probe_step_multipliers,
                     "physical_grid_mode": args.physical_grid_mode,
                     "output_dir": str(resolve_repo_path(args.output_dir)),
                     "oracle_cache_dir": str(resolve_repo_path(args.oracle_cache_dir)),
@@ -426,16 +454,22 @@ def main() -> None:
     sigma_grid[0] = float(defect_batch.sigma_max)
     sigma_grid[-1] = 0.0
     if np.any(np.diff(sigma_grid) > 1.0e-8):
-        raise RuntimeError("Diffusers GOES sigma grid must be non-increasing.")
+        raise RuntimeError("Diffusers GPDE sigma grid must be non-increasing.")
     u_grid = -np.asarray(sigma_grid, dtype=np.float64)
     if np.any(np.diff(u_grid) <= -1.0e-8):
-        raise RuntimeError("Diffusers GOES unified grid must be non-decreasing after sigma sign flip.")
+        raise RuntimeError("Diffusers GPDE unified grid must be non-decreasing after sigma sign flip.")
     # Repair repeated terminal or scheduler nodes for interpolation.
     keep = np.concatenate([[True], np.diff(u_grid) > 1.0e-10])
     u_grid = u_grid[keep]
     if len(u_grid) < 2:
-        raise RuntimeError("Diffusers GOES reference grid collapsed to fewer than two nodes.")
-    candidate_grid = np.linspace(float(u_grid[0]), float(u_grid[-1]), int(args.candidate_grid_size) + 1)
+        raise RuntimeError("Diffusers GPDE reference grid collapsed to fewer than two nodes.")
+    probe_grid = np.linspace(float(u_grid[0]), float(u_grid[-1]), _probe_grid_size(args), dtype=np.float64)
+    probe_steps = make_probe_steps(
+        u_min=float(u_grid[0]),
+        u_max=float(u_grid[-1]),
+        probe_grid_size=_probe_grid_size(args),
+        multipliers=args.probe_step_multipliers,
+    )
 
     def velocity_fn(sample, u_tensor, batch_start=0, batch_stop=None):
         sigma = -u_tensor
@@ -491,19 +525,28 @@ def main() -> None:
         coordinate=SimpleNamespace(name="negative_sigma"),
     )
     aggregation = {"name": args.aggregation, "trim_ratio": args.trim_ratio, "alpha": args.cvar_alpha}
-    edge_table = evaluate_torch_velocity_edge_table(
-        solver_name=proxy_solver,
+    solver_proxy = make_torch_step_solver(
+        name=proxy_solver,
         velocity_fn=velocity_fn,
-        oracle=oracle_result.oracle,
-        candidate_grid=candidate_grid,
-        metric=metric,
-        rho=float(args.rho),
-        aggregation=aggregation,
         device=device,
         dtype=defect_batch.initial_latents.dtype,
     )
-    path = solve_minimax_schedule(edge_table.edge_costs, int(args.nfe))
-    u_schedule = candidate_grid[path.indices]
+    profile = evaluate_gpde_profile(
+        solver_proxy,
+        oracle=oracle_result.oracle,
+        probe_grid=probe_grid,
+        probe_steps=probe_steps,
+        metric=metric,
+        rho=float(args.rho),
+        aggregation=aggregation,
+        q_mode=str(args.q_mode),
+        fixed_q=args.fixed_q,
+        default_q=default_q_for_solver(proxy_solver),
+        coefficient_floor=float(args.monitor_epsilon),
+        monitor_smoothing_window=int(args.monitor_smoothing_window),
+    )
+    gpde_schedule = materialize_gpde_schedule(profile.probe_grid, profile.monitor_density, int(args.nfe))
+    u_schedule = gpde_schedule.u_schedule
     native_sigmas = -u_schedule
     native_sigmas[-1] = 0.0
 
@@ -522,8 +565,9 @@ def main() -> None:
         context_metadata=context_metadata,
     )
     payload = {
-        "method": "GOES",
-        "schedule_implementation_version": GOES_SCHEDULE_IMPLEMENTATION_VERSION,
+        "method": "GPDE",
+        "legacy_method_alias": "GOES",
+        "schedule_implementation_version": GPDE_SCHEDULE_IMPLEMENTATION_VERSION,
         **context_metadata,
         "solver": args.solver,
         "target_nfe": int(args.nfe),
@@ -535,31 +579,51 @@ def main() -> None:
         "metric": metric.metadata(),
         "aggregation": aggregation_label(aggregation),
         "oracle_cache_key": oracle_result.cache_key,
-        "edge_objective": float(path.objective),
-        "selected_edge_costs": [float(item) for item in path.edge_costs],
-        "selected_indices": [int(item) for item in path.indices],
+        "optimizer": "monitor_inverse_cdf",
+        "edge_objective": float(gpde_schedule.objective),
+        "monitor_objective": float(gpde_schedule.objective),
+        "total_monitor_mass": float(gpde_schedule.total_monitor_mass),
+        "selected_monitor_masses": [float(item) for item in gpde_schedule.interval_monitor_masses],
+        "selected_edge_costs": [float(item) for item in gpde_schedule.interval_monitor_masses],
+        "selected_indices": [int(item) for item in gpde_schedule.selected_indices],
+        "snap_errors": [float(item) for item in gpde_schedule.snap_errors],
+        "q_estimate": float(profile.q_estimate),
+        "q_source": profile.q_source,
+        "monitor_exponent": profile.metadata["monitor_exponent"],
+        "probe_profile": profile.metadata,
         "schedule_hash": schedule_hash,
     }
     save_schedule_outputs(
         output_dir,
         payload=payload,
-        selected_indices=path.indices,
-        selected_edge_costs=path.edge_costs,
+        selected_indices=gpde_schedule.selected_indices,
+        selected_edge_costs=gpde_schedule.interval_monitor_masses,
     )
     np.savez_compressed(
-        output_dir / "edge_costs.npz",
-        candidate_grid=edge_table.candidate_grid,
-        edge_costs=edge_table.edge_costs,
-        per_sample_costs=edge_table.per_sample_costs,
-        fallback_counts=edge_table.fallback_counts,
+        output_dir / "probe_defects.npz",
+        probe_grid=profile.probe_grid,
+        probe_steps=profile.probe_steps,
+        defects=profile.defects,
+        coefficient_per_sample=profile.coefficient_per_sample,
+        aggregate_coefficient=profile.aggregate_coefficient,
+        monitor_density=profile.monitor_density,
+        fallback_counts=profile.fallback_counts,
     )
+    write_csv(
+        [
+            {
+                "probe_index": int(index),
+                "u": float(u),
+                "aggregate_coefficient": float(profile.aggregate_coefficient[index]),
+                "monitor_density": float(profile.monitor_density[index]),
+                "q_estimate": float(profile.q_estimate),
+            }
+            for index, u in enumerate(profile.probe_grid)
+        ],
+        output_dir / "monitor_profile.csv",
+    )
+    dump_json(profile.metadata, output_dir / "q_estimate.json")
     dump_json(oracle_result.oracle.metadata, output_dir / "oracle_metadata.json")
-    solver_proxy = make_torch_step_solver(
-        name=proxy_solver,
-        velocity_fn=velocity_fn,
-        device=device,
-        dtype=defect_batch.initial_latents.dtype,
-    )
     replay_metrics = evaluate_replay_metrics(
         solver_proxy,
         oracle_result.oracle,
@@ -584,8 +648,9 @@ def main() -> None:
     write_csv([heldout_row], output_dir / "heldout_metrics.csv")
     write_csv([heldout_row], output_dir / "paper_tables" / "main_results.csv")
     bundle_meta = {
-        "schedule_family": "GOES",
-        "schedule_implementation_version": GOES_SCHEDULE_IMPLEMENTATION_VERSION,
+        "schedule_family": "GPDE",
+        "legacy_schedule_family_alias": "GOES",
+        "schedule_implementation_version": GPDE_SCHEDULE_IMPLEMENTATION_VERSION,
         "backend": "diffusers",
         **context_metadata,
         "model_asset": str(args.model_asset),
@@ -601,8 +666,12 @@ def main() -> None:
         "rho": float(args.rho),
         "metric": metric.metadata(),
         "aggregation": aggregation_label(aggregation),
-        "edge_objective": float(path.objective),
-        "selected_edge_costs": [float(item) for item in path.edge_costs],
+        "edge_objective": float(gpde_schedule.objective),
+        "monitor_objective": float(gpde_schedule.objective),
+        "selected_edge_costs": [float(item) for item in gpde_schedule.interval_monitor_masses],
+        "selected_monitor_masses": [float(item) for item in gpde_schedule.interval_monitor_masses],
+        "q_estimate": float(profile.q_estimate),
+        "q_source": profile.q_source,
         "effective_nfe": int(args.nfe),
         "solver_steps": int(args.nfe),
         **coverage,
@@ -625,13 +694,14 @@ def main() -> None:
         "oracle_cache_key": oracle_result.cache_key,
         "oracle_loaded_from_cache": oracle_result.loaded_from_cache,
         "oracle_build_or_load_seconds": oracle_result.elapsed_seconds,
-        "edge_table": edge_table.metadata,
+        "probe_profile": profile.metadata,
+        "schedule_materialization": gpde_schedule.metadata,
         "total_seconds": time.time() - started,
         "theory_coverage": coverage,
         "skipped_baselines": [
             {
                 "name": "AYS/base generation",
-                "reason": "This exporter materializes a GOES schedule; generation/evaluation remains in run_experiment_config.",
+                "reason": "This exporter materializes a GPDE schedule; generation/evaluation remains in run_experiment_config.",
             }
         ],
     }

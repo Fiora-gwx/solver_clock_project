@@ -58,7 +58,7 @@ class ToySolver:
     ) -> np.ndarray:
         h = float(b) - float(a)
         if h <= 0.0:
-            raise ValueError("GOES edge steps require b > a in unified coordinate.")
+            raise ValueError("GPDE edge/probe steps require b > a in unified coordinate.")
         if self.name == "euler":
             return x_a + h * self.model.drift(x_a, a, condition)
         if self.name in {"heun", "heun2"}:

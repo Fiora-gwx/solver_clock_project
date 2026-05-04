@@ -1,4 +1,4 @@
-method: goes
+method: gpde
 model:
   name: toy_flow
   state_shape: [2]
@@ -16,9 +16,11 @@ heldout:
   num_samples: 4
   seed: 29
   split: heldout
-candidate_grid:
+probe_grid:
   size: 12
   type: uniform_in_u
+probe_steps:
+  multipliers: [1.0, 2.0]
 solver:
   name: euler
   target_nfe: 4
@@ -28,8 +30,8 @@ metric:
 mixed_defect:
   rho: 0.1
 aggregation:
-  name: trimmed_mean
-  trim_ratio: 0.10
+  name: cvar
+  alpha: 0.80
 output:
   root: ./outputs/goes
   save_plots: false

@@ -9,7 +9,7 @@ import numpy as np
 from src.utils.schedule_bundle import ScheduleBundle
 
 from .config import repo_path
-from .schedules import GOES_SCHEDULE_IMPLEMENTATION_VERSION
+from .schedules import GPDE_SCHEDULE_IMPLEMENTATION_VERSION, GOES_SCHEDULE_IMPLEMENTATION_VERSION
 
 
 def _require(condition: bool, message: str) -> None:
@@ -18,7 +18,7 @@ def _require(condition: bool, message: str) -> None:
 
 
 def _finite_vector(payload: dict[str, Any], key: str) -> np.ndarray:
-    _require(key in payload, f"Missing `{key}` in GOES schedule payload.")
+    _require(key in payload, f"Missing `{key}` in schedule payload.")
     values = np.asarray(payload[key], dtype=np.float64)
     _require(values.ndim == 1, f"`{key}` must be a one-dimensional array.")
     _require(np.all(np.isfinite(values)), f"`{key}` contains non-finite values.")
@@ -36,10 +36,12 @@ def _require_strictly_monotone(values: np.ndarray, name: str) -> None:
 
 
 def verify_schedule_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    _require(payload.get("method") == "GOES", "Expected schedule payload method to be GOES.")
+    method = str(payload.get("method", ""))
+    _require(method in {"GPDE", "GOES"}, "Expected schedule payload method to be GPDE or GOES.")
+    expected_version = GPDE_SCHEDULE_IMPLEMENTATION_VERSION if method == "GPDE" else GOES_SCHEDULE_IMPLEMENTATION_VERSION
     _require(
-        int(payload.get("schedule_implementation_version", -1)) == GOES_SCHEDULE_IMPLEMENTATION_VERSION,
-        "GOES schedule implementation version is stale or missing.",
+        int(payload.get("schedule_implementation_version", -1)) == expected_version,
+        f"{method} schedule implementation version is stale or missing.",
     )
     target_nfe = int(payload.get("target_nfe", -1))
     _require(target_nfe > 0, "`target_nfe` must be positive.")
@@ -56,10 +58,11 @@ def verify_schedule_payload(payload: dict[str, Any]) -> dict[str, Any]:
     _require(native_schedule.size == target_nfe + 1, "`native_schedule` must contain target_nfe + 1 points.")
     _require(np.all(np.diff(u_schedule) > 0.0), "`u_schedule` must be strictly increasing.")
 
-    selected_costs = np.asarray(payload.get("selected_edge_costs", []), dtype=np.float64)
-    _require(selected_costs.ndim == 1, "`selected_edge_costs` must be one-dimensional.")
-    _require(selected_costs.size == target_nfe, "`selected_edge_costs` must contain target_nfe values.")
-    _require(np.all(np.isfinite(selected_costs)), "`selected_edge_costs` contains non-finite values.")
+    selected_key = "selected_monitor_masses" if method == "GPDE" else "selected_edge_costs"
+    selected_costs = np.asarray(payload.get(selected_key, payload.get("selected_edge_costs", [])), dtype=np.float64)
+    _require(selected_costs.ndim == 1, f"`{selected_key}` must be one-dimensional.")
+    _require(selected_costs.size == target_nfe, f"`{selected_key}` must contain target_nfe values.")
+    _require(np.all(np.isfinite(selected_costs)), f"`{selected_key}` contains non-finite values.")
 
     selected_indices = payload.get("selected_indices")
     if selected_indices is not None:
@@ -69,7 +72,7 @@ def verify_schedule_payload(payload: dict[str, Any]) -> dict[str, Any]:
         _require(np.all(np.diff(indices) > 0), "`selected_indices` must be strictly increasing.")
 
     rho = float(payload.get("rho", np.nan))
-    edge_objective = float(payload.get("edge_objective", np.nan))
+    edge_objective = float(payload.get("monitor_objective", payload.get("edge_objective", np.nan)))
     _require(np.isfinite(rho) and 0.0 <= rho <= 1.0, "`rho` must be finite and lie in [0, 1].")
     _require(np.isfinite(edge_objective), "`edge_objective` must be finite.")
     _require(bool(payload.get("oracle_cache_key")), "`oracle_cache_key` must be recorded.")
@@ -104,10 +107,12 @@ def verify_schedule_bundle(bundle_dir: str | Path, *, expected_nfe: int | None =
     path = repo_path(bundle_dir)
     bundle = ScheduleBundle.load(path)
     meta = bundle.meta
-    _require(meta.get("schedule_family") == "GOES", "Expected ScheduleBundle schedule_family to be GOES.")
+    family = str(meta.get("schedule_family", ""))
+    _require(family in {"GPDE", "GOES"}, "Expected ScheduleBundle schedule_family to be GPDE or GOES.")
+    expected_version = GPDE_SCHEDULE_IMPLEMENTATION_VERSION if family == "GPDE" else GOES_SCHEDULE_IMPLEMENTATION_VERSION
     _require(
-        int(meta.get("schedule_implementation_version", -1)) == GOES_SCHEDULE_IMPLEMENTATION_VERSION,
-        "GOES ScheduleBundle implementation version is stale or missing.",
+        int(meta.get("schedule_implementation_version", -1)) == expected_version,
+        f"{family} ScheduleBundle implementation version is stale or missing.",
     )
     effective_nfe = int(meta.get("effective_nfe", bundle.nfe))
     if expected_nfe is not None:

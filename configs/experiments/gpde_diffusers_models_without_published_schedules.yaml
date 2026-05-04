@@ -1,33 +1,23 @@
-name: goes_diffusers_cfg_nfe_sweep
+name: gpde_diffusers_models_without_published_schedules
 backend: diffusers
 models:
   - sd35_medium
+  - flux_dev
+  - lumina_image_2
 solvers:
   - flow_euler
 schedules:
   - base
-  - GOES
+  - GPDE
 nfes:
-  - 4
-  - 5
-  - 6
-  - 8
   - 10
-  - 12
-  - 15
-  - 20
-  - 30
-  - 50
 seeds:
   - 0
   - 1
   - 2
 prompt_asset: diffusers_smoke_prompts
 guidance_scales:
-  - 3.0
-  - 5.0
-  - 7.5
-  - 10.0
+  - 3.5
 metrics:
   - clipscore
   - imagereward
@@ -35,15 +25,15 @@ execution:
   num_gpus: 1
   materialize_schedules: false
   prepare_schedules_first: true
-goes:
-  batch_size: 4
-  num_batches: 8
+gpde:
+  batch_size: 2
+  num_batches: 4
   microbatch_size: 1
   ref_nfe: 256
   ref_grid_size: 257
-  candidate_grid_size: 512
+  probe_grid_size: 512
   physical_grid_mode: scheduler_sigmas
   metric: channel_whitened
   rho: 0.1
-  aggregation: trimmed_mean
+  aggregation: cvar
   trim_ratio: 0.10

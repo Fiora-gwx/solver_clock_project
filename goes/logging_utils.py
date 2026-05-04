@@ -54,7 +54,8 @@ def make_run_dir(config: dict[str, Any], command: str) -> Path:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     solver = str(config["solver"]["name"])
     nfe = int(config["solver"]["target_nfe"])
-    run_name = f"{timestamp}_goes_{command}_{solver}_{nfe}nfe_{short_config_hash(config)}"
+    method = str(config.get("method", "gpde")).lower()
+    run_name = f"{timestamp}_{method}_{command}_{solver}_{nfe}nfe_{short_config_hash(config)}"
     path = root / run_name
     suffix = 1
     while path.exists():
@@ -116,7 +117,7 @@ def maybe_write_plots(
         ax.plot(np.arange(len(u_schedule)), u_schedule, marker="o")
         ax.set_xlabel("schedule index")
         ax.set_ylabel("unified coordinate u")
-        ax.set_title("GOES schedule")
+        ax.set_title("GPDE schedule")
         fig.tight_layout()
         path = run_dir / "plots" / "schedule.png"
         fig.savefig(path, dpi=160)
@@ -129,7 +130,7 @@ def maybe_write_plots(
         image = ax.imshow(finite, origin="lower", aspect="auto")
         ax.set_xlabel("edge end index")
         ax.set_ylabel("edge start index")
-        ax.set_title("GOES edge costs")
+        ax.set_title("Edge costs")
         fig.colorbar(image, ax=ax)
         fig.tight_layout()
         path = run_dir / "plots" / "edge_cost_heatmap.png"
@@ -142,7 +143,7 @@ def maybe_write_plots(
         ax.plot(np.arange(len(selected_edge_costs)), selected_edge_costs, marker="o")
         ax.set_xlabel("selected edge")
         ax.set_ylabel("edge cost")
-        ax.set_title("Selected GOES edge costs")
+        ax.set_title("Selected interval scores")
         fig.tight_layout()
         path = run_dir / "plots" / "selected_edge_costs.png"
         fig.savefig(path, dpi=160)

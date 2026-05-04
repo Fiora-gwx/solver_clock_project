@@ -52,10 +52,10 @@ FIELDNAMES = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Summarize GOES schedule materialization cost and oracle reuse from exported schedule directories."
+            "Summarize GPDE/GOES schedule materialization cost and oracle reuse from exported schedule directories."
         )
     )
-    parser.add_argument("roots", nargs="+", help="Schedule directories or roots containing GOES schedule.json files.")
+    parser.add_argument("roots", nargs="+", help="Schedule directories or roots containing GPDE/GOES schedule.json files.")
     parser.add_argument("--output-csv", required=True, help="Path for oracle_reuse_cost.csv.")
     return parser.parse_args()
 
@@ -126,7 +126,7 @@ def cost_from_breakdown(breakdown: dict[str, Any]) -> tuple[int, int, int] | Non
     num_samples = int_or_empty(breakdown.get("num_samples"))
     cfg_multiplier = int_or_empty(breakdown.get("cfg_multiplier"))
     oracle_cost_per_sample = int_or_empty(breakdown.get("oracle_cost_per_sample"))
-    edge_cost_per_sample = int_or_empty(breakdown.get("edge_cost_per_sample"))
+    edge_cost_per_sample = int_or_empty(breakdown.get("edge_cost_per_sample", breakdown.get("probe_cost_per_sample")))
     if "" in {num_samples, cfg_multiplier, oracle_cost_per_sample, edge_cost_per_sample}:
         return None
     oracle_cost = int(num_samples) * int(cfg_multiplier) * int(oracle_cost_per_sample)
@@ -136,7 +136,7 @@ def cost_from_breakdown(breakdown: dict[str, Any]) -> tuple[int, int, int] | Non
 
 def row_from_schedule(schedule_path: Path) -> dict[str, Any] | None:
     schedule = load_json(schedule_path)
-    if str(schedule.get("method", "")).upper() != "GOES":
+    if str(schedule.get("method", "")).upper() not in {"GPDE", "GOES"}:
         return None
     run_metadata_path = schedule_path.parent / "run_metadata.json"
     run_metadata = load_json(run_metadata_path) if run_metadata_path.exists() else {}
@@ -239,10 +239,10 @@ def summarize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def build_report(roots: Iterable[str | Path]) -> list[dict[str, Any]]:
     rows = [row for path in discover_schedule_jsons(roots) if (row := row_from_schedule(path)) is not None]
     if not rows:
-        raise ValueError("No GOES schedule.json files found under the provided roots.")
+        raise ValueError("No GPDE/GOES schedule.json files found under the provided roots.")
     report = summarize_rows(rows)
     if not any(row.get("status") in {"OK", "INCONSISTENT_ORACLE_COST"} for row in report):
-        raise ValueError("No GOES schedules with usable oracle reuse cost metadata were found.")
+        raise ValueError("No GPDE/GOES schedules with usable oracle reuse cost metadata were found.")
     return report
 
 

@@ -1,4 +1,4 @@
-name: goes_diffusers_oracle_convergence
+name: gpde_diffusers_probe_grid_ablation
 backend: diffusers
 models:
   - sd35_medium
@@ -6,10 +6,11 @@ solvers:
   - flow_euler
 schedules:
   - base
-  - GOES[ref_nfe_100]
-  - GOES[ref_nfe_200]
-  - GOES[ref_nfe_500]
-  - GOES[ref_nfe_1000]
+  - GPDE[probe_m64]
+  - GPDE[probe_m128]
+  - GPDE[probe_m256]
+  - GPDE[probe_m512]
+  - GPDE[probe_m1024]
 nfes:
   - 10
 seeds:
@@ -26,22 +27,23 @@ execution:
   num_gpus: 1
   materialize_schedules: false
   prepare_schedules_first: true
-goes:
+gpde:
   batch_size: 4
   num_batches: 8
   microbatch_size: 1
   ref_nfe: 256
   ref_grid_size: 257
-  candidate_grid_size: 512
+  probe_grid_size: 512
   physical_grid_mode: scheduler_sigmas
   metric: channel_whitened
   rho: 0.1
-  aggregation: trimmed_mean
+  aggregation: cvar
   trim_ratio: 0.10
 schedule_clock_configs:
-  GOES:
+  GPDE:
     variants:
-      ref_nfe_100: configs/goes/variants/ref_nfe_100.yaml
-      ref_nfe_200: configs/goes/variants/ref_nfe_200.yaml
-      ref_nfe_500: configs/goes/variants/ref_nfe_500.yaml
-      ref_nfe_1000: configs/goes/variants/ref_nfe_1000.yaml
+      probe_m64: configs/goes/variants/probe_m64.yaml
+      probe_m128: configs/goes/variants/probe_m128.yaml
+      probe_m256: configs/goes/variants/probe_m256.yaml
+      probe_m512: configs/goes/variants/probe_m512.yaml
+      probe_m1024: configs/goes/variants/probe_m1024.yaml
