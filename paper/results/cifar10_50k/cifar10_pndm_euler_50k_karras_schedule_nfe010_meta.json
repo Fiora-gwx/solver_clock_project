@@ -1,0 +1,33 @@
+{
+  "backend": "pndm",
+  "coordinate_domain": "sigmas",
+  "dataset": "cifar10",
+  "effective_nfe": 10,
+  "execution_backend": "native_scheduler",
+  "has_g_grid": false,
+  "has_sigma_grid": true,
+  "has_sigmas": true,
+  "has_tau_grid": false,
+  "has_time_grid": true,
+  "has_timesteps": true,
+  "karras_rho": 7.0,
+  "nfe": 10,
+  "representation": "timesteps_from_karras_sigmas",
+  "schedule_family": "karras",
+  "schedule_implementation_version": 1,
+  "solver": "euler",
+  "solver_steps": 10,
+  "step_methods": [
+    "euler",
+    "euler",
+    "euler",
+    "euler",
+    "euler",
+    "euler",
+    "euler",
+    "euler",
+    "euler",
+    "euler"
+  ],
+  "terminal_timestep": 0.0
+}

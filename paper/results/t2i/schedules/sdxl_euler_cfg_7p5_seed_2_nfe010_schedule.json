@@ -1,0 +1,211 @@
+{
+  "aggregation": "cvar_80pct",
+  "anchored_replay_config": {},
+  "calibration_config": {
+    "batch_size": 1,
+    "guidance_scale": 7.5,
+    "microbatch_size": 1,
+    "num_batches": 4,
+    "num_samples": 4,
+    "prompt_asset": "diffusers_ablation_prompts",
+    "prompt_count": 4,
+    "seed": 2
+  },
+  "calibration_cost_breakdown": {
+    "candidate_edges": 8256,
+    "cfg_multiplier": 2,
+    "edge_cost_per_sample": 8256,
+    "note": "Estimated RK4 oracle drift calls plus oracle-start GPDE probe drift calls; CFG multiplier counts unconditional/conditional branches and excludes generation.",
+    "num_samples": 4,
+    "oracle_cost_per_sample": 321,
+    "probe_cost_per_sample": 8256,
+    "probe_nodes": 128,
+    "probe_step_count": 3,
+    "solver_evals_per_edge": 1,
+    "total_model_eval_equivalents": 68616
+  },
+  "calibration_cost_estimate": 68616,
+  "calibration_cost_unit": "model_evaluation_equivalents",
+  "candidate_grid_config": {
+    "fixed_q": null,
+    "monitor_epsilon": 1e-12,
+    "monitor_smoothing_window": 3,
+    "probe_step_multipliers": [
+      1.0,
+      2.0,
+      4.0
+    ],
+    "q_mode": "global_fit",
+    "size": 128,
+    "type": "uniform_in_negative_sigma"
+  },
+  "coordinate": "negative_sigma",
+  "coordinate_direction": "increasing_u_native_decreasing",
+  "coordinate_domain": "sigmas",
+  "defect_backend": "single_step",
+  "dtype": "bfloat16",
+  "edge_objective": 7.717137646624877,
+  "guidance_scale": 7.5,
+  "height": 1024,
+  "legacy_method_alias": "GOES",
+  "method": "GPDE",
+  "metric": {
+    "eps": 1e-12,
+    "max_weight": 10000.0,
+    "min_weight": 0.0001,
+    "name": "channel_whitened",
+    "weight_shape": [
+      65,
+      4
+    ]
+  },
+  "model_asset": "hf_sdxl_base_10",
+  "model_path": "checkpoints/hf/stabilityai--stable-diffusion-xl-base-1.0",
+  "monitor_exponent": "q_root",
+  "monitor_objective": 7.717137646624877,
+  "native_schedule": [
+    10.721362113952637,
+    8.664437765014945,
+    6.70962159393894,
+    4.963240957886276,
+    3.409433567454891,
+    2.1357741091197906,
+    1.2386181639024345,
+    0.6797458891961227,
+    0.3735907759440242,
+    0.1727420647428817,
+    0.0
+  ],
+  "optimizer": "monitor_inverse_cdf",
+  "oracle_cache_key": "faaf7de3207544073d578b40",
+  "oracle_config": {
+    "cache_dir": "outputs/gpde_diffusers_sdxl_nfe10_cfg_seed_sweep/schedules/_goes_oracle_cache/diffusers",
+    "ref_grid_size": 65,
+    "ref_integrator": "rk4",
+    "ref_nfe": 64,
+    "reuse": true
+  },
+  "physical_grid_mode": "scheduler_sigmas",
+  "pilot_config": {
+    "batch_size": 1,
+    "guidance_scale": 7.5,
+    "microbatch_size": 1,
+    "num_batches": 4,
+    "num_samples": 4,
+    "prompt_asset": "diffusers_ablation_prompts",
+    "prompt_count": 4,
+    "seed": 2
+  },
+  "pipeline_kind": "sdxl",
+  "probe_grid_config": {
+    "fixed_q": null,
+    "monitor_epsilon": 1e-12,
+    "monitor_smoothing_window": 3,
+    "probe_step_multipliers": [
+      1.0,
+      2.0,
+      4.0
+    ],
+    "q_mode": "global_fit",
+    "size": 128,
+    "type": "uniform_in_negative_sigma"
+  },
+  "probe_profile": {
+    "aggregation": {
+      "alpha": 0.8,
+      "name": "cvar",
+      "trim_ratio": 0.1
+    },
+    "coefficient_floor": 1e-12,
+    "method": "GPDE",
+    "monitor_exponent": "q_root",
+    "monitor_smoothing_window": 3,
+    "num_probe_nodes": 128,
+    "num_probe_steps": 3,
+    "probe_steps": [
+      0.08442017412561131,
+      0.16884034825122263,
+      0.33768069650244525
+    ],
+    "profile_type": "oracle_start_probe_monitor",
+    "q_estimate": 2.5266121308603564,
+    "q_source": "global_loglog_fit",
+    "tiny_tangent_fallback_fraction": 0.0
+  },
+  "prompt_asset": "diffusers_ablation_prompts",
+  "prompt_count": 4,
+  "prompt_path": "data/pndm/prompts/modern_diffusers_ablation_prompts.json",
+  "q_estimate": 2.5266121308603564,
+  "q_source": "global_loglog_fit",
+  "rho": 0.1,
+  "schedule_hash": "9bf0a68cbd434d44",
+  "schedule_implementation_version": 2,
+  "seed": 2,
+  "selected_edge_costs": [
+    7.717137646624874,
+    7.717137646624877,
+    7.717137646624874,
+    7.717137646624877,
+    7.717137646624877,
+    7.71713764662487,
+    7.717137646624877,
+    7.717137646624877,
+    7.717137646624877,
+    7.717137646624877
+  ],
+  "selected_indices": [
+    0,
+    24,
+    48,
+    68,
+    87,
+    102,
+    112,
+    119,
+    123,
+    125,
+    127
+  ],
+  "selected_monitor_masses": [
+    7.717137646624874,
+    7.717137646624877,
+    7.717137646624874,
+    7.717137646624877,
+    7.717137646624877,
+    7.71713764662487,
+    7.717137646624877,
+    7.717137646624877,
+    7.717137646624877,
+    7.717137646624877
+  ],
+  "snap_errors": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "solver": "euler",
+  "target_nfe": 10,
+  "total_monitor_mass": 77.17137646624876,
+  "u_schedule": [
+    -10.721362113952637,
+    -8.664437765014945,
+    -6.70962159393894,
+    -4.963240957886276,
+    -3.409433567454891,
+    -2.1357741091197906,
+    -1.2386181639024345,
+    -0.6797458891961227,
+    -0.3735907759440242,
+    -0.1727420647428817,
+    -0.0
+  ],
+  "width": 1024
+}

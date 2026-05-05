@@ -1,0 +1,24 @@
+Denoising diffusion models generate high-quality images by simulating a
+reverse trajectory from noise to data, but this iterative procedure becomes
+costly when many denoiser evaluations are required. A central challenge in fast
+sampling is therefore to choose a discretization schedule that places a small
+computational budget at the most important parts of the reverse trajectory.
+Existing schedules are often hand-crafted or optimized using indirect criteria
+such as distributional bounds, transport costs, or information increments.
+These criteria can produce useful grids, but they do not directly reveal where
+a particular numerical solver makes its most consequential local errors along
+the denoising path. This paper presents \emph{geometric prediction defect
+equalization}, a training-free algorithm for automatically selecting sampling
+schedules for deterministic diffusion ODE samplers. Our method uses accurate
+teacher trajectories from a pretrained model to estimate where a target solver
+locally deviates from the intended trajectory, and then allocates time steps to
+equalize these geometric prediction defects. The resulting
+schedule is solver-aware, coordinate-covariant, and requires no model
+retraining, sampler distillation, or tuning of quality-based objectives. We
+show that, under a local power-law defect model, our schedule is asymptotically
+minimax-optimal for controlling the maximum local distributional prediction
+defect. In validated PNDM/CIFAR-10 Euler 50k-sample runs, ours improves
+FID over base, native-coordinate linear, and an authorized project-owned
+offline-proxy schedule at NFE 10 and 20 across three seeds. Comparisons to
+fixed Karras/EDM-style grids and matched SD1.5/SDXL AYS schedules remain
+mixed, highlighting the current limits of defect-based schedule calibration.

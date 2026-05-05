@@ -1,0 +1,46 @@
+name: goes_pndm_candidate_grid_ablation
+backend: pndm
+dataset: cifar10
+model_assets:
+  - pndm_model_ddim_cifar10
+solvers:
+  - euler
+schedules:
+  - base
+  - GOES[candidate_m64]
+  - GOES[candidate_m128]
+  - GOES[candidate_m256]
+  - GOES[candidate_m512]
+  - GOES[candidate_m1024]
+nfes:
+  - 10
+seeds:
+  - 0
+  - 1
+  - 2
+metrics:
+  - fid
+execution:
+  num_gpus: 1
+  materialize_schedules: false
+  prepare_schedules_first: true
+goes:
+  batch_size: 8
+  num_batches: 8
+  microbatch_size: 4
+  ref_nfe: 256
+  ref_grid_size: 257
+  probe_grid_size: 512
+  coordinate_domain: timesteps
+  metric: channel_whitened
+  rho: 0.1
+  aggregation: cvar
+  trim_ratio: 0.10
+schedule_clock_configs:
+  GOES:
+    variants:
+      candidate_m64: configs/goes/variants/probe_m64.yaml
+      candidate_m128: configs/goes/variants/probe_m128.yaml
+      candidate_m256: configs/goes/variants/probe_m256.yaml
+      candidate_m512: configs/goes/variants/probe_m512.yaml
+      candidate_m1024: configs/goes/variants/probe_m1024.yaml

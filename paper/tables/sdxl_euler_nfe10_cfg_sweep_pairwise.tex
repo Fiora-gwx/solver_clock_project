@@ -1,0 +1,21 @@
+\begin{table}[t]
+  \centering
+  \caption{SDXL text-to-image matched CFG sweep with Euler solver,
+  NFE 10, seeds 0--2, and 50 prompts from
+  \texttt{diffusers\_ablation\_prompts}. Rows report pairwise mean
+  deltas and win rates over 150 matched prompt/seed pairs. CLIPScore
+  and ImageReward are higher-is-better.}
+  \label{tab:sdxl-euler-nfe10-cfg-sweep-pairwise}
+  \begin{tabular}{llrrrr}
+    \toprule
+    CFG & comparison & $\Delta$CLIP & CLIP win (\%) & $\Delta$IR & IR win (\%) \\
+    \midrule
+    5 & AYS - base & +0.02 & 46.0 & +0.197 & 66.0 \\
+    5 & ours - base & -0.17 & 43.3 & +0.079 & 52.7 \\
+    5 & ours - AYS & -0.19 & 48.0 & -0.119 & 35.3 \\
+    7.5 & AYS - base & -0.33 & 44.7 & -0.036 & 49.3 \\
+    7.5 & ours - base & +0.09 & 46.7 & +0.122 & 54.7 \\
+    7.5 & ours - AYS & +0.42 & 58.0 & +0.158 & 52.7 \\
+    \bottomrule
+  \end{tabular}
+\end{table}

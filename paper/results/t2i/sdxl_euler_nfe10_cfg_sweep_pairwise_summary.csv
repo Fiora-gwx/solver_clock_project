@@ -1,0 +1,7 @@
+evidence_level,model,solver,nfe,guidance_scale,comparison,num_pairs,clip_score_mean_delta,clip_score_win_rate,clip_score_ci_low,clip_score_ci_high,image_reward_mean_delta,image_reward_win_rate,image_reward_ci_low,image_reward_ci_high,metric_direction
+matched_sdxl_cfg_sweep,sdxl,euler,10,5,AYS - base,150,0.023736,0.460000,-0.332297,0.355407,0.197256,0.660000,0.082367,0.309423,higher_is_better
+matched_sdxl_cfg_sweep,sdxl,euler,10,5,D-GPDE - base,150,-0.166760,0.433333,-0.505645,0.164496,0.078564,0.526667,-0.012499,0.174628,higher_is_better
+matched_sdxl_cfg_sweep,sdxl,euler,10,5,D-GPDE - AYS,150,-0.190496,0.480000,-0.494007,0.102656,-0.118692,0.353333,-0.208071,-0.036080,higher_is_better
+matched_sdxl_cfg_sweep,sdxl,euler,10,7.5,AYS - base,150,-0.328960,0.446667,-0.751119,0.072974,-0.036437,0.493333,-0.151865,0.075276,higher_is_better
+matched_sdxl_cfg_sweep,sdxl,euler,10,7.5,D-GPDE - base,150,0.087717,0.466667,-0.242949,0.413132,0.121939,0.546667,0.039323,0.213776,higher_is_better
+matched_sdxl_cfg_sweep,sdxl,euler,10,7.5,D-GPDE - AYS,150,0.416677,0.580000,0.007133,0.852251,0.158376,0.526667,0.069342,0.260703,higher_is_better

@@ -9,6 +9,7 @@ import torch
 
 
 ProgressCallback = Callable[[str, dict[str, object]], None]
+StageResultCallback = Callable[[int, "AysOptimizationResult"], None]
 
 
 @dataclass(frozen=True)
@@ -434,6 +435,7 @@ def hierarchical_optimize_schedule(
     device: torch.device,
     proxy_evaluator: Callable[[np.ndarray, int], float] | None = None,
     progress_callback: ProgressCallback | None = None,
+    stage_result_callback: StageResultCallback | None = None,
 ) -> AysHierarchicalResult:
     if config.initial_steps < 2:
         raise ValueError("AYS initial_steps must be at least 2.")
@@ -466,6 +468,8 @@ def hierarchical_optimize_schedule(
         stage_steps=len(initial_schedule) - 1,
     )
     stage_results[len(current_result.schedule) - 1] = current_result
+    if stage_result_callback is not None:
+        stage_result_callback(len(current_result.schedule) - 1, current_result)
     current_schedule = current_result.schedule
     if progress_callback is not None:
         progress_callback(
@@ -506,6 +510,8 @@ def hierarchical_optimize_schedule(
             stage_steps=len(current_schedule) - 1,
         )
         stage_results[len(current_result.schedule) - 1] = current_result
+        if stage_result_callback is not None:
+            stage_result_callback(len(current_result.schedule) - 1, current_result)
         current_schedule = current_result.schedule
         if progress_callback is not None:
             progress_callback(

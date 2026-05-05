@@ -1,0 +1,64 @@
+\section{Related Work}
+\label{sec:related-work}
+
+Our method sits between schedule optimization and solver design. The closest
+prior work asks how to choose the discretization grid; our distinction is that
+we estimate the local oracle-start defect of the target solver under the
+teacher marginal and then convert that defect into an equal-mass monitor.
+
+\textbf{Diffusion samplers and hand-designed schedules.}
+DDPMs, DDIMs, and score-SDE samplers define reverse generative dynamics and
+expose a finite set of model-evaluation locations
+\citep{ho2020ddpm,song2022ddim,song2021sde}. EDM makes the design space of
+preconditioning, noise parameterization, and polynomial noise schedules explicit
+\citep{karras2022edm}. These schedules are cheap, stable, and reusable, which
+makes them strong practical baselines. They are not, however, diagnostics of a
+particular solver's local prediction defect.
+
+\textbf{Offline and path-geometric schedule optimization.}
+AYS is the strongest direct schedule-optimization baseline in our setting. It
+uses stochastic calculus to build a Girsanov-based KL upper bound between the
+true generative SDE and a solver-induced linearized SDE, then searches for a
+schedule specific to a model, dataset, and solver \citep{sabour2024ays}. Its
+published Stable Diffusion schedules are therefore important baselines in the
+text-to-image sweep.
+
+Score-Optimal Diffusion Schedules are especially close conceptually
+\citep{williams2024scoreoptimal}. Williams et al. define a diffusion path cost
+from the work a Langevin corrector must perform after a predictor step. The
+resulting optimal generator is an inverse path-length parameterization: local
+costs are equalized along the sampling path. We keep this equalization
+principle but change the object being equalized. Instead of a path-intrinsic
+score-corrector cost under perfect-score assumptions, we measure the
+oracle-start one-step residual of the actual deterministic solver against a
+teacher flow, aggregate it over $p_u$, and use the $q$-th root dictated by the
+measured local defect order.
+
+Other optimized-timestep methods also move beyond fixed grids. Xue et al.
+optimize time steps by minimizing the distance between a ground-truth ODE
+solution and the numerical solution induced by a specific solver
+\citep{xue2024optimizedtimesteps}. This is close to the teacher-student
+motivation of our method, but their method solves an offline constrained
+optimization problem, whereas ours estimates a distributional local defect
+profile and materializes the schedule by inverse-CDF equalization.
+
+\textbf{Solver acceleration.}
+PNDM, DPM-Solver, DPM-Solver++, UniPC, and related predictor-corrector solvers
+reduce sampling cost by changing the numerical update rule
+\citep{liu2022pndm,lu2022dpmsolver,lu2025dpmsolverpp,zhao2023unipc}. STORK
+uses stabilized Taylor orthogonal Runge--Kutta ideas to improve mid-NFE
+diffusion and flow-matching sampling while addressing stiffness and
+structure-dependence \citep{tan2025stork}. These methods are complementary to
+our method: they change how a step is computed, while ours changes where a
+fixed solver evaluates the model. The distinction also matters for theory. Our
+main guarantee is stated for deterministic oracle-start ODE defects; multistep,
+stochastic, and scheduler-history solvers require either augmented-state
+analysis or empirical framing.
+
+\textbf{Learned fast samplers.}
+Differentiable sampler search and progressive distillation reduce NFE by
+optimizing sampler parameters or distilling many-step samplers into fewer-step
+generators \citep{watson2022fastsamplers,salimans2022progressive}. Our method
+does not update model weights and does not optimize an image-quality objective.
+Negative cases therefore diagnose the schedule monitor and its calibration
+distribution rather than a learned generator.

@@ -1,0 +1,11 @@
+evidence_level,backend,dataset,model,solver,method,nfe,seed_count,seeds,num_samples,metric,metric_direction,fid_mean,fid_std,fid_sem
+three_seed_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,base,10,3,"0,1,2",50000,FID,lower_is_better,20.565771,0.129941,0.075021
+three_seed_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,linear,10,3,"0,1,2",50000,FID,lower_is_better,20.565771,0.129941,0.075021
+three_seed_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,Karras,10,3,"0,1,2",50000,FID,lower_is_better,25.841488,0.179639,0.103715
+three_seed_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,offline,10,3,"0,1,2",50000,FID,lower_is_better,19.197856,0.147450,0.085130
+three_seed_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,D-GPDE,10,3,"0,1,2",50000,FID,lower_is_better,17.539309,0.130738,0.075482
+three_seed_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,base,20,3,"0,1,2",50000,FID,lower_is_better,11.173382,0.128824,0.074377
+three_seed_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,linear,20,3,"0,1,2",50000,FID,lower_is_better,11.203878,0.127419,0.073565
+three_seed_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,Karras,20,3,"0,1,2",50000,FID,lower_is_better,10.637144,0.151381,0.087400
+three_seed_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,offline,20,3,"0,1,2",50000,FID,lower_is_better,10.883802,0.101701,0.058717
+three_seed_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,D-GPDE,20,3,"0,1,2",50000,FID,lower_is_better,10.709165,0.122778,0.070886

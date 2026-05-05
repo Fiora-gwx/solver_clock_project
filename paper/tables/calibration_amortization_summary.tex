@@ -1,0 +1,23 @@
+\begin{table}[t]
+  \centering
+  \caption{Calibration amortization under reuse of the same schedule.
+  Columns report calibration overhead divided by generation cost after
+  reusing the schedule for $M$ evaluated-size batches. Break-even is the
+  smallest integer $M$ for which calibration cost is no larger than
+  generation cost.}
+  \label{tab:calibration-amortization-summary}
+  \small
+  \begin{tabular}{lllrrrr}
+    \toprule
+    Setting & condition & quality vs. base & $M=1$ & $M=10$ & $M=100$ & break-even \\
+    \midrule
+    CIFAR-10 & NFE 10 & +3.026 $\pm$ 0.019 FID & 8.49$\times$ & 0.85$\times$ & 0.08$\times$ & 9 \\
+    CIFAR-10 & NFE 20 & +0.464 $\pm$ 0.005 FID & 4.24$\times$ & 0.42$\times$ & 0.04$\times$ & 5 \\
+    SD1.5 & CFG 5 & -0.133 IR & 8{,}487$\times$ & 848.70$\times$ & 84.87$\times$ & 8487 \\
+    SD1.5 & CFG 7.5 & -0.084 IR & 8{,}487$\times$ & 848.70$\times$ & 84.87$\times$ & 8487 \\
+    SD1.5 & CFG 10 & -0.087 IR & 8{,}487$\times$ & 848.70$\times$ & 84.87$\times$ & 8487 \\
+    SDXL & CFG 5 & +0.079 IR & 68.62$\times$ & 6.86$\times$ & 0.69$\times$ & 69 \\
+    SDXL & CFG 7.5 & +0.122 IR & 68.62$\times$ & 6.86$\times$ & 0.69$\times$ & 69 \\
+    \bottomrule
+  \end{tabular}
+\end{table}

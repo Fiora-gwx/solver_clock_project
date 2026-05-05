@@ -231,7 +231,7 @@ def canonical_schedule_name(name: str) -> tuple[str, str]:
         "linear": ("linear", "linear"),
         "ays": ("ays", "ays_like"),
         "gpde": ("GPDE", "GPDE"),
-        "goes": ("GPDE", "GPDE"),
+        "goes": ("GOES", "GOES"),
         "legacy_sadb": ("LEGACY_SADB", "LEGACY_SADB"),
         "fp_clock": ("FP_CLOCK", "FP_CLOCK"),
     }
@@ -327,7 +327,7 @@ def resolve_schedule_clock_configs(
 
     for raw_key, raw_value in raw_mapping.items():
         schedule_name, _ = canonical_schedule_name(str(raw_key))
-        if schedule_name not in {*configs, "GPDE"}:
+        if schedule_name not in {*configs, "GPDE", "GOES"}:
             raise ValueError(f"Unsupported materializable schedule in `schedule_clock_configs`: {raw_key}")
         if isinstance(raw_value, str):
             configs[schedule_name] = ((None, raw_value),)
@@ -427,7 +427,7 @@ GOES_COMMON_CLI_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("microbatch_size", "--microbatch-size", ("calibration_microbatch_size", "pilot_observation_microbatch")),
     ("ref_nfe", "--ref-nfe", ()),
     ("ref_grid_size", "--ref-grid-size", ()),
-    ("probe_grid_size", "--probe-grid-size", ("candidate_grid_size",)),
+    ("candidate_grid_size", "--candidate-grid-size", ("probe_grid_size",)),
     ("probe_step_multipliers", "--probe-step-multipliers", ()),
     ("q_mode", "--q-mode", ()),
     ("fixed_q", "--fixed-q", ()),
@@ -588,8 +588,8 @@ def cached_schedule_root(cache_root: Path, schedule_folder: str, backend: str, *
 
 def is_materializable_schedule(backend: str, schedule_name: str) -> bool:
     materializable = {
-        "pndm": {"linear", "GPDE", "LEGACY_SADB", "FP_CLOCK"},
-        "diffusers": {"linear", "GPDE", "LEGACY_SADB", "FP_CLOCK"},
+        "pndm": {"linear", "GPDE", "GOES", "LEGACY_SADB", "FP_CLOCK"},
+        "diffusers": {"linear", "GPDE", "GOES", "LEGACY_SADB", "FP_CLOCK"},
     }
     return schedule_name in materializable.get(backend, set())
 
@@ -612,7 +612,7 @@ def schedule_target_dir(root: Path, nfe: int) -> Path:
 
 
 def maybe_seeded_schedule_parts(parts: tuple[str, ...], *, schedule_name: str, seed: int, seed_count: int) -> tuple[str, ...]:
-    if schedule_name in {"GPDE", "LEGACY_SADB", "FP_CLOCK"} and seed_count > 1:
+    if schedule_name in {"GPDE", "GOES", "LEGACY_SADB", "FP_CLOCK"} and seed_count > 1:
         return (*parts, f"seed_{int(seed)}")
     return parts
 
@@ -772,7 +772,7 @@ def build_pndm_prepare_steps(
             for nfe in target_nfes
         )
 
-    if schedule_name == "GPDE":
+    if schedule_name in {"GPDE", "GOES"}:
         validate_goes_pndm_solver(solver)
         active_goes_config = goes_config or {}
         goes_parts = schedule_parts or pndm_schedule_parts(
@@ -791,7 +791,7 @@ def build_pndm_prepare_steps(
         reuse_args = ("--no-reuse-oracle",) if bool(active_goes_config.get("no_reuse_oracle", False)) else ()
         return tuple(
             PrepareStep(
-                key=f"GPDE:pndm:{':'.join(goes_parts)}:{nfe}",
+                key=f"{schedule_name}:pndm:{':'.join(goes_parts)}:{nfe}",
                 runtime_backend="pndm",
                 output_path=schedule_target_dir(root, nfe),
                 arguments=(
@@ -923,7 +923,7 @@ def build_diffusers_prepare_steps(
             for nfe in target_nfes
         )
 
-    if schedule_name == "GPDE":
+    if schedule_name in {"GPDE", "GOES"}:
         active_goes_config = goes_config or {}
         goes_parts = schedule_parts or extend_schedule_parts((model_key, solver), clock_label)
         root = cached_schedule_root(schedule_cache_root, schedule_folder, "diffusers", *goes_parts)
@@ -934,7 +934,7 @@ def build_diffusers_prepare_steps(
         reuse_args = ("--no-reuse-oracle",) if bool(active_goes_config.get("no_reuse_oracle", False)) else ()
         return tuple(
             PrepareStep(
-                key=f"GPDE:diffusers:{':'.join(goes_parts)}:{nfe}",
+                key=f"{schedule_name}:diffusers:{':'.join(goes_parts)}:{nfe}",
                 runtime_backend="diffusers",
                 output_path=schedule_target_dir(root, nfe),
                 arguments=(
@@ -1067,7 +1067,7 @@ def build_pndm_invocations(
                 active_schedules = solver_schedule_overrides[solver]
                 for raw_schedule in active_schedules:
                     schedule_name, schedule_folder, requested_clock_label = parse_schedule_spec(str(raw_schedule))
-                    if schedule_name == "GPDE":
+                    if schedule_name in {"GPDE", "GOES"}:
                         validate_goes_pndm_solver(solver)
                     active_clock_variants = active_clock_variants_for_schedule(
                         schedule_name,
@@ -1103,7 +1103,7 @@ def build_pndm_invocations(
                         display_name = schedule_display_name(schedule_name, clock_variant.label)
                         active_goes_config = (
                             resolve_goes_variant_config(goes_config, clock_variant)
-                            if schedule_name == "GPDE"
+                            if schedule_name in {"GPDE", "GOES"}
                             else goes_config
                         )
 
@@ -1259,7 +1259,7 @@ def build_diffusers_invocations(
                 active_schedules = solver_schedule_overrides[solver]
                 for raw_schedule in active_schedules:
                     schedule_name, schedule_folder, requested_clock_label = parse_schedule_spec(str(raw_schedule))
-                    if schedule_name == "GPDE":
+                    if schedule_name in {"GPDE", "GOES"}:
                         validate_goes_diffusers_solver(
                             model_key=model_key,
                             model_config=model_config,
@@ -1277,7 +1277,7 @@ def build_diffusers_invocations(
                         display_name = schedule_display_name(schedule_name, clock_variant.label)
                         active_goes_config = (
                             resolve_goes_variant_config(goes_config, clock_variant)
-                            if schedule_name == "GPDE"
+                            if schedule_name in {"GPDE", "GOES"}
                             else goes_config
                         )
 
@@ -1971,7 +1971,7 @@ def experiment_includes_goes(experiment_config: Mapping[str, Any]) -> bool:
                 raw_schedules.extend(schedules)
             elif schedules:
                 raw_schedules.append(schedules)
-    return any(parse_schedule_spec(str(schedule))[0] == "GPDE" for schedule in raw_schedules)
+    return any(parse_schedule_spec(str(schedule))[0] in {"GPDE", "GOES"} for schedule in raw_schedules)
 
 
 def run_goes_oracle_reuse_report(
@@ -1982,15 +1982,19 @@ def run_goes_oracle_reuse_report(
 ) -> None:
     if not experiment_includes_goes(experiment_config):
         return
-    schedule_root = execution_config.schedule_cache_root / "GPDE"
-    if not resolve_repo_path(schedule_root).exists():
-        print(f"[goes-oracle-reuse] skipped: no GPDE schedule root at {schedule_root}")
+    schedule_roots = [
+        execution_config.schedule_cache_root / family
+        for family in ("GPDE", "GOES")
+        if resolve_repo_path(execution_config.schedule_cache_root / family).exists()
+    ]
+    if not schedule_roots:
+        print(f"[goes-oracle-reuse] skipped: no GPDE/GOES schedule root at {execution_config.schedule_cache_root}")
         return
     output_csv = experiment_output_root(args, experiment_config) / "paper_tables" / "oracle_reuse_cost.csv"
     report_args = (
         sys.executable,
         "scripts/report_goes_oracle_reuse_cost.py",
-        str(schedule_root),
+        *(str(root) for root in schedule_roots),
         "--output-csv",
         str(output_csv),
     )

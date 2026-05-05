@@ -1,0 +1,18 @@
+\begin{table}[t]
+  \centering
+  \caption{Retained lightweight offline-proxy CIFAR-10 baseline.
+  Rows report PNDM/CIFAR-10 Euler FID, mean $\pm$ standard error over
+  seeds 0, 1, and 2 with 50k generated images per seed. The
+  offline-proxy schedule is a small-budget project-owned hierarchical
+  coordinate-search run, not the published AYS schedule. Lower FID is
+  better.}
+  \label{tab:cifar10-pndm-euler-50k-offline-proxy}
+  \begin{tabular}{rrrrr}
+    \toprule
+    NFE & base & Karras & ours & offline-proxy \\
+    \midrule
+    10 & 20.57 $\pm$ 0.08 & 25.84 $\pm$ 0.10 & 17.54 $\pm$ 0.08 & 41.37 $\pm$ 0.13 \\
+    20 & 11.17 $\pm$ 0.07 & 10.64 $\pm$ 0.09 & 10.71 $\pm$ 0.07 & 22.36 $\pm$ 0.05 \\
+    \bottomrule
+  \end{tabular}
+\end{table}

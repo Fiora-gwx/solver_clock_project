@@ -106,7 +106,32 @@ def parse_args() -> argparse.Namespace:
 
 
 def _probe_grid_size(args: argparse.Namespace) -> int:
-    return int(args.probe_grid_size if args.candidate_grid_size is None else args.candidate_grid_size)
+    candidate_grid_size = getattr(args, "candidate_grid_size", None)
+    probe_grid_size = getattr(args, "probe_grid_size", candidate_grid_size)
+    if candidate_grid_size is not None:
+        return int(candidate_grid_size)
+    return int(probe_grid_size)
+
+
+def _probe_step_multipliers_arg(args: argparse.Namespace) -> str:
+    return str(getattr(args, "probe_step_multipliers", "1,2,4"))
+
+
+def _q_mode_arg(args: argparse.Namespace) -> str:
+    return str(getattr(args, "q_mode", "global_fit"))
+
+
+def _fixed_q_arg(args: argparse.Namespace) -> float | None:
+    value = getattr(args, "fixed_q", None)
+    return None if value is None else float(value)
+
+
+def _monitor_smoothing_window_arg(args: argparse.Namespace) -> int:
+    return int(getattr(args, "monitor_smoothing_window", 3))
+
+
+def _monitor_epsilon_arg(args: argparse.Namespace) -> float:
+    return float(getattr(args, "monitor_epsilon", 1.0e-12))
 
 
 def _load_prompt_batch(manifest: AssetManifest, prompt_asset_or_path: str, total_samples: int) -> list[str]:
@@ -138,7 +163,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     if int(args.ref_grid_size) < 2:
         raise ValueError("--ref-grid-size must be at least 2.")
     if _probe_grid_size(args) < int(args.nfe) + 1:
-        raise ValueError("--probe-grid-size must be at least --nfe + 1.")
+        flag = "--candidate-grid-size" if getattr(args, "candidate_grid_size", None) is not None else "--probe-grid-size"
+        raise ValueError(f"{flag} must be at least --nfe + 1.")
     if int(getattr(args, "anchor_nfe", 0)) < 0:
         raise ValueError("--anchor-nfe must be non-negative.")
     if int(getattr(args, "window_size", 0)) < 0:
@@ -149,11 +175,11 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--replay-q-min must be finite and greater than 1.")
     if not math.isfinite(replay_q_max) or replay_q_max <= replay_q_min:
         raise ValueError("--replay-q-max must be finite and greater than --replay-q-min.")
-    if int(args.monitor_smoothing_window) < 1:
+    if _monitor_smoothing_window_arg(args) < 1:
         raise ValueError("--monitor-smoothing-window must be positive.")
-    if float(args.monitor_epsilon) <= 0.0:
+    if _monitor_epsilon_arg(args) <= 0.0:
         raise ValueError("--monitor-epsilon must be positive.")
-    if args.q_mode == "fixed" and (args.fixed_q is None or float(args.fixed_q) <= 0.0):
+    if _q_mode_arg(args) == "fixed" and (_fixed_q_arg(args) is None or float(_fixed_q_arg(args)) <= 0.0):
         raise ValueError("--fixed-q must be positive when --q-mode=fixed.")
     rho = float(args.rho)
     if not math.isfinite(rho) or not 0.0 <= rho <= 1.0:
@@ -299,7 +325,8 @@ def _goes_context_metadata(
     microbatch_size = int(args.microbatch_size) if int(args.microbatch_size) > 0 else None
     calibration_samples = int(args.batch_size) * int(args.num_batches)
     probe_nodes = _probe_grid_size(args)
-    probe_step_count = len(parse_float_list(args.probe_step_multipliers, default=(1.0, 2.0, 4.0)))
+    probe_step_count = len(parse_float_list(_probe_step_multipliers_arg(args), default=(1.0, 2.0, 4.0)))
+    candidate_edges = int(probe_nodes) * (int(probe_nodes) + 1) // 2
     normalized_solver = str(args.solver).lower().replace("-", "_")
     solver_evals_per_edge = 2 if normalized_solver == "flow_heun" else 1
     cfg_multiplier = 2 if float(args.guidance_scale) != 1.0 else 1
@@ -309,15 +336,26 @@ def _goes_context_metadata(
         window_size = int(replay_meta.get("window_size", _default_window_size(args, normalized_solver)))
         oracle_cost_per_sample = int(replay_meta.get("calibration_cost_per_sample", anchor_nfe * (4 + 7 * window_size)))
         probe_cost_per_sample = 0
+        edge_cost_per_sample = 0
         calibration_cost = calibration_samples * cfg_multiplier * oracle_cost_per_sample
         cost_note = "Estimated history-aware anchored replay scheduler steps; CFG multiplier counts unconditional/conditional branches and excludes generation."
     else:
         anchor_nfe = None
         window_size = None
         oracle_cost_per_sample = 4 * int(args.ref_nfe) + int(args.ref_grid_size)
-        probe_cost_per_sample = probe_nodes * probe_step_count * solver_evals_per_edge
-        calibration_cost = calibration_samples * cfg_multiplier * (oracle_cost_per_sample + probe_cost_per_sample)
+        edge_cost_per_sample = candidate_edges * solver_evals_per_edge
+        probe_cost_per_sample = edge_cost_per_sample
+        calibration_cost = calibration_samples * cfg_multiplier * (oracle_cost_per_sample + edge_cost_per_sample)
         cost_note = "Estimated RK4 oracle drift calls plus oracle-start GPDE probe drift calls; CFG multiplier counts unconditional/conditional branches and excludes generation."
+    grid_config = {
+        "size": int(probe_nodes),
+        "type": "uniform_in_negative_sigma",
+        "probe_step_multipliers": parse_float_list(_probe_step_multipliers_arg(args), default=(1.0, 2.0, 4.0)),
+        "q_mode": _q_mode_arg(args),
+        "fixed_q": _fixed_q_arg(args),
+        "monitor_smoothing_window": _monitor_smoothing_window_arg(args),
+        "monitor_epsilon": _monitor_epsilon_arg(args),
+    }
     return {
         "model_asset": str(args.model_asset),
         "model_path": "" if model_path is None else str(model_path),
@@ -369,21 +407,16 @@ def _goes_context_metadata(
             "cache_dir": str(args.oracle_cache_dir),
             "reuse": not bool(args.no_reuse_oracle),
         },
-        "probe_grid_config": {
-            "size": int(probe_nodes),
-            "type": "uniform_in_negative_sigma",
-            "probe_step_multipliers": parse_float_list(args.probe_step_multipliers, default=(1.0, 2.0, 4.0)),
-            "q_mode": str(args.q_mode),
-            "fixed_q": None if args.fixed_q is None else float(args.fixed_q),
-            "monitor_smoothing_window": int(args.monitor_smoothing_window),
-            "monitor_epsilon": float(args.monitor_epsilon),
-        },
+        "probe_grid_config": grid_config,
+        "candidate_grid_config": dict(grid_config),
         "calibration_cost_estimate": int(calibration_cost),
         "calibration_cost_unit": "model_evaluation_equivalents",
         "calibration_cost_breakdown": {
             "num_samples": calibration_samples,
             "cfg_multiplier": int(cfg_multiplier),
             "oracle_cost_per_sample": int(oracle_cost_per_sample),
+            "candidate_edges": int(candidate_edges),
+            "edge_cost_per_sample": int(edge_cost_per_sample),
             "probe_nodes": int(probe_nodes),
             "probe_step_count": int(probe_step_count),
             "solver_evals_per_edge": int(solver_evals_per_edge),

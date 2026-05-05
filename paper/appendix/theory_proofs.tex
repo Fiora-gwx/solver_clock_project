@@ -1,0 +1,173 @@
+\section{Additional Theory Details and Proofs}
+\label{app:theory-proofs}
+
+This appendix supplies the proof details that are not central to the main
+paper narrative. All results concern oracle-start local defects for
+deterministic ODE solvers and support local risk calibration only.
+
+\subsection{Mixed residual decomposition}
+\label{app:mixed-residual}
+
+Let $T=T_{k,G}(b)$ satisfy $T^\top G(b)T=1$. The $G(b)$-orthogonal tangent
+projection of $r$ is
+\begin{equation}
+  r_\parallel^{G(b)}=(T^\top G(b)r)T,
+\end{equation}
+and $r_\perp^{G(b)}=r-r_\parallel^{G(b)}$. Orthogonality gives
+\begin{equation}
+  \|r\|_{G(b)}^2
+  =
+  \|r_\perp^{G(b)}\|_{G(b)}^2
+  +
+  \|r_\parallel^{G(b)}\|_{G(b)}^2,
+\end{equation}
+with
+\begin{equation}
+  \|r_\parallel^{G(b)}\|_{G(b)}^2=(T^\top G(b)r)^2.
+\end{equation}
+Substituting into Eq.~\eqref{eq:mixed-norm} yields
+Eq.~\eqref{eq:mixed-decomposition}.
+
+\subsection{Equal monitor mass}
+\label{app:equal-monitor-mass}
+
+For completeness we prove Lemma~\ref{lem:equal-monitor-mass}. The interval
+masses satisfy $\sum_{i=0}^{N-1}M_i=\Omega_{\mathcal R}$, so their maximum is
+at least their average. Equality holds exactly when all masses are equal. Since
+$\omega_{\mathcal R}>0$, the cumulative monitor clock
+$\tau_{\mathcal R}$ is strictly increasing and invertible, and the inverse-CDF
+construction in Eq.~\eqref{eq:inverse-cdf-schedule} gives equal increments of
+normalized cumulative mass.
+
+\subsection{Full proof of asymptotic minimax optimality}
+\label{app:minimax-proof}
+
+For the equal-mass schedule $U^\Omega$,
+\begin{equation}
+  \mathcal M_{\mathcal R}([u_i^\Omega,u_{i+1}^\Omega])
+  =
+  \frac{\Omega_{\mathcal R}}{N}.
+\end{equation}
+Since $\omega_{\mathcal R}(u)\ge\omega_{\min}$,
+\begin{equation}
+  h_i^\Omega
+  =
+  u_{i+1}^\Omega-u_i^\Omega
+  \le
+  \frac{\Omega_{\mathcal R}/N}{\omega_{\min}}
+  =
+  O(N^{-1}).
+\end{equation}
+Using Assumption~\ref{assump:uniform-monitor},
+\begin{align}
+  \bar D_{\mathcal R}(u_i^\Omega,u_{i+1}^\Omega)
+  &\le
+  \mathcal M_{\mathcal R}([u_i^\Omega,u_{i+1}^\Omega])^q
+  +C_E(h_i^\Omega)^{q+1}\\
+  &\le
+  \left(\frac{\Omega_{\mathcal R}}{N}\right)^q
+  +C_1N^{-(q+1)}.
+\end{align}
+Taking the maximum over intervals proves the upper bound.
+
+Now consider any admissible schedule $U$ with $h_{\max}\le C_h/N$. Define
+$M_i=\mathcal M_{\mathcal R}([u_i,u_{i+1}])$. Since
+$\sum_iM_i=\Omega_{\mathcal R}$, there exists $j$ such that
+$M_j\ge\Omega_{\mathcal R}/N$. Again by
+Assumption~\ref{assump:uniform-monitor},
+\begin{align}
+  \bar D_{\mathcal R}(u_j,u_{j+1})
+  &\ge
+  M_j^q-C_Eh_j^{q+1}\\
+  &\ge
+  \left(\frac{\Omega_{\mathcal R}}{N}\right)^q
+  -C_E\left(\frac{C_h}{N}\right)^{q+1}\\
+  &=
+  \left(\frac{\Omega_{\mathcal R}}{N}\right)^q
+  -C_2N^{-(q+1)}.
+\end{align}
+Therefore the maximum interval defect of any admissible schedule is at least
+this lower bound.
+
+\subsection{Monte Carlo estimation of the mean monitor}
+\label{app:mc-proof}
+
+Since $x_k^\star(u)\sim p_u$, the random variables
+$a_k(u)=a_{\mathcal S}(x_k^\star(u),u)$ are i.i.d. samples from the
+distribution of $a_{\mathcal S}(x,u)$ under $p_u$. If the variance is finite,
+the central limit theorem gives
+\begin{equation}
+  \frac{1}{K}\sum_{k=1}^K a_k(u)
+  -
+  \mathbb E_{x\sim p_u}[a_{\mathcal S}(x,u)]
+  =
+  O_p(K^{-1/2}).
+\end{equation}
+If coefficients are estimated from finite probes, write
+$\widehat a_k(u)=a_k(u)+\delta_k(u)$ with
+$K^{-1}\sum_k\delta_k(u)=O(\varepsilon_{\rm probe}(u))$. Then
+\begin{equation}
+  \widehat a_{\rm mean}(u)-\bar a_{\rm mean}(u)
+  =
+  O_p(K^{-1/2})+O(\varepsilon_{\rm probe}(u)).
+\end{equation}
+
+\subsection{Inverse-CDF stability}
+\label{app:inverse-stability-proof}
+
+Let
+\begin{equation}
+  F(u)=\int_{u_{\min}}^u\omega_{\mathcal R}(\xi)d\xi,
+  \qquad
+  \widehat F(u)=\int_{u_{\min}}^u\widehat\omega_{\mathcal R}(\xi)d\xi.
+\end{equation}
+If $\sup_u|\widehat F(u)-F(u)|\le\varepsilon_F$ and
+$\omega_{\mathcal R}(u)\ge\omega_{\min}>0$, then $F^{-1}$ is Lipschitz with
+constant at most $1/\omega_{\min}$. The corresponding exact and estimated
+schedules satisfy
+\begin{equation}
+  \max_m|\widehat u_m-u_m|
+  \le
+  \frac{\varepsilon_F}{\omega_{\min}}+O(\varepsilon_F^2).
+\end{equation}
+The second-order term accounts for local nonlinear curvature of the inverse
+map and normalization effects in the estimated cumulative mass.
+
+\subsection{Distributional coupling interpretation}
+\label{app:w2-coupling}
+
+Let $p_{\star,T}$ be the terminal teacher distribution and
+$p_{\mathcal S,T}$ the terminal student distribution induced by schedule $U$.
+For a shared initial sample $x_0$, define
+\begin{equation}
+  x_T^\star=F_{u_{\min}\rightarrow T}(x_0),
+  \qquad
+  x_T^{\mathcal S}=\Phi_{\mathcal S,U}(x_0).
+\end{equation}
+This shared-noise construction is a coupling between $p_{\star,T}$ and
+$p_{\mathcal S,T}$, hence
+\begin{equation}
+  W_2^2(p_{\mathcal S,T},p_{\star,T})
+  \le
+  \mathbb E_{x_0}\!\left[\|x_T^{\mathcal S}-x_T^\star\|_{G_T}^2\right].
+\end{equation}
+Under a first-order error propagation expansion,
+\begin{equation}
+  x_T^{\mathcal S}-x_T^\star
+  =
+  \sum_{i=0}^{N-1}S_ie_i+\text{higher-order terms},
+\end{equation}
+where $e_i$ is the oracle-start local error at step $i$, stability of the
+downstream flow gives the conservative proxy
+\begin{equation}
+  W_2^2(p_{\mathcal S,T},p_{\star,T})
+  \le
+  C_{\rm stab}(U)
+  \sum_{i=0}^{N-1}
+  \mathbb E_{x\sim p_{u_i}}
+  [d_{\mathcal S}(x;u_i,u_{i+1})]
+  +\text{higher-order terms}.
+\end{equation}
+This is an interpretation, not the main guarantee: local defect controls a
+first-order coupling proxy under stability assumptions, but it is not an exact
+final image-quality objective.

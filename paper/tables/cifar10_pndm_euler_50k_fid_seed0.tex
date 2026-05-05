@@ -1,0 +1,16 @@
+\begin{table}[t]
+  \centering
+  \caption{PNDM/CIFAR-10 FID for the Euler solver. Schedules are
+  base and our schedule, NFE is listed per row, seed count is 1 seed
+  (0), and FID is lower-is-better. Each row uses 50000
+  generated images. This is a 50k FID run for seed 0; it does not support multi-seed reliability or significance claims.}
+  \label{tab:cifar10-pndm-euler-50k-fid-seed0}
+  \begin{tabular}{rrrr}
+    \toprule
+    NFE & base FID $\downarrow$ & ours FID $\downarrow$ & FID reduction \\
+    \midrule
+    10 & 20.71 & 17.68 & 3.04 \\
+    20 & 11.32 & 10.85 & 0.47 \\
+    \bottomrule
+  \end{tabular}
+\end{table}

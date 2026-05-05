@@ -13,6 +13,7 @@ import numpy as np
 from .aggregation import aggregation_label
 from .config import load_config, repo_path, stable_hash, write_config
 from .coordinate import make_coordinate_adapter
+from .dp_minimax import MinimaxPath, solve_minimax_schedule
 from .edge_evaluator import ReplayMetrics, evaluate_replay_metrics
 from .gpde import (
     default_q_for_solver,
@@ -25,7 +26,9 @@ from .logging_utils import dump_json, make_run_dir, maybe_write_nfe_quality_curv
 from .metrics import Metric, make_metric
 from .oracle import OracleData
 from .oracle_cache import OracleCacheResult, build_or_load_oracle
+from .replay_refinement import refine_schedule_blackbox
 from .schedules import gpde_schedule_payload, save_schedule_outputs
+from .schedules import GOES_SCHEDULE_IMPLEMENTATION_VERSION
 from .toy import make_solver, make_toy_model
 from .verify import verify_schedule_payload
 
@@ -349,6 +352,34 @@ def _save_probe_profile(profile: Any, run_dir: Path) -> None:
     dump_json(profile.metadata, run_dir / "q_estimate.json")
 
 
+def _monitor_edge_cost_matrix(probe_grid: np.ndarray, monitor_density: np.ndarray) -> np.ndarray:
+    grid = np.asarray(probe_grid, dtype=np.float64)
+    density = np.asarray(monitor_density, dtype=np.float64)
+    if grid.ndim != 1 or density.ndim != 1 or grid.shape != density.shape:
+        raise ValueError("probe_grid and monitor_density must be matching 1D arrays.")
+    if grid.size < 2:
+        raise ValueError("probe_grid must contain at least two nodes.")
+    intervals = np.diff(grid)
+    if np.any(intervals <= 0.0):
+        raise ValueError("probe_grid must be strictly increasing.")
+    masses = 0.5 * (density[:-1] + density[1:]) * intervals
+    cumulative = np.concatenate([[0.0], np.cumsum(masses)])
+    edge_costs = np.full((grid.size, grid.size), np.inf, dtype=np.float64)
+    for start in range(grid.size - 1):
+        edge_costs[start, start + 1 :] = cumulative[start + 1 :] - cumulative[start]
+    return edge_costs
+
+
+def _nearest_probe_indices(probe_grid: np.ndarray, u_schedule: np.ndarray) -> list[int]:
+    grid = np.asarray(probe_grid, dtype=np.float64)
+    schedule = np.asarray(u_schedule, dtype=np.float64)
+    return [int(np.argmin(np.abs(grid - value))) for value in schedule]
+
+
+def _selected_edge_costs(edge_costs: np.ndarray, selected_indices: list[int]) -> list[float]:
+    return [float(edge_costs[start, stop]) for start, stop in zip(selected_indices[:-1], selected_indices[1:])]
+
+
 def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command: str = "search") -> dict[str, Any]:
     started = time.time()
     deterministic_seeds = _set_deterministic_seeds(config)
@@ -402,18 +433,70 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
     if bool(admissible_config.get("enabled", False)):
         admissible_size = int(admissible_config.get("size") or max(probe_size, int(config["solver"]["target_nfe"]) + 1))
         admissible_grid = make_probe_grid(coordinate.u_min, coordinate.u_max, admissible_size)
+    target_nfe = int(config["solver"]["target_nfe"])
     schedule = materialize_gpde_schedule(
         profile.probe_grid,
         profile.monitor_density,
-        int(config["solver"]["target_nfe"]),
+        target_nfe,
         admissible_grid=admissible_grid,
     )
+    edge_costs = _monitor_edge_cost_matrix(profile.probe_grid, profile.monitor_density)
+    pre_refinement_path: MinimaxPath | None = None
+    refinement_history: list[dict[str, Any]] = []
+    selected_indices = list(schedule.selected_indices)
+    selected_costs = [float(item) for item in schedule.interval_monitor_masses]
+    schedule_metadata = dict(schedule.metadata)
+    replay_config = config.get("replay_refinement", {})
+    if bool(replay_config.get("enabled", False)):
+        pre_refinement_path = solve_minimax_schedule(
+            edge_costs,
+            target_nfe,
+            tie_break_sum_cost=True,
+            tie_tolerance=float(config.get("optimizer", {}).get("tie_tolerance", 1.0e-12)),
+        )
+        initial_schedule = np.asarray(profile.probe_grid, dtype=np.float64)[pre_refinement_path.indices]
+        refinement = refine_schedule_blackbox(
+            solver,
+            oracle_result.oracle,
+            initial_schedule,
+            profile.probe_grid,
+            metric,
+            rho=float(config["mixed_defect"]["rho"]),
+            aggregation=config["aggregation"],
+            rounds=int(replay_config.get("rounds", 3)),
+            local_window=int(replay_config.get("local_window", 8)),
+            lambda_final=float(replay_config.get("lambda_final", 0.0)),
+            mu_smooth=float(replay_config.get("mu_smooth", 0.0)),
+            fallback_full_residual_on_tiny_tangent=bool(
+                config["mixed_defect"].get("fallback_full_residual_on_tiny_tangent", True)
+            ),
+        )
+        u_schedule = np.asarray(refinement.u_schedule, dtype=np.float64)
+        selected_indices = _nearest_probe_indices(profile.probe_grid, u_schedule)
+        selected_costs = _selected_edge_costs(edge_costs, selected_indices)
+        schedule_metadata.update(
+            {
+                "monitor_objective": max(selected_costs) if selected_costs else 0.0,
+                "pre_refinement_monitor_objective": pre_refinement_path.objective,
+                "pre_refinement_schedule_indices": pre_refinement_path.indices,
+                "refinement_enabled": True,
+            }
+        )
+        refinement_history = [dict(item) for item in getattr(refinement, "history", [])]
+    else:
+        u_schedule = schedule.u_schedule
     search_seconds = time.time() - search_started
-    u_schedule = schedule.u_schedule
+
+    np.savez_compressed(
+        run_dir / "edge_costs.npz",
+        edge_costs=edge_costs,
+        probe_grid=profile.probe_grid,
+        candidate_grid=profile.probe_grid,
+    )
 
     payload = gpde_schedule_payload(
         solver_name=solver.name,
-        target_nfe=int(config["solver"]["target_nfe"]),
+        target_nfe=target_nfe,
         coordinate=coordinate,
         u_schedule=u_schedule,
         rho=float(config["mixed_defect"]["rho"]),
@@ -421,16 +504,20 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
         aggregation_config=config["aggregation"],
         oracle_cache_key=oracle_result.cache_key,
         profile_metadata=profile.metadata,
-        schedule_metadata=schedule.metadata,
-        selected_indices=schedule.selected_indices,
-        interval_monitor_masses=schedule.interval_monitor_masses,
+        schedule_metadata=schedule_metadata,
+        selected_indices=selected_indices,
+        interval_monitor_masses=np.asarray(selected_costs, dtype=np.float64),
         snap_errors=schedule.snap_errors,
+        extra={
+            "method": "GOES",
+            "schedule_implementation_version": GOES_SCHEDULE_IMPLEMENTATION_VERSION,
+        },
     )
     save_schedule_outputs(
         run_dir,
         payload=payload,
-        selected_indices=schedule.selected_indices,
-        selected_edge_costs=schedule.interval_monitor_masses,
+        selected_indices=selected_indices,
+        selected_edge_costs=selected_costs,
     )
     _save_probe_profile(profile, run_dir)
     config_resolved_path = write_config(config, run_dir / "config.resolved.yaml")
@@ -453,7 +540,7 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
         heldout_oracle=heldout_result.oracle,
         goes_schedule=u_schedule,
         uniform_schedule=uniform_schedule,
-        edge_objective=schedule.objective,
+        edge_objective=float(payload["edge_objective"]),
         tiny_tangent_fallback_fraction=profile.fallback_fraction,
     )
     metric_fields = [
@@ -487,7 +574,7 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
                 "rho": float(config["mixed_defect"]["rho"]),
                 "metric": metric.metadata()["name"],
                 "aggregation": aggregation_label(config["aggregation"]),
-                "edge_objective": schedule.objective,
+                "edge_objective": float(payload["edge_objective"]),
                 "heldout_final_latent_mse": next(
                     row["final_latent_mse"] for row in heldout_rows if row["schedule"] == "GPDE"
                 ),
@@ -514,8 +601,10 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
     if bool(config.get("output", {}).get("save_plots", True)):
         plots_written = maybe_write_plots(
             run_dir,
+            candidate_grid=profile.probe_grid,
+            edge_costs=edge_costs,
             u_schedule=u_schedule,
-            selected_edge_costs=np.asarray(schedule.interval_monitor_masses, dtype=np.float64),
+            selected_edge_costs=np.asarray(selected_costs, dtype=np.float64),
         )
     else:
         plots_written = []
@@ -539,7 +628,7 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
         "search_seconds": search_seconds,
         "total_seconds": time.time() - started,
         "probe_profile": profile.metadata,
-        "schedule_materialization": schedule.metadata,
+        "schedule_materialization": schedule_metadata,
         "mixed_defect": {
             "rho": float(config["mixed_defect"]["rho"]),
             "tiny_tangent_fallback_fraction": profile.fallback_fraction,
@@ -567,9 +656,9 @@ def _search_once(config: dict[str, Any], run_dir: Path | None = None, *, command
         "heldout_noise_seeds": heldout_result.oracle.metadata.get("noise_seeds"),
         "schedule_hash": payload["schedule_hash"],
         "plots_written": plots_written,
-        "refinement_history": [],
-        "pre_refinement_edge_objective": None,
-        "pre_refinement_schedule_indices": None,
+        "refinement_history": refinement_history,
+        "pre_refinement_edge_objective": None if pre_refinement_path is None else float(pre_refinement_path.objective),
+        "pre_refinement_schedule_indices": None if pre_refinement_path is None else [int(item) for item in pre_refinement_path.indices],
     }
     dump_json(run_metadata, run_dir / "run_metadata.json")
     return {
@@ -857,6 +946,8 @@ def oracle_convergence_command(config: dict[str, Any], values: list[int]) -> dic
         else:
             row["monitor_correlation_to_highest_ref"] = ""
             row["monitor_rank_correlation_to_highest_ref"] = ""
+        row["edge_cost_correlation_to_highest_ref"] = row["monitor_correlation_to_highest_ref"]
+        row["edge_cost_rank_correlation_to_highest_ref"] = row["monitor_rank_correlation_to_highest_ref"]
     write_csv(rows, run_dir / "paper_tables" / "oracle_convergence.csv")
     _write_top_level_run_metadata(
         config,
@@ -888,6 +979,8 @@ def nfe_sweep_command(config: dict[str, Any], values: list[int]) -> dict[str, An
                     "total_seconds": result["run_metadata"]["total_seconds"],
                     "probe_evaluation_seconds": result["run_metadata"]["probe_evaluation_seconds"],
                     "search_seconds": result["run_metadata"]["search_seconds"],
+                    "edge_evaluation_seconds": result["run_metadata"]["probe_evaluation_seconds"],
+                    "search_dp_seconds": result["run_metadata"]["search_seconds"],
                     "run_dir": result["run_dir"],
                 }
             )
@@ -975,6 +1068,9 @@ def candidate_grid_ablation_command(config: dict[str, Any], values: list[int]) -
                 "heldout_final_latent_mse": goes_row["final_latent_mse"],
                 "probe_evaluation_seconds": result["run_metadata"]["probe_evaluation_seconds"],
                 "search_seconds": result["run_metadata"]["search_seconds"],
+                "candidate_grid_size": actual_size,
+                "edge_evaluation_seconds": result["run_metadata"]["probe_evaluation_seconds"],
+                "search_dp_seconds": result["run_metadata"]["search_seconds"],
                 "total_seconds": result["run_metadata"]["total_seconds"],
                 "schedule_hash": result["schedule"]["schedule_hash"],
                 "run_dir": result["run_dir"],
@@ -985,7 +1081,9 @@ def candidate_grid_ablation_command(config: dict[str, Any], values: list[int]) -
     for row in rows:
         size = int(row["probe_grid_size"])
         row["schedule_l1_to_largest_probe_grid"] = float(np.mean(np.abs(schedules[size] - reference_schedule)))
+        row["schedule_l1_to_largest_candidate_grid"] = row["schedule_l1_to_largest_probe_grid"]
     write_csv(rows, run_dir / "paper_tables" / "probe_grid_ablation.csv")
+    write_csv(rows, run_dir / "paper_tables" / "candidate_grid_ablation.csv")
     _write_top_level_run_metadata(
         config,
         run_dir,
@@ -1027,6 +1125,8 @@ def cross_solver_reuse_command(config: dict[str, Any], solvers: list[str]) -> di
                     "solver_oracle_build_or_load_seconds": "",
                     "probe_evaluation_seconds": "",
                     "search_seconds": "",
+                    "edge_evaluation_seconds": "",
+                    "search_dp_seconds": "",
                     "total_solver_search_seconds": "",
                     "edge_objective": "",
                     "heldout_final_latent_mse": "",
@@ -1050,6 +1150,8 @@ def cross_solver_reuse_command(config: dict[str, Any], solvers: list[str]) -> di
                 "solver_oracle_build_or_load_seconds": run_metadata["oracle_build_or_load_seconds"],
                 "probe_evaluation_seconds": run_metadata["probe_evaluation_seconds"],
                 "search_seconds": run_metadata["search_seconds"],
+                "edge_evaluation_seconds": run_metadata["probe_evaluation_seconds"],
+                "search_dp_seconds": run_metadata["search_seconds"],
                 "total_solver_search_seconds": run_metadata["total_seconds"],
                 "edge_objective": result["schedule"]["edge_objective"],
                 "heldout_final_latent_mse": goes_row["final_latent_mse"],

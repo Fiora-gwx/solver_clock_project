@@ -239,10 +239,10 @@ def summarize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def build_report(roots: Iterable[str | Path]) -> list[dict[str, Any]]:
     rows = [row for path in discover_schedule_jsons(roots) if (row := row_from_schedule(path)) is not None]
     if not rows:
-        raise ValueError("No GPDE/GOES schedule.json files found under the provided roots.")
+        raise ValueError("No GOES schedule.json files found under the provided roots (GPDE aliases are accepted).")
     report = summarize_rows(rows)
     if not any(row.get("status") in {"OK", "INCONSISTENT_ORACLE_COST"} for row in report):
-        raise ValueError("No GPDE/GOES schedules with usable oracle reuse cost metadata were found.")
+        raise ValueError("No GOES schedules with usable oracle reuse cost metadata were found (GPDE aliases are accepted).")
     return report
 
 

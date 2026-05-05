@@ -1,0 +1,43 @@
+\section{Reproducibility Notes}
+
+All paper-facing runs were executed on a local workstation with four NVIDIA
+GeForce RTX 4090 GPUs using a PyTorch/CUDA inference stack. The repository
+stores experiment configurations, cleaned result CSVs, plotting inputs, copied
+schedule metadata, and prompt manifests alongside the paper artifacts so that
+the tables and figures can be regenerated without relying on raw training logs.
+
+The CIFAR-10 study uses the PNDM backend \citep{liu2022pndm} with
+\texttt{pndm\_model\_ddim\_cifar10}, Euler solver, NFE 10 and 20, and seeds 0,
+1, and 2. Each reported FID row uses 50k generated images per seed. The
+baseline set includes the native base schedule, a native-coordinate linear
+schedule, a fixed Karras/EDM-style sigma grid \citep{karras2022edm}, an
+authorized project-owned offline-proxy schedule, and our schedule. The offline
+baseline is an in-repository coordinate-search run for this CIFAR setting; it
+is not a published AYS CIFAR schedule. Additional lightweight and medium-budget
+offline-proxy attempts are retained only as failure evidence.
+
+The text-to-image studies use latent-diffusion models \citep{rombach2022ldm}
+with the Diffusers Euler solver, NFE 10, three random seeds, and 50 prompts
+from \texttt{diffusers\_ablation\_prompts}. Stable Diffusion 1.5 is evaluated
+at guidance scales 5.0, 7.5, and 10.0; SDXL is evaluated at guidance scales 5.0
+and 7.5. Each comparison is matched by prompt, seed, model, solver, NFE, and
+guidance scale across base, published AYS \citep{sabour2024ays}, and our
+schedule. We report CLIPScore \citep{hessel2022clipscore,radford2021clip} and
+ImageReward \citep{xu2023imagereward} with pairwise mean deltas and win rates.
+
+Schedule reuse is evaluated separately from schedule construction. For
+CIFAR-10, the seed-0 schedule is reused for seeds 1 and 2 under the same PNDM
+Euler execution grid and then re-evaluated with 50k generated images per seed.
+For SD1.5, the schedule calibrated at CFG 7.5 and seed 0 is reused across CFG
+5.0, 7.5, and 10.0 and all three seeds. These checks measure reuse within the
+same model and solver family; they do not establish transfer across models,
+prompt distributions, or solver classes.
+
+Calibration cost is reported in model-evaluation equivalents. For CIFAR-10 the
+quality column uses base-minus-ours FID, so positive values mean lower FID for
+our schedule. For text-to-image rows the quality column uses ours-minus-base
+ImageReward, so negative values mean lower ImageReward for our schedule. The
+anonymous archive omits raw AYS and authorized-offline numeric schedule bundles,
+but keeps cleaned metrics, summary tables, rendered figures, and copied
+paper-facing schedule metadata under \texttt{paper/results/},
+\texttt{paper/tables/}, and \texttt{paper/figures/}.

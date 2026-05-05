@@ -1,0 +1,19 @@
+\section{Pilot CIFAR-10 result record}
+
+The project retains the existing PNDM/CIFAR-10 pilot rows because they are useful
+for debugging the claim-evidence loop. They are excluded from main-paper FID
+claims because the run uses one seed and 5k generated images, below the
+paper-grade 50k FID setting.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.78\linewidth]{figures/cifar10_pndm_euler_pilot_fid.pdf}
+  \caption{PNDM/CIFAR-10 pilot FID for model
+  \texttt{pndm\_model\_ddim\_cifar10}, Euler solver, base and our schedule
+  schedules, NFE shown on the x-axis, seed 0, 5k generated images, final
+  generation metric FID where lower is better. This is retained pilot evidence,
+  not a paper-grade 50k FID result.}
+  \label{fig:cifar10-pndm-euler-pilot}
+\end{figure}
+
+\input{tables/cifar10_pndm_euler_pilot_fid}

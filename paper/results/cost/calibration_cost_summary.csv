@@ -1,0 +1,8 @@
+evidence_level,setting,model,solver,condition,evaluated_items,quality_metric,quality_delta_vs_base,quality_delta_sem,quality_delta_display,calibration_model_eval_equivalents,evaluated_generation_model_eval_equivalents,calibration_to_generation_ratio
+three_seed_50k_fid,CIFAR-10,pndm_model_ddim_cifar10,Euler,NFE 10,150k images,FID reduction,3.026462,0.019359,+3.026 +/- 0.019 FID,12730464.000000,1500000.000000,8.486976
+three_seed_50k_fid,CIFAR-10,pndm_model_ddim_cifar10,Euler,NFE 20,150k images,FID reduction,0.464217,0.004550,+0.464 +/- 0.005 FID,12730464.000000,3000000.000000,4.243488
+matched_sd15_cfg_sweep,SD1.5,stable_diffusion_15,Diffusers Euler,CFG 5,150 images,ImageReward delta,-0.132759,,-0.133 IR,25460928.000000,3000.000000,8486.976000
+matched_sd15_cfg_sweep,SD1.5,stable_diffusion_15,Diffusers Euler,CFG 7.5,150 images,ImageReward delta,-0.084285,,-0.084 IR,25460928.000000,3000.000000,8486.976000
+matched_sd15_cfg_sweep,SD1.5,stable_diffusion_15,Diffusers Euler,CFG 10,150 images,ImageReward delta,-0.087109,,-0.087 IR,25460928.000000,3000.000000,8486.976000
+matched_sdxl_cfg_sweep,SDXL,sdxl,Diffusers Euler,CFG 5,150 images,ImageReward delta,0.078564,,+0.079 IR,205848.000000,3000.000000,68.616000
+matched_sdxl_cfg_sweep,SDXL,sdxl,Diffusers Euler,CFG 7.5,150 images,ImageReward delta,0.121939,,+0.122 IR,205848.000000,3000.000000,68.616000

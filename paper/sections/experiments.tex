@@ -1,0 +1,71 @@
+\section{Experiments}
+\label{sec:experiments}
+
+Our studies are organized by claim. Final CIFAR-10 claims require
+50k generated samples for FID, NFE coverage that includes 10 and 20, and more
+than one seed for reliability language, with matched base, native-coordinate
+linear, Karras/EDM-style \citep{karras2022edm}, project-owned offline-proxy,
+and our schedules. The retained CIFAR backend is PNDM
+\citep{liu2022pndm} with the Euler solver. Text-to-image diagnostics require
+matched prompt, seed, model, solver, NFE, and guidance-scale keys across base,
+published AYS \citep{sabour2024ays}, and our schedules. The repository
+also contains STORK adapter tests and scheduler code \citep{tan2025stork}, but
+this draft does not report paper-grade STORK quality results.
+
+\input{tables/smoke_gate}
+
+Table~\ref{tab:smoke-gate} is a pipeline gate, not a paper result. It verifies
+that the repository can materialize our schedule, generate samples for
+base and our schedule, compute non-empty FID rows, and write calibration-cost
+metadata. The 32-sample FID values cannot support any image-quality claim.
+
+\input{tables/cifar10_pndm_euler_50k_fid_seeds0_1_2}
+
+Table~\ref{tab:cifar10-pndm-euler-50k-fid-seeds0-1-2} records the current
+three-seed 50k CIFAR-10 run for NFE 10 and 20, including native-coordinate
+linear, fixed Karras/EDM-style, and authorized project-owned offline-proxy
+baselines. The offline-proxy rows come from the project-owned coordinate-search optimizer; they
+are not published AYS schedules. The result supports only a bounded
+controlled-benchmark statement
+for the PNDM/CIFAR-10 backend, Euler solver, these two NFE values, and the
+reported baseline set. Appendix
+Figure~\ref{fig:cifar10-pndm-euler-50k-seeds0-1-2} shows the same aggregate
+with per-seed points. Ours improves FID over base, linear, and offline at
+both NFE values. The Karras-style grid is worse than ours at NFE 10 but
+slightly better at NFE 20, so the positive claim is scoped away from uniform
+superiority over fixed schedules. Appendix
+Figure~\ref{fig:cifar10-pndm-euler-schedule-profile-nfe20} visualizes the
+NFE-20 schedule profiles for seed 0. Appendix
+Table~\ref{tab:cifar10-pndm-euler-50k-reuse-seed0-schedule} gives a narrow
+actual reuse check for the same backend: reusing the seed-0 schedule
+for seeds 1 and 2 has zero observed FID gap because the continuous schedules
+round to the same PNDM Euler integer timesteps. Appendix
+Tables~\ref{tab:sd15-euler-nfe10-cfg-sweep-pairwise} and
+\ref{tab:sdxl-euler-nfe10-cfg-sweep-pairwise} record the matched
+text-to-image CFG sweeps where published AYS schedules enter the retained
+experiments. SD1.5 is a negative case for our schedule under CLIPScore and
+ImageReward. SDXL is condition-dependent: at CFG 5.0 our schedule improves
+ImageReward over base but trails AYS, while at CFG 7.5 it improves the mean
+CLIPScore and ImageReward deltas against both base and AYS. These sweeps
+support CFG-matched coverage and boundary analysis; broad text-to-image
+quality improvement remains unsupported. Appendix
+Figure~\ref{fig:sd15-euler-nfe10-cfg7p5-schedule-profile} shows the
+representative base/AYS/ours sigma-grid diagnostic for CFG 7.5 and seed 0.
+
+\input{tables/calibration_cost_summary}
+
+Table~\ref{tab:calibration-cost-summary} reports the current calibration-cost
+accounting. The CIFAR-10 gain over base comes with calibration cost that exceeds
+the evaluated generation batch by 4.24--8.49 times. The SD1.5 sweep has a much
+larger calibration-to-generation ratio for the small matched prompt batch and
+negative ImageReward deltas. The SDXL rows use a deliberately lighter
+calibration configuration and have lower cost ratios, but they still require
+schedule reuse across many matched prompt batches for amortization. These
+numbers support cost-aware reporting and leave deployment efficiency
+unsupported.
+
+\textbf{Takeaway.} The three-seed CIFAR setting improves over base,
+native-linear, and authorized project-owned offline-proxy schedules at NFE 10
+and 20. The Karras comparison is mixed and stronger at NFE 20. The matched
+SD1.5 and SDXL sweeps establish text-to-image coverage, but their automated
+metrics are condition-dependent and constrain the claims.

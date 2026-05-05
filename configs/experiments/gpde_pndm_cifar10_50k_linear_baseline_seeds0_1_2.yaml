@@ -1,0 +1,26 @@
+name: gpde_pndm_cifar10_50k_linear_baseline_seeds0_1_2
+backend: pndm
+dataset: cifar10
+solvers:
+  - euler
+schedules:
+  - linear
+nfes:
+  - 10
+  - 20
+seeds:
+  - 0
+  - 1
+  - 2
+num_samples: 50000
+batch_size: 64
+save_samples: false
+preview_samples: 64
+metrics:
+  - fid
+execution:
+  num_gpus: 4
+  materialize_schedules: true
+  prepare_schedules_first: true
+  skip_existing: true
+  continue_on_error: false

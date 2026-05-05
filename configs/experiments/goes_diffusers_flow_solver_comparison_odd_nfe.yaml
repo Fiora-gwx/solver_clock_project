@@ -1,0 +1,41 @@
+name: goes_diffusers_flow_solver_comparison_odd_nfe
+backend: diffusers
+models:
+  - sd35_medium
+solvers:
+  - flow_euler
+  - flow_heun
+schedules:
+  - base
+  - GOES
+nfes:
+  - 5
+  - 9
+  - 15
+seeds:
+  - 0
+  - 1
+  - 2
+prompt_asset: diffusers_smoke_prompts
+guidance_scales:
+  - 3.0
+  - 7.5
+metrics:
+  - clipscore
+  - imagereward
+execution:
+  num_gpus: 1
+  materialize_schedules: false
+  prepare_schedules_first: true
+goes:
+  batch_size: 4
+  num_batches: 8
+  microbatch_size: 1
+  ref_nfe: 256
+  ref_grid_size: 257
+  probe_grid_size: 512
+  physical_grid_mode: scheduler_sigmas
+  metric: channel_whitened
+  rho: 0.1
+  aggregation: cvar
+  trim_ratio: 0.10

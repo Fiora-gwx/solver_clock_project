@@ -24,7 +24,13 @@ from src.adapters.pndm import (
     load_training_dataset,
     run_generation,
 )
-from src.clock.ays import AysConfig, build_sigma_lookup, hierarchical_optimize_schedule, schedule_for_nfe
+from src.clock.ays import (
+    AysConfig,
+    AysOptimizationResult,
+    build_sigma_lookup,
+    hierarchical_optimize_schedule,
+    schedule_for_nfe,
+)
 from src.utils.assets import AssetManifest
 from src.utils.config import dump_json, ensure_dir, load_yaml
 from src.utils.fid import compute_fid
@@ -147,6 +153,69 @@ def stage_metadata(hierarchical_result) -> dict[str, dict[str, float | int | boo
             "best_proxy_value": result.best_proxy_value,
         }
     return payload
+
+
+def stage_results_metadata(
+    stage_results: dict[int, AysOptimizationResult],
+) -> dict[str, dict[str, float | int | bool | None]]:
+    payload: dict[str, dict[str, float | int | bool | None]] = {}
+    for stage_nfe, result in sorted(stage_results.items()):
+        payload[str(stage_nfe)] = {
+            "iterations_ran": result.iterations,
+            "converged": result.converged,
+            "stopped_early": result.stopped_early,
+            "best_proxy_value": result.best_proxy_value,
+        }
+    return payload
+
+
+def make_bundle(
+    *,
+    args: argparse.Namespace,
+    dataset_config: dict,
+    model_asset: str,
+    optimizer_config: AysConfig,
+    consumer_solvers: list[str],
+    nfe: int,
+    schedule: np.ndarray,
+    source: str,
+    stage_meta: dict[str, dict[str, float | int | bool | None]],
+    partial_stage_export: bool = False,
+) -> ScheduleBundle:
+    consumer_solver = (consumer_solvers or [args.solver])[0]
+    consumer_plan = resolve_effective_nfe_plan(consumer_solver, int(nfe))
+    terminal_timestep = 0.0
+    time_grid = np.concatenate([schedule[:0:-1].copy(), np.asarray([terminal_timestep], dtype=np.float64)])
+    return ScheduleBundle(
+        timesteps=schedule[:0:-1].copy(),
+        time_grid=time_grid,
+        meta={
+            "schedule_family": "ays",
+            "backend": "pndm",
+            "dataset": dataset_config["name"],
+            "model_asset": model_asset,
+            "solver": args.solver,
+            "reference_solver": args.solver,
+            "consumer_solvers": consumer_solvers or [args.solver],
+            "shared_across_solvers": bool(consumer_solvers and any(item != args.solver for item in consumer_solvers)),
+            "nfe": int(nfe),
+            **consumer_plan.to_meta(),
+            "terminal_timestep": terminal_timestep,
+            "optimization_method": "paper_hierarchical_coordinate_search",
+            "candidate_count": optimizer_config.candidate_count,
+            "data_samples": optimizer_config.data_samples,
+            "batch_size": optimizer_config.batch_size,
+            "sigma_data": optimizer_config.sigma_data,
+            "initialization": "time_uniform",
+            "initial_steps": optimizer_config.initial_steps,
+            "subdivision_rounds": optimizer_config.subdivision_rounds,
+            "reference_nfe": optimizer_config.reference_steps,
+            "schedule_source": source,
+            "stage_results": stage_meta,
+            "partial_stage_export": partial_stage_export,
+            "early_stop": asdict(optimizer_config.early_stop),
+        },
+    )
 
 
 def make_progress_reporter(output_root: Path):
@@ -301,6 +370,34 @@ def main() -> None:
         model=model,
     )
 
+    completed_stage_results: dict[int, AysOptimizationResult] = {}
+    stage_bundle_root = output_root / "_stage_bundles"
+
+    def save_completed_stage(stage_nfe: int, result: AysOptimizationResult) -> None:
+        completed_stage_results[int(stage_nfe)] = result
+        bundle = make_bundle(
+            args=args,
+            dataset_config=dataset_config,
+            model_asset=model_asset,
+            optimizer_config=optimizer_config,
+            consumer_solvers=consumer_solvers,
+            nfe=int(stage_nfe),
+            schedule=result.schedule,
+            source="optimized_stage",
+            stage_meta=stage_results_metadata(completed_stage_results),
+            partial_stage_export=True,
+        )
+        saved_dir = bundle.save(stage_bundle_root / f"nfe_{int(stage_nfe):03d}")
+        report_progress(
+            "bundle_saved",
+            {
+                "nfe": int(stage_nfe),
+                "schedule_source": "optimized_stage",
+                "output_dir": str(saved_dir),
+                "partial_stage_export": True,
+            },
+        )
+
     hierarchical_result = hierarchical_optimize_schedule(
         model=model,
         num_train_timesteps=int(schedule_cfg["diffusion_step"]),
@@ -311,6 +408,7 @@ def main() -> None:
         device=device,
         proxy_evaluator=proxy_evaluator,
         progress_callback=report_progress,
+        stage_result_callback=save_completed_stage,
     )
     serialized_stage_meta = stage_metadata(hierarchical_result)
 
@@ -322,36 +420,16 @@ def main() -> None:
             hierarchical_result=hierarchical_result,
             sigma_lookup=sigma_lookup,
         )
-        terminal_timestep = 0.0
-        time_grid = np.concatenate([schedule[:0:-1].copy(), np.asarray([terminal_timestep], dtype=np.float64)])
-        bundle = ScheduleBundle(
-            timesteps=schedule[:0:-1].copy(),
-            time_grid=time_grid,
-            meta={
-                "schedule_family": "ays",
-                "backend": "pndm",
-                "dataset": dataset_config["name"],
-                "model_asset": model_asset,
-                "solver": args.solver,
-                "reference_solver": args.solver,
-                "consumer_solvers": consumer_solvers or [args.solver],
-                "shared_across_solvers": bool(consumer_solvers and any(item != args.solver for item in consumer_solvers)),
-                "nfe": int(nfe),
-                **consumer_plan.to_meta(),
-                "terminal_timestep": terminal_timestep,
-                "optimization_method": "paper_hierarchical_coordinate_search",
-                "candidate_count": optimizer_config.candidate_count,
-                "data_samples": optimizer_config.data_samples,
-                "batch_size": optimizer_config.batch_size,
-                "sigma_data": optimizer_config.sigma_data,
-                "initialization": "time_uniform",
-                "initial_steps": optimizer_config.initial_steps,
-                "subdivision_rounds": optimizer_config.subdivision_rounds,
-                "reference_nfe": optimizer_config.reference_steps,
-                "schedule_source": source,
-                "stage_results": serialized_stage_meta,
-                "early_stop": asdict(optimizer_config.early_stop),
-            },
+        bundle = make_bundle(
+            args=args,
+            dataset_config=dataset_config,
+            model_asset=model_asset,
+            optimizer_config=optimizer_config,
+            consumer_solvers=consumer_solvers,
+            nfe=int(nfe),
+            schedule=schedule,
+            source=source,
+            stage_meta=serialized_stage_meta,
         )
         saved_dir = bundle.save(output_root / f"nfe_{int(nfe):03d}")
         report_progress(

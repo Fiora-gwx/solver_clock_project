@@ -1,0 +1,82 @@
+\section{Introduction}
+\label{sec:introduction}
+
+Denoising diffusion models generate images by simulating a reverse trajectory
+from noise to data. This simulation is accurate when many denoiser evaluations
+are available, but those evaluations dominate sampling cost. Fast sampling
+therefore asks a concrete allocation question: given only a small number of
+function evaluations, where along the reverse trajectory should they be placed?
+The answer is not determined by the solver alone. Even a strong numerical
+update can fail if its few steps are spent in the wrong regions of the
+denoising path.
+
+Discretization schedules are the mechanism for making this allocation. Linear,
+polynomial, log-SNR, and EDM-style schedules are simple, stable, and widely
+used \citep{karras2022edm}, but they are usually hand-crafted and reused across
+models, solvers, and budgets. Recent work shows that this choice can be
+optimized. AYS searches for schedules with a solver-specific Girsanov KL upper
+bound \citep{sabour2024ays}. Score-Optimal Diffusion Schedules derive a local
+path cost from the work performed by a score-based corrector and choose an
+inverse path-length schedule \citep{williams2024scoreoptimal}. Other
+optimized-timestep methods minimize discrepancies between ODE teacher
+solutions and numerical solver trajectories \citep{xue2024optimizedtimesteps}.
+These approaches make clear that schedule selection is a central component of
+fast diffusion sampling.
+
+However, the criteria used to choose a schedule often remain indirect from the
+perspective of the sampler that will actually be run. A distributional bound,
+transport-style cost, or path information increment can justify an effective
+grid. These criteria leave open the diagnostic question we care about: where
+does this numerical solver make its largest local prediction errors along the
+denoising trajectory? Without that information, schedule selection still looks
+like global search instead of targeted correction of the solver's failure modes.
+
+We present \emph{geometric prediction defect equalization}, a training-free
+algorithm for automatically selecting schedules for deterministic diffusion ODE
+samplers. Our method uses accurate teacher trajectories from a pretrained model
+to estimate where a target student solver locally deviates
+from the intended trajectory. It then allocates time steps so that these local
+geometric prediction defects are equalized across the schedule.
+
+The details of our method are designed to make this diagnostic meaningful. Each
+defect probe starts from the correct teacher state, so it measures one-step
+solver error rather than error accumulated from previous approximate steps.
+Teacher trajectories are treated as Monte Carlo samples from the teacher
+marginal at each noise level, so the estimated defect profile is
+distributional rather than path-specific. A state-space metric and optional
+tangent downweighting turn endpoint residuals into geometric prediction
+defects. Finally, a local power-law model determines how to convert these
+defects into a monitor density whose inverse CDF yields the schedule.
+
+Our contributions are as follows.
+\begin{enumerate}
+  \item \textbf{A solver-facing schedule objective.} We formulate low-NFE
+  schedule selection as distributional local prediction-defect equalization for
+  a fixed pretrained model and deterministic sampler.
+  \item \textbf{A training-free calibration algorithm.} We estimate local
+  oracle-start defects from teacher trajectories, aggregate them over the
+  teacher marginal with mean, CVaR, or mixed risk, and construct the schedule
+  by inverse-CDF equalization of the induced monitor.
+  \item \textbf{Geometry and theory.} We derive the monitor
+  $\omega_{\mathcal R}(u)=(\bar a_{\mathcal R}(u)+\epsilon_a)^{1/q}$ from a
+  local power-law defect model, prove coordinate covariance of the monitor
+  one-form, and prove asymptotic minimax optimality of the inverse-CDF schedule
+  for local distributional risk.
+  \item \textbf{Scoped empirical evidence.} We report a real PNDM/CIFAR-10
+  smoke gate, three-seed 50k CIFAR-10 FID results including base, linear,
+  Karras-style fixed, and authorized project-owned offline-proxy schedules,
+  matched SD1.5 and SDXL CFG sweeps retained as text-to-image boundary
+  evidence, and model-evaluation-equivalent calibration cost accounting.
+\end{enumerate}
+
+The empirical claims are deliberately bounded. On PNDM/CIFAR-10 with the Euler
+solver, our schedule improves FID over base, native-coordinate linear, and the
+project-owned offline-proxy schedule at NFE 10 and 20. The comparison to a
+fixed Karras/EDM-style grid is mixed: ours wins at NFE 10 and trails
+slightly at NFE 20. The matched text-to-image sweeps show condition-dependent
+behavior: SD1.5 is negative under these metrics, while SDXL improves
+ImageReward against base at CFG 5.0 and 7.5 and has positive mean deltas
+against AYS at CFG 7.5. We therefore present our method as a way to expose and
+equalize solver-local
+trajectory defects; direct optimization of FID, CLIPScore, ImageReward, or
+human preference remains outside the claim.

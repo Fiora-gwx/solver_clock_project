@@ -1,0 +1,99 @@
+\section{Matched text-to-image CFG sweeps}
+
+The text-to-image runs evaluate latent-diffusion models
+\citep{rombach2022ldm} with the Diffusers Euler solver, NFE 10, seeds 0, 1,
+and 2, and 50 prompts from \texttt{diffusers\_ablation\_prompts}. Each base,
+published AYS \citep{sabour2024ays}, and our row is matched by prompt, seed,
+model, solver, NFE, and guidance scale. The metrics are CLIPScore
+\citep{hessel2022clipscore,radford2021clip} and ImageReward
+\citep{xu2023imagereward}, where higher is better.
+
+\subsection{Stable Diffusion 1.5}
+
+The SD1.5 sweep uses guidance scales 5.0, 7.5, and 10.0. It retains the
+largest text-to-image calibration setting in this draft, with 9 calibrated
+schedules and 1350 scored images.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.86\linewidth]{figures/sd15_euler_nfe10_cfg_sweep_pairwise.pdf}
+  \caption{Matched SD1.5 text-to-image pairwise mean deltas for model
+  \texttt{stable\_diffusion\_15}, Diffusers Euler solver, NFE 10, guidance
+  scales 5.0, 7.5, and 10.0, schedules base, AYS, and ours, seeds 0--2,
+  and 50 prompts per seed from \texttt{diffusers\_ablation\_prompts}. Deltas
+  are computed over 150 matched prompt/seed pairs per guidance scale. CLIPScore
+  and ImageReward are higher-is-better.}
+  \label{fig:sd15-euler-nfe10-cfg-sweep-pairwise}
+\end{figure}
+
+\input{tables/sd15_euler_nfe10_cfg_sweep_pairwise}
+
+\subsection{SDXL}
+
+The SDXL sweep \citep{podell2023sdxl} uses guidance scales 5.0 and 7.5. It
+uses a lighter calibration configuration than SD1.5: one prompt per batch, four
+calibration batches, 64 reference steps, a 65-node reference grid, and a
+128-node candidate grid. This choice keeps the run within the minimum
+validation budget while preserving the matched base/AYS/ours comparison
+across three seeds.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.86\linewidth]{figures/sdxl_euler_nfe10_cfg_sweep_pairwise.pdf}
+  \caption{Matched SDXL text-to-image pairwise mean deltas for model
+  \texttt{sdxl}, Diffusers Euler solver, NFE 10, guidance scales 5.0 and 7.5,
+  schedules base, AYS, and ours, seeds 0--2, and 50 prompts per seed from
+  \texttt{diffusers\_ablation\_prompts}. Deltas are computed over 150 matched
+  prompt/seed pairs per guidance scale. CLIPScore and ImageReward are
+  higher-is-better.}
+  \label{fig:sdxl-euler-nfe10-cfg-sweep-pairwise}
+\end{figure}
+
+\input{tables/sdxl_euler_nfe10_cfg_sweep_pairwise}
+
+The SDXL result is condition-dependent. At CFG 5.0, our schedule improves
+ImageReward over base by 0.079 but trails AYS by 0.119. At CFG 7.5, it improves
+the mean CLIPScore and ImageReward deltas over both base and AYS. This pattern
+supports condition-aware evaluation coverage and keeps the text-to-image claim
+bounded to matched automated metrics.
+
+\subsection{SD1.5 reuse and schedule diagnostics}
+
+\input{tables/sd15_euler_nfe10_cfg7p5_seed0_reuse}
+
+Table~\ref{tab:sd15-euler-nfe10-reuse-cfg7p5-seed0} reports a second actual
+reuse check. We reuse the CFG 7.5, seed-0 schedule for CFG 5.0, 7.5,
+and 10.0, seeds 0--2, with the same 50 prompts. Reuse stays near the CFG- and
+seed-specific rows on ImageReward, with matched deltas from +0.003
+to +0.034, but loses CLIPScore by up to 0.10. Against base and AYS, reuse
+remains negative on both automated metrics in the pairwise summaries. The
+result broadens reuse evidence while preserving the text-to-image conclusion as
+mixed or negative.
+
+Figure~\ref{fig:sd15-euler-nfe10-cfg7p5-schedule-profile} shows the sigma-grid
+diagnostic for the CFG 7.5, seed-0 schedule bundle. Our schedule keeps
+larger sigma values for more early boundaries than both base and AYS in this
+representative case. This diagnostic explains allocation only; the quality
+metrics below remain the evidence for the mixed result.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.82\linewidth]{figures/sd15_euler_nfe10_cfg7p5_schedule_profile_seed0.pdf}
+  \caption{Stable Diffusion 1.5 Diffusers Euler NFE-10 schedule profile for
+  guidance scale 7.5 and seed 0. The left panel shows the sigma grid for base,
+  published AYS, and our schedules. The right panel shows sigma drops
+  between adjacent boundaries. This is a schedule diagnostic, not a perceptual
+  quality metric.}
+  \label{fig:sd15-euler-nfe10-cfg7p5-schedule-profile}
+\end{figure}
+
+The SD1.5 sweep is a retained mixed result. AYS improves ImageReward over base
+at all three guidance scales, while ours trails base and AYS on ImageReward and
+underperforms base on CLIPScore under this SD1.5/Euler/NFE-10 setup. This
+evidence supports a bounded failure analysis and CFG-matched evaluation
+coverage. Cleaned rows, pairwise summaries, copied schedules, and oracle-reuse
+cost accounting are stored under \texttt{paper/results/t2i/}. The same
+directory includes the prompt manifest and prompt-index CSV for
+\texttt{diffusers\_ablation\_prompts}. The source output roots are
+\texttt{outputs/gpde\_diffusers\_sd15\_nfe10\_cfg\_seed\_sweep/} and
+\texttt{outputs/gpde\_diffusers\_sdxl\_nfe10\_cfg\_seed\_sweep/}.

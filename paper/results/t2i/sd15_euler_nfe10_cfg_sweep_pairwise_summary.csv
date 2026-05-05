@@ -1,0 +1,10 @@
+evidence_level,model,solver,nfe,guidance_scale,comparison,num_pairs,clip_score_mean_delta,clip_score_win_rate,clip_score_ci_low,clip_score_ci_high,image_reward_mean_delta,image_reward_win_rate,image_reward_ci_low,image_reward_ci_high,metric_direction
+matched_sd15_cfg_sweep,stable_diffusion_15,euler,10,5,AYS - base,150,0.184698,0.533333,-0.086465,0.470047,0.105831,0.660000,0.043437,0.177819,higher_is_better
+matched_sd15_cfg_sweep,stable_diffusion_15,euler,10,5,D-GPDE - base,150,-0.188169,0.426667,-0.514171,0.147796,-0.132759,0.333333,-0.205080,-0.058686,higher_is_better
+matched_sd15_cfg_sweep,stable_diffusion_15,euler,10,5,D-GPDE - AYS,150,-0.372867,0.413333,-0.695894,-0.062979,-0.238589,0.266667,-0.335210,-0.146008,higher_is_better
+matched_sd15_cfg_sweep,stable_diffusion_15,euler,10,7.5,AYS - base,150,-0.081102,0.513333,-0.416374,0.233693,0.035244,0.573333,-0.035568,0.103144,higher_is_better
+matched_sd15_cfg_sweep,stable_diffusion_15,euler,10,7.5,D-GPDE - base,150,-0.164133,0.453333,-0.513679,0.174938,-0.084285,0.460000,-0.181904,0.008173,higher_is_better
+matched_sd15_cfg_sweep,stable_diffusion_15,euler,10,7.5,D-GPDE - AYS,150,-0.083031,0.473333,-0.465887,0.309813,-0.119529,0.386667,-0.239084,-0.001744,higher_is_better
+matched_sd15_cfg_sweep,stable_diffusion_15,euler,10,10,AYS - base,150,-0.109025,0.460000,-0.479787,0.242593,0.035402,0.540000,-0.055209,0.124983,higher_is_better
+matched_sd15_cfg_sweep,stable_diffusion_15,euler,10,10,D-GPDE - base,150,-0.131227,0.413333,-0.481595,0.226420,-0.087109,0.406667,-0.192055,0.009818,higher_is_better
+matched_sd15_cfg_sweep,stable_diffusion_15,euler,10,10,D-GPDE - AYS,150,-0.022202,0.480000,-0.444399,0.374415,-0.122512,0.373333,-0.232172,-0.013771,higher_is_better

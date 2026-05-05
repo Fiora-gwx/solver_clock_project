@@ -1,0 +1,18 @@
+\begin{table}[t]
+  \centering
+  \caption{Actual SD1.5 schedule reuse check. We reuse a single
+  our schedule calibrated at CFG 7.5, seed 0 for CFG 5.0, 7.5,
+  and 10.0, seeds 0--2, and 50 prompts per seed. Rows report matched prompt/seed
+  deltas for reuse minus the CFG- and seed-specific schedule.
+  Higher is better for both metrics.}
+  \label{tab:sd15-euler-nfe10-reuse-cfg7p5-seed0}
+  \begin{tabular}{rrrrr}
+    \toprule
+    CFG & $\Delta$ CLIP & CLIP win (\%) & $\Delta$ ImageReward & IR win (\%) \\
+    \midrule
+    5 & -0.10 & 46.7 & +0.006 & 50.7 \\
+    7.5 & -0.05 & 28.0 & +0.003 & 31.3 \\
+    10 & -0.00 & 48.7 & +0.034 & 53.3 \\
+    \bottomrule
+  \end{tabular}
+\end{table}

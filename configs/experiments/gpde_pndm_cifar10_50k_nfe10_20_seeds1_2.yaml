@@ -1,0 +1,37 @@
+name: gpde_pndm_cifar10_50k_nfe10_20_seeds1_2
+backend: pndm
+dataset: cifar10
+solvers:
+  - euler
+schedules:
+  - base
+  - GPDE
+nfes:
+  - 10
+  - 20
+seeds:
+  - 1
+  - 2
+num_samples: 50000
+batch_size: 64
+save_samples: false
+preview_samples: 64
+metrics:
+  - fid
+execution:
+  num_gpus: 4
+  materialize_schedules: true
+  prepare_schedules_first: true
+  skip_existing: true
+  continue_on_error: false
+gpde:
+  batch_size: 8
+  num_batches: 4
+  microbatch_size: 2
+  ref_nfe: 256
+  ref_grid_size: 257
+  probe_grid_size: 512
+  metric: channel_whitened
+  rho: 0.1
+  aggregation: cvar
+  trim_ratio: 0.10

@@ -1,0 +1,21 @@
+\section{Limitations}
+\label{sec:limitations}
+
+Our method equalizes local distributional solver defect rather than final
+perceptual quality. It should therefore be interpreted as
+teacher-alignment calibration, not as a direct optimizer for FID, CLIPScore,
+ImageReward, or human preference. The matched SD1.5 and SDXL CFG sweeps are
+retained because they show this distinction concretely.
+
+The minimax result is asymptotic and relies on local power-law behavior. Very
+small step counts such as $N=4$ or $N=8$ may fall outside the regime where the
+theory is tight. The theory also assumes a deterministic ODE solver with
+oracle-start defects; multistep and scheduler-history adapters require an
+augmented-state analysis before the theorem applies exactly.
+
+Calibration adds compute before generation. A schedule is practically useful
+only when reuse amortizes the teacher and probe cost, so the experiments report
+model-evaluation-equivalent calibration cost separately from generation cost.
+Finally, the empirical monitor depends on the representativeness of the
+calibration trajectories, the teacher solver accuracy, the chosen metric
+$G(u)$, and the stability of the fitted order $q$.

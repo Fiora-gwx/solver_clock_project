@@ -1,0 +1,4 @@
+evidence_level,model,solver,schedule,source_schedule_guidance_scale,source_schedule_seed,nfe,guidance_scale,seed_count,seeds,prompt_asset,num_prompts_per_seed,clip_score_mean,clip_score_sem_over_seeds,image_reward_mean,image_reward_sem_over_seeds,metric_direction
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,D-GPDE-reuse-cfg7p5-seed0,7.5,0,10,5,3,"0,1,2",diffusers_ablation_prompts,50,29.169754,0.229802,-0.043643,0.060586,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,D-GPDE-reuse-cfg7p5-seed0,7.5,0,10,7.5,3,"0,1,2",diffusers_ablation_prompts,50,29.518804,0.108951,0.119731,0.061143,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,D-GPDE-reuse-cfg7p5-seed0,7.5,0,10,10,3,"0,1,2",diffusers_ablation_prompts,50,29.538404,0.138365,0.185152,0.024061,higher_is_better

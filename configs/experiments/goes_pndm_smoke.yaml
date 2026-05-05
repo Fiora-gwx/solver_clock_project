@@ -1,0 +1,34 @@
+name: goes_pndm_smoke
+backend: pndm
+dataset: cifar10
+solvers:
+  - euler
+schedules:
+  - base
+  - GOES
+nfes:
+  - 4
+seeds:
+  - 0
+num_samples: 32
+batch_size: 16
+save_samples: true
+preview_samples: 16
+metrics:
+  - fid
+execution:
+  num_gpus: 1
+  materialize_schedules: false
+  prepare_schedules_first: true
+goes:
+  batch_size: 2
+  num_batches: 1
+  microbatch_size: 1
+  ref_nfe: 8
+  ref_grid_size: 9
+  candidate_grid_size: 8
+  coordinate_domain: timesteps
+  metric: identity
+  rho: 0.1
+  aggregation: cvar
+  trim_ratio: 0.10

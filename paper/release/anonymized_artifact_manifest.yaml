@@ -1,0 +1,145 @@
+schema_version: 1
+status: draft
+last_updated: 2026-05-05
+anonymization:
+  path_policy: repository_relative_paths_only
+  local_absolute_paths: removed_from_paper_facing_results
+  author_identity: no author names or institution paths recorded here
+paper_artifacts:
+  manuscript:
+    paths:
+      - paper/neurips_2026.tex
+      - paper/sections/
+      - paper/appendix/
+      - paper/checklist.tex
+      - paper/references.bib
+    role: manuscript_source
+    release_status: include_after_author_license_decision
+  cleaned_results:
+    paths:
+      - paper/results/smoke/
+      - paper/results/pilot/
+      - paper/results/cifar10_50k/
+      - paper/results/t2i/
+      - paper/results/cost/
+      - paper/results/failure/
+    role: paper_facing_aggregate_metrics_base_linear_karras_dgpde_schedule_metadata_and_authorized_offline_metrics
+    release_status: include_after_path_sanitization_and_license_review
+  generated_tables:
+    paths:
+      - paper/tables/
+    role: latex_tables_generated_from_cleaned_results
+    release_status: include_after_author_license_decision
+  generated_figures:
+    paths:
+      - paper/figures/*.pdf
+      - paper/figures/*.png
+    role: data_driven_plots_and_selected_qualitative_failure_grid
+    release_status: include_after_author_license_decision
+  aggregation_scripts:
+    paths:
+      - paper/figures/src/
+    role: scripts_that_regenerate_paper_tables_figures_and_cleaned_summaries
+    release_status: include_after_code_license_decision
+  draft_release_filelist:
+    paths:
+      - paper/release/build_draft_release_filelist.py
+      - paper/release/build_draft_release_archive.py
+      - paper/release/draft_release_filelist.txt
+      - paper/release/draft_release_exclusions.txt
+      - paper/release/dist/dgpde_neurips2026_draft_artifacts.zip
+      - paper/release/dist/dgpde_neurips2026_draft_artifacts.sha256
+    role: local_draft_allowlist_and_archive_for_anonymous_paper_artifact_package
+    release_status: local_draft_archive_not_external_release
+external_dependencies:
+  cifar10:
+    role: benchmark_dataset_and_fid_reference_statistics
+    local_records:
+      - configs/datasets/cifar10.yaml
+      - configs/assets_manifest.yaml
+    license_status: UCI_lists_CC_BY_4_0_for_dataset_page
+    redistribution: do_not_bundle_raw_dataset_without_final_license_review
+  pndm_cifar_checkpoint:
+    role: controlled_CIFAR10_sampler_backend
+    source_urls:
+      - https://github.com/luping-liu/PNDM
+      - https://drive.google.com/drive/folders/1leEpziaPdYlshzB4QALY5pL7Snw8XM28
+    local_records:
+      - configs/assets_manifest.yaml
+      - checkpoints/pndm/models/ddim_cifar10.ckpt
+    sha256:
+      checkpoints/pndm/models/ddim_cifar10.ckpt: 751666384af5152b673fb00de447878b0d1843420a5609f9bf0a0dd38c118517
+      checkpoints/pndm/fids/fid_cifar10_train.npz: fce45a8ad7ca84a06bfda567dafdcc2960dfe036d4048227963f89499731a5fb
+    license_status: official_PNDM_repository_is_Apache_2_0_and_links_checkpoint_statistics_folder
+    redistribution: do_not_bundle_checkpoint_in_anonymized_archive
+  stable_diffusion_15:
+    role: text_to_image_backend_for_sd15_runs
+    local_records:
+      - checkpoints/hf/runwayml--stable-diffusion-v1-5/README.md
+      - configs/assets_manifest.yaml
+    license_status: cached_model_card_lists_creativeml_openrail_m
+    redistribution: do_not_bundle_model_weights
+  sdxl:
+    role: text_to_image_backend_for_sdxl_runs
+    local_records:
+      - checkpoints/hf/stabilityai--stable-diffusion-xl-base-1.0/
+      - configs/assets_manifest.yaml
+    license_status: cached_model_card_and_upstream_terms_need_final_author_review
+    redistribution: do_not_bundle_model_weights
+  ays_10step_schedule:
+    role: published_offline_schedule_baseline
+    source_urls:
+      - https://research.nvidia.com/labs/toronto-ai/AlignYourSteps/
+      - https://research.nvidia.com/labs/toronto-ai/AlignYourSteps/howto.html
+    local_records:
+      - configs/reference_schedules/ays_published_10step.yaml
+      - schedules/ays_like/published/stable_diffusion_15/nfe_010/
+      - schedules/ays_like/published/sdxl/nfe_010/
+    sha256:
+      configs/reference_schedules/ays_published_10step.yaml: 6c1b39d87464c1499137d95c70f378de679bd16514d6c2801d9184688f2adcf8
+      schedules/ays_like/published/stable_diffusion_15/nfe_010/meta.json: 0f0a8c09ce2ebcbb45c493eaa2d6f5d0b0305c0590e145841423fdd44f4031b6
+      schedules/ays_like/published/stable_diffusion_15/nfe_010/timesteps.npy: bf5840b180a61c07722f08e79cf2b47c46ef69fa8ffef786f970e8dec7cb6722
+      schedules/ays_like/published/stable_diffusion_15/nfe_010/sigmas.npy: 3d7a58b73540bce0efcb032b443514c55bb8028513f7e16380bec2f44d920437
+      schedules/ays_like/published/sdxl/nfe_010/meta.json: 9f4b12364926a56fbe66bc17a8ed1540377f9dc68587c7dab16f81d075a2f3d8
+      schedules/ays_like/published/sdxl/nfe_010/timesteps.npy: 4656f3258c5eacb74f42297a0e29fc86e0db2848a4a2319dcd76dd6c2c3cc044
+      schedules/ays_like/published/sdxl/nfe_010/sigmas.npy: cf6881ca7d75cdbf4f29425820cc216363e2fe20b8150f99c759ae920db0ce2a
+    license_status: official_AYS_quickstart_lists_numeric_schedules_no_license_notice_found_diffusers_AysSchedules_Apache_2_0_source_exists
+    redistribution: omit_raw_numeric_schedule_values_keep_citations_hashes_rendered_figures_and_optional_external_loader
+  diffusers:
+    role: text_to_image_execution_library
+    local_records:
+      - third_party/diffusers/LICENSE
+    license_status: Apache_2_0
+    redistribution: preserve_upstream_license_if_bundled
+  image_reward:
+    role: automated_text_to_image_metric
+    local_records:
+      - ImageReward/LICENSE
+    license_status: Apache_2_0
+    redistribution: preserve_upstream_license_if_bundled
+  prompt_set:
+    role: matched_text_to_image_prompt_asset
+    local_records:
+      - data/pndm/prompts/modern_diffusers_ablation_prompts.json
+      - paper/results/t2i/diffusers_ablation_prompts_manifest.json
+      - paper/results/t2i/diffusers_ablation_prompts.csv
+      - paper/results/t2i/sd15_euler_nfe10_cfg_sweep_detail.csv
+      - paper/results/t2i/sdxl_euler_nfe10_cfg_sweep_detail.csv
+    sha256:
+      data/pndm/prompts/modern_diffusers_ablation_prompts.json: ce18968ad8140ed23e6741d3f1ab0b00b64a2c9b9b346ff5a82a468a8688b9aa
+      paper/results/t2i/diffusers_ablation_prompts_manifest.json: 1ad93146a6b7fe37df36ccbc4859bb2fe51a0ced2c95187bd1a384a6d3802dda
+      paper/results/t2i/diffusers_ablation_prompts.csv: 2903f9dae862b63af188674f31b07e1d70dfcdb9e0b1136d79edc78e166e99a2
+    license_status: project_local_provenance_no_external_source_recorded_author_license_pending
+    redistribution: include_prompt_text_only_after_author_license_decision
+known_exclusions:
+  - raw_CIFAR10_data
+  - model_weights
+  - PNDM_checkpoint_files
+  - raw_generated_text_to_image_sample_jpegs
+  - raw_AYS_numeric_schedule_files
+  - authorized_offline_numeric_schedule_bundles
+  - local_environment_paths
+open_blockers:
+  - final_author_license_for_paper_produced_text_scripts_tables_figures_and_csvs
+  - prompt_asset_author_license_decision
+  - external_anonymized_archive_or_repository

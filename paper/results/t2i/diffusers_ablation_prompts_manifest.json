@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "prompt_asset": "diffusers_ablation_prompts",
+  "source_path": "data/pndm/prompts/modern_diffusers_ablation_prompts.json",
+  "paper_prompt_csv": "paper/results/t2i/diffusers_ablation_prompts.csv",
+  "sha256": "ce18968ad8140ed23e6741d3f1ab0b00b64a2c9b9b346ff5a82a468a8688b9aa",
+  "prompt_count": 50,
+  "used_by": [
+    "configs/experiments/gpde_diffusers_sd15_nfe10_cfg_seed_sweep.yaml",
+    "paper/results/t2i/sd15_euler_nfe10_cfg_sweep_detail.csv"
+  ],
+  "license_status": "project_local_provenance_and_release_license_pending"
+}

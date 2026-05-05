@@ -1,0 +1,23 @@
+\begin{table}[t]
+  \centering
+  \caption{Calibration cost accounting for current paper-facing runs.
+  The quality column reports base-minus-ours FID for CIFAR-10 and
+  ours-minus-base ImageReward for text-to-image, so positive values favor
+  ours. Model-evaluation equivalents count retained calibration
+  cost and the evaluated generation batch, excluding unrelated pilot
+  experiments.}
+  \label{tab:calibration-cost-summary}
+  \begin{tabular}{lllrrr}
+    \toprule
+    Setting & condition & quality vs. base & cal. evals (M) & gen. evals (M) & cal./gen. \\
+    \midrule
+    CIFAR-10 & NFE 10 & +3.026 $\pm$ 0.019 FID & 12.73 & 1.500 & 8.49$\times$ \\
+    CIFAR-10 & NFE 20 & +0.464 $\pm$ 0.005 FID & 12.73 & 3.000 & 4.24$\times$ \\
+    SD1.5 & CFG 5 & -0.133 IR & 25.46 & 0.003 & 8{,}487$\times$ \\
+    SD1.5 & CFG 7.5 & -0.084 IR & 25.46 & 0.003 & 8{,}487$\times$ \\
+    SD1.5 & CFG 10 & -0.087 IR & 25.46 & 0.003 & 8{,}487$\times$ \\
+    SDXL & CFG 5 & +0.079 IR & 0.21 & 0.003 & 68.62$\times$ \\
+    SDXL & CFG 7.5 & +0.122 IR & 0.21 & 0.003 & 68.62$\times$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}

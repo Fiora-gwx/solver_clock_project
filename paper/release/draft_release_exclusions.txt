@@ -1,0 +1,17 @@
+internal_reviews/cifar10_offline_baseline_availability_2026-05-05.md	internal review note, not part of anonymous artifact release
+internal_reviews/citation_verification_2026-05-05.md	internal review note, not part of anonymous artifact release
+internal_reviews/compute_decisions_needed_2026-05-05.md	internal review note, not part of anonymous artifact release
+internal_reviews/current_gap_audit.md	internal review note, not part of anonymous artifact release
+internal_reviews/default_offline_proxy_feasibility_2026-05-05.md	internal review note, not part of anonymous artifact release
+internal_reviews/final_claim_audit_2026-05-05.md	internal review note, not part of anonymous artifact release
+internal_reviews/reuse_evidence_boundary_2026-05-05.md	internal review note, not part of anonymous artifact release
+internal_reviews/rigor_review_2026-05-05.md	internal review note, not part of anonymous artifact release
+neurips_2026.aux	latex/python build artifact
+neurips_2026.bbl	latex/python build artifact
+neurips_2026.blg	latex/python build artifact
+neurips_2026.log	latex/python build artifact
+neurips_2026.out	latex/python build artifact
+project_context.md	working project context, not part of anonymous artifact release
+release/dist/dgpde_neurips2026_draft_artifacts.sha256	generated release archive output
+release/dist/dgpde_neurips2026_draft_artifacts.zip	generated release archive output
+results/t2i/sd15_euler_nfe10_cfg7p5_schedule_profile_seed0.csv	raw AYS numeric schedule values are excluded from the anonymous artifact package

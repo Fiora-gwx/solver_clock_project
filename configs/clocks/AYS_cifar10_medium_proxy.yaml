@@ -1,0 +1,18 @@
+optimizer:
+  candidate_count: 7
+  data_samples: 1024
+  batch_size: 128
+  sigma_data: 0.5
+  seed: 0
+  initial_steps: 10
+  subdivision_rounds: 1
+  max_iterations_initial: 16
+  max_iterations_subdivision: 16
+  early_stop:
+    metric: fid
+    proxy_num_samples: 2048
+    batch_size: 128
+    patience: 3
+    min_iterations: 4
+    min_delta: 0.0
+    seed_offset: 100000

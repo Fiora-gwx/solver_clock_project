@@ -1,0 +1,19 @@
+evidence_level,model,solver,nfe,guidance_scale,comparison,metric,matched_pairs,mean_delta,win_rate,metric_direction
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,5,D-GPDE-reuse-cfg7p5-seed0 - base,clip_score,150,-0.289764,44.666667,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,5,D-GPDE-reuse-cfg7p5-seed0 - base,image_reward,150,-0.126468,34.666667,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,5,D-GPDE-reuse-cfg7p5-seed0 - AYS,clip_score,150,-0.474462,40.666667,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,5,D-GPDE-reuse-cfg7p5-seed0 - AYS,image_reward,150,-0.232299,28.666667,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,5,D-GPDE-reuse-cfg7p5-seed0 - D-GPDE,clip_score,150,-0.101595,46.666667,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,5,D-GPDE-reuse-cfg7p5-seed0 - D-GPDE,image_reward,150,0.006291,50.666667,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,7.5,D-GPDE-reuse-cfg7p5-seed0 - base,clip_score,150,-0.212124,44.666667,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,7.5,D-GPDE-reuse-cfg7p5-seed0 - base,image_reward,150,-0.081607,44.000000,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,7.5,D-GPDE-reuse-cfg7p5-seed0 - AYS,clip_score,150,-0.131022,48.666667,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,7.5,D-GPDE-reuse-cfg7p5-seed0 - AYS,image_reward,150,-0.116851,40.000000,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,7.5,D-GPDE-reuse-cfg7p5-seed0 - D-GPDE,clip_score,150,-0.047990,28.000000,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,7.5,D-GPDE-reuse-cfg7p5-seed0 - D-GPDE,image_reward,150,0.002678,31.333333,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,10,D-GPDE-reuse-cfg7p5-seed0 - base,clip_score,150,-0.135318,43.333333,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,10,D-GPDE-reuse-cfg7p5-seed0 - base,image_reward,150,-0.053536,43.333333,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,10,D-GPDE-reuse-cfg7p5-seed0 - AYS,clip_score,150,-0.026293,47.333333,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,10,D-GPDE-reuse-cfg7p5-seed0 - AYS,image_reward,150,-0.088938,41.333333,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,10,D-GPDE-reuse-cfg7p5-seed0 - D-GPDE,clip_score,150,-0.004092,48.666667,higher_is_better
+actual_sd15_reuse_cfg7p5_seed0_schedule,stable_diffusion_15,euler,10,10,D-GPDE-reuse-cfg7p5-seed0 - D-GPDE,image_reward,150,0.033573,53.333333,higher_is_better

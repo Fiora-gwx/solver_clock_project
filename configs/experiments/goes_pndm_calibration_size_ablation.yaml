@@ -1,0 +1,49 @@
+name: goes_pndm_calibration_size_ablation
+backend: pndm
+dataset: cifar10
+solvers:
+  - euler
+schedules:
+  - base
+  - GOES[calibration_k4]
+  - GOES[calibration_k8]
+  - GOES[calibration_k16]
+  - GOES[calibration_k32]
+  - GOES[calibration_k64]
+  - GOES[calibration_k128]
+nfes:
+  - 10
+seeds:
+  - 0
+  - 1
+  - 2
+num_samples: 5000
+batch_size: 64
+save_samples: false
+preview_samples: 64
+metrics:
+  - fid
+execution:
+  num_gpus: 1
+  materialize_schedules: false
+  prepare_schedules_first: true
+goes:
+  batch_size: 8
+  num_batches: 4
+  microbatch_size: 2
+  ref_nfe: 256
+  ref_grid_size: 257
+  probe_grid_size: 512
+  metric: channel_whitened
+  rho: 0.1
+  aggregation: cvar
+  trim_ratio: 0.10
+schedule_clock_configs:
+  GOES:
+    variants:
+      calibration_k4: configs/goes/variants/calibration_k4.yaml
+      calibration_k8: configs/goes/variants/calibration_k8.yaml
+      calibration_k16: configs/goes/variants/calibration_k16.yaml
+      calibration_k32: configs/goes/variants/calibration_k32.yaml
+      calibration_k64: configs/goes/variants/calibration_k64.yaml
+      calibration_k128: configs/goes/variants/calibration_k128.yaml

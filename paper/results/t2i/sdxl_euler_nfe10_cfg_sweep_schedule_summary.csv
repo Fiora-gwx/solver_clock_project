@@ -1,0 +1,7 @@
+evidence_level,model,solver,schedule,nfe,guidance_scale,seed_count,seeds,prompt_asset,num_prompts_per_seed,clip_score_mean,clip_score_sem_over_seeds,image_reward_mean,image_reward_sem_over_seeds,metric_direction
+matched_sdxl_cfg_sweep,sdxl,euler,base,10,5,3,"0,1,2",diffusers_ablation_prompts,50,31.001818,0.097627,0.821994,0.045319,higher_is_better
+matched_sdxl_cfg_sweep,sdxl,euler,AYS,10,5,3,"0,1,2",diffusers_ablation_prompts,50,31.025554,0.161321,1.019249,0.038377,higher_is_better
+matched_sdxl_cfg_sweep,sdxl,euler,D-GPDE,10,5,3,"0,1,2",diffusers_ablation_prompts,50,30.835058,0.091159,0.900557,0.033637,higher_is_better
+matched_sdxl_cfg_sweep,sdxl,euler,base,10,7.5,3,"0,1,2",diffusers_ablation_prompts,50,31.020002,0.207193,1.007245,0.071756,higher_is_better
+matched_sdxl_cfg_sweep,sdxl,euler,AYS,10,7.5,3,"0,1,2",diffusers_ablation_prompts,50,30.691042,0.261354,0.970808,0.035544,higher_is_better
+matched_sdxl_cfg_sweep,sdxl,euler,D-GPDE,10,7.5,3,"0,1,2",diffusers_ablation_prompts,50,31.107719,0.142831,1.129184,0.039350,higher_is_better

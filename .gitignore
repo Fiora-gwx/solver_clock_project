@@ -7,6 +7,7 @@ __pycache__/
 /.claude/
 /.codex/
 /.vscode/
+paper/project_context.md
 
 # Python / test caches
 .pytest_cache/
@@ -36,6 +37,14 @@ logs/
 *.log
 *.out
 *.err
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
 
 # Model/checkpoint artifacts
 *.ckpt

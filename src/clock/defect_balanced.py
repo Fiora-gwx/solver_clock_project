@@ -215,7 +215,7 @@ def collect_velocity_curvature_stats(
         raise ValueError("defect_clip_quantile must be in (0, 1].")
 
     def evaluate_velocity(sample: torch.Tensor, coordinate: float, sample_start: int, sample_stop: int) -> torch.Tensor:
-        coordinate_tensor = torch.as_tensor(float(coordinate), device=sample.device, dtype=torch.float32)
+        coordinate_tensor = torch.as_tensor(float(coordinate), device=sample.device, dtype=sample.dtype)
         return _call_velocity(velocity_fn, sample, coordinate_tensor, sample_start, sample_stop)
 
     current = initial_sample.detach()

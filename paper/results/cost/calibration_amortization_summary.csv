@@ -1,0 +1,8 @@
+setting,condition,evaluated_items,quality_delta_display,calibration_to_generation_ratio,overhead_after_1_batch,overhead_after_10_batches,overhead_after_100_batches,break_even_evaluated_batches
+CIFAR-10,NFE 10,150k images,+3.026 +/- 0.019 FID,8.486976,8.486976,0.848698,0.084870,9
+CIFAR-10,NFE 20,150k images,+0.464 +/- 0.005 FID,4.243488,4.243488,0.424349,0.042435,5
+SD1.5,CFG 5,150 images,-0.133 IR,8486.976000,8486.976000,848.697600,84.869760,8487
+SD1.5,CFG 7.5,150 images,-0.084 IR,8486.976000,8486.976000,848.697600,84.869760,8487
+SD1.5,CFG 10,150 images,-0.087 IR,8486.976000,8486.976000,848.697600,84.869760,8487
+SDXL,CFG 5,150 images,+0.079 IR,68.616000,68.616000,6.861600,0.686160,69
+SDXL,CFG 7.5,150 images,+0.122 IR,68.616000,68.616000,6.861600,0.686160,69

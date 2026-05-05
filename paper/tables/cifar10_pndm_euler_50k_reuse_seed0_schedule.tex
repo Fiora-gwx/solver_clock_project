@@ -1,0 +1,19 @@
+\begin{table}[t]
+  \centering
+  \caption{Actual seed-0 schedule reuse for PNDM/CIFAR-10 with
+  \texttt{pndm\_model\_ddim\_cifar10}, Euler solver, NFE 10 and 20,
+  seeds 1 and 2, and 50k generated images per seed. FID is
+  lower-is-better. The reuse gap is seed-0-reuse FID minus seed-specific
+  FID for our schedule. For these rows the continuous schedules differ by
+  less than 0.002 timestep units and round to the same integer
+  PNDM Euler execution grids.}
+  \label{tab:cifar10-pndm-euler-50k-reuse-seed0-schedule}
+  \begin{tabular}{rrrrr}
+    \toprule
+    NFE & base & per-seed ours & reused ours & reuse gap \\
+    \midrule
+    10 & 20.49 $\pm$ 0.02 & 17.47 $\pm$ 0.05 & 17.47 $\pm$ 0.05 & 0.000 $\pm$ 0.000 \\
+    20 & 11.10 $\pm$ 0.02 & 10.64 $\pm$ 0.02 & 10.64 $\pm$ 0.02 & 0.000 $\pm$ 0.000 \\
+    \bottomrule
+  \end{tabular}
+\end{table}

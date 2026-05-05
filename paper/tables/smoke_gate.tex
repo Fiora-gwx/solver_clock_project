@@ -1,0 +1,16 @@
+\begin{table}[t]
+  \centering
+  \caption{Real PNDM/CIFAR-10 smoke gate for our implementation. The run uses
+  Euler, NFE 4, seed 0, and 32 generated samples per
+  schedule. FID is reported only to verify that scoring produced finite,
+  non-empty outputs; it is not paper-grade evidence.}
+  \label{tab:smoke-gate}
+  \begin{tabular}{lrrrr}
+    \toprule
+    Schedule & NFE & Seed & Samples & FID \\
+    \midrule
+    Base & 4 & 0 & 32 & 295.77 \\
+    ours & 4 & 0 & 32 & 258.82 \\
+    \bottomrule
+  \end{tabular}
+\end{table}

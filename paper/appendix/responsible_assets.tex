@@ -1,0 +1,75 @@
+\section{Broader Impacts and Asset Notes}
+\label{app:responsible-assets}
+
+Our method is a schedule-calibration method, separate from model or dataset
+release. Its
+positive impact, when reuse is possible, is reduced generation error at a fixed
+NFE or fewer failed generations for a fixed model. Its main negative impact is
+that it can also make existing generative-image systems cheaper or easier to
+tune. Such systems inherit risks from their base models, including harmful
+content, social bias, mis- and disinformation, impersonation, and copyright or
+license misuse. The matched SD1.5 and SDXL results in this paper are reported
+as automated-metric boundary cases, leaving broad text-to-image quality and
+safer generation unsupported.
+
+It also adds calibration compute. In settings where a calibrated
+schedule is used only once, total compute can increase sharply. Any
+deployment claim should therefore account for schedule reuse, safety filtering,
+and model-license restrictions. This work uses no human subjects, private data,
+or deployed system. Complete local paths for the assets below are recorded in
+\texttt{configs/assets\_manifest.yaml}.
+
+\begin{table}[t]
+\centering
+\caption{Current asset audit. ``Pending'' marks items that need final release
+documentation before submission.}
+\label{tab:asset-audit}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{p{0.18\linewidth}p{0.16\linewidth}p{0.30\linewidth}p{0.22\linewidth}}
+\toprule
+Asset & Role & Source/license status & Local record \\
+\midrule
+CIFAR-10 & FID benchmark and reference statistics &
+Created by Krizhevsky, Nair, and Hinton; UCI lists CC BY 4.0; cite the
+technical report \citep{krizhevsky2009learning}. &
+CIFAR config and FID-stat asset \\
+PNDM CIFAR checkpoint & Controlled sampler backend &
+The official PNDM repository is Apache-2.0 and links the checkpoint/statistics
+folder; cite \citet{liu2022pndm}. The release manifest records the local CIFAR
+checkpoint and FID-stat hashes, but the archive should not bundle checkpoint
+files without final redistribution review. &
+PNDM CIFAR checkpoint asset \\
+Stable Diffusion 1.5 & Text-to-image backend &
+Cached model card lists \texttt{creativeml-openrail-m}. &
+SD1.5 cached model card \\
+SDXL & Text-to-image backend &
+Cached model card and upstream terms need final author review. &
+SDXL cached model record \\
+AYS 10-step schedule & Published offline schedule baseline &
+The official AYS quickstart lists the 10-step values; the release manifest
+records local hashes. The anonymous package omits raw numeric schedule files
+and retains AYS through citations, hashes, rendered figures, and metric rows. &
+AYS SD1.5 and SDXL 10-step bundles \\
+Diffusers & Text-to-image execution library &
+Repository license is Apache-2.0. &
+Diffusers vendored checkout \\
+ImageReward & Text-to-image metric &
+Model card and repository license are Apache-2.0. &
+ImageReward checkout \\
+Prompt set & Matched text-to-image prompts &
+Project-local 50-prompt asset; the paper-facing manifest records hashes, while
+the release license still needs final audit. &
+SD prompt asset \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The new assets produced by this paper are experiment configs, schedule
+metadata, cleaned CSVs, tables, plots, and manuscript text under
+\texttt{paper/}. Draft release metadata now lives under
+\texttt{paper/release/}, including an anonymized artifact manifest, license
+status note, and generated-sample policy. Before release, the authors still
+need to choose final licenses, finish the prompt redistribution audit, and
+prepare an external anonymous archive or repository. The current release policy
+omits raw AYS numeric schedule files from the anonymous package.

@@ -1,0 +1,190 @@
+\section{Theory}
+\label{sec:theory}
+
+Our theory concerns deterministic ODE solvers with oracle-start local
+defects. The statement excludes stochastic, ancestral, and history-dependent
+solver paths unless they are rewritten as deterministic augmented-state systems.
+This section derives the monitor in Eq.~\eqref{eq:monitor}, proves coordinate
+covariance, and states the local minimax guarantee.
+
+The result has the same structural shape as path-length equalization in
+Score-Optimal Diffusion Schedules \citep{williams2024scoreoptimal}: a local
+cost density induces a monitor, and the inverse cumulative monitor yields a
+constant-speed traversal in that geometry. The difference is the density. In
+Score-Optimal scheduling, the density is derived from score-corrector work along
+the diffusion path. Here it is the $q$-th root of a distributional
+oracle-start solver-defect coefficient, so the monitor is tied to the target
+solver and the teacher marginal distribution used during calibration.
+
+\begin{assumption}[Local power law]
+\label{assump:local-power-law}
+For $x\sim p_u$, the oracle-start defect satisfies
+\begin{equation}
+  d_{\mathcal S}(x;u,u+h)
+  =
+  a_{\mathcal S}(x,u)h^q+R(x,u,h),
+\end{equation}
+where $q>0$, $a_{\mathcal S}(x,u)\ge0$, and
+$|R(x,u,h)|\le C_R(x,u)h^{q+1}$.
+\end{assumption}
+
+\begin{assumption}[Risk regularity]
+\label{assump:risk-regularity}
+The risk functional $\mathcal R$ is monotone, positive homogeneous, and
+subadditive on nonnegative random variables, and
+$\mathcal R_{x\sim p_u}[C_R(x,u)]<\infty$.
+\end{assumption}
+
+Expectation, CVaR, worst-case risk, and nonnegative mixtures of coherent risks
+satisfy this assumption.
+
+\begin{theorem}[Distributional local power law]
+\label{thm:distributional-power-law}
+Under Assumptions~\ref{assump:local-power-law}
+and~\ref{assump:risk-regularity},
+\begin{equation}
+  \bar D_{\mathcal R}(u,u+h)
+  =
+  \bar a_{\mathcal R}(u)h^q+O(h^{q+1}),
+\end{equation}
+where
+\begin{equation}
+  \bar D_{\mathcal R}(u,u+h)
+  =
+  \mathcal R_{x\sim p_u}
+  \!\left[d_{\mathcal S}(x;u,u+h)\right],
+  \qquad
+  \bar a_{\mathcal R}(u)
+  =
+  \mathcal R_{x\sim p_u}
+  \!\left[a_{\mathcal S}(x,u)\right].
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+For expectation, linearity gives
+$\bar D_{\mathbb E}=h^q\mathbb E[a_{\mathcal S}]+\mathbb E[R]$, and the
+remainder is bounded by $\mathbb E[C_R]h^{q+1}$. For coherent risks, positive
+homogeneity gives $\mathcal R[a_{\mathcal S}h^q]=h^q\mathcal R[a_{\mathcal S}]$,
+while monotonicity and subadditivity bound the perturbation by
+$\mathcal R[|R|]\le\mathcal R[C_R]h^{q+1}$.
+\end{proof}
+
+\begin{theorem}[Correct monitor density]
+\label{thm:correct-monitor}
+Suppose
+\begin{equation}
+  \bar D_{\mathcal R}(u,u+h)
+  =
+  \bar a_{\mathcal R}(u)h^q+O(h^{q+1})
+\end{equation}
+with $\bar a_{\mathcal R}(u)>0$. The leading-order solution of
+\begin{equation}
+  \min_{\{h_i\}}\max_i \bar a_{\mathcal R}(u_i)h_i^q,
+  \qquad \sum_i h_i=L,
+\end{equation}
+is obtained by equalizing $\bar a_{\mathcal R}(u_i)h_i^q$ across intervals.
+The corresponding continuous monitor density is
+\begin{equation}
+  \omega_{\mathcal R}(u)=\bar a_{\mathcal R}(u)^{1/q}.
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+At leading order, interval $i$ has risk
+$E_i=\bar a_{\mathcal R}(u_i)h_i^q$. If two active intervals have
+$E_i>E_j$, decreasing $h_i$ and increasing $h_j$ by a sufficiently small amount
+preserves $\sum_i h_i=L$ and decreases the maximum risk. Thus all active
+intervals satisfy $\bar a_{\mathcal R}(u_i)h_i^q=C$, so
+$h_i=C^{1/q}\bar a_{\mathcal R}(u_i)^{-1/q}$. The local sampling density is
+therefore proportional to $\bar a_{\mathcal R}(u)^{1/q}$.
+\end{proof}
+
+\begin{theorem}[Coordinate covariance of the monitor]
+\label{thm:coordinate-covariance}
+Let $v=g(u)$ be a smooth monotone reparameterization. Suppose the same physical
+local defect can be expressed as
+$\bar D_{\mathcal R}(u,u+h_u)\approx\bar a_u(u)h_u^q$ in $u$-coordinates and
+$\bar D_{\mathcal R}(v,v+h_v)\approx\bar a_v(v)h_v^q$ in $v$-coordinates.
+Then
+\begin{equation}
+  \omega_v(v)\,dv=\omega_u(u)\,du,
+\end{equation}
+where $\omega_u(u)=\bar a_u(u)^{1/q}$ and
+$\omega_v(v)=\bar a_v(v)^{1/q}$. Thus $\omega(u)\,du$ is a
+coordinate-covariant monitor one-form.
+\end{theorem}
+
+\begin{proof}
+Small increments satisfy
+$h_v=|dv/du|h_u$ and $h_u=|du/dv|h_v$ to leading order. The physical local
+defect is invariant under reparameterization, so
+$\bar a_u(u)h_u^q=\bar a_v(v)h_v^q$. Substituting
+$h_u=|du/dv|h_v$ gives
+$\bar a_v(v)=\bar a_u(u)|du/dv|^q$. Taking $q$-th roots yields
+$\omega_v(v)=\omega_u(u)|du/dv|$, and multiplication by $dv$ gives the claim.
+\end{proof}
+
+\begin{lemma}[Exact equalization of monitor mass]
+\label{lem:equal-monitor-mass}
+Let $\omega_{\mathcal R}(u)>0$ be continuous on
+$[u_{\min},u_{\max}]$, and let
+$\Omega_{\mathcal R}=\int_{u_{\min}}^{u_{\max}}\omega_{\mathcal R}(u)du$.
+For any $N$-interval schedule, define
+$M_i=\int_{u_i}^{u_{i+1}}\omega_{\mathcal R}(u)du$. Then
+$\max_i M_i\ge\Omega_{\mathcal R}/N$. Equality holds exactly when all
+interval masses are equal, which is achieved by
+$u_m=\tau_{\mathcal R}^{-1}(m/N)$.
+\end{lemma}
+
+\begin{assumption}[Uniform monitor approximation]
+\label{assump:uniform-monitor}
+There exists $C_E>0$ such that for all sufficiently small intervals $[s,t]$,
+\begin{equation}
+  \left|
+  \bar D_{\mathcal R}(s,t)-\mathcal M_{\mathcal R}([s,t])^q
+  \right|
+  \le C_E|t-s|^{q+1}.
+\end{equation}
+Assume also
+$0<\omega_{\min}\le\omega_{\mathcal R}(u)\le\omega_{\max}<\infty$.
+\end{assumption}
+
+\begin{theorem}[Asymptotic minimax optimality]
+\label{thm:minimax}
+Let $U^\Omega$ be the equal-monitor-mass schedule. Under
+Assumption~\ref{assump:uniform-monitor},
+\begin{equation}
+  \max_i\bar D_{\mathcal R}(u_i^\Omega,u_{i+1}^\Omega)
+  \le
+  \left(\frac{\Omega_{\mathcal R}}{N}\right)^q
+  +C_1N^{-(q+1)}.
+\end{equation}
+Moreover, for any schedule $U$ satisfying $h_{\max}\le C_h/N$,
+\begin{equation}
+  \max_i\bar D_{\mathcal R}(u_i,u_{i+1})
+  \ge
+  \left(\frac{\Omega_{\mathcal R}}{N}\right)^q
+  -C_2N^{-(q+1)}.
+\end{equation}
+Thus the equal-monitor schedule is asymptotically minimax optimal for local
+distributional risk up to $O(N^{-(q+1)})$.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The equal-mass schedule has monitor mass $\Omega_{\mathcal R}/N$ on every
+interval. Since $\omega_{\mathcal R}\ge\omega_{\min}$, its interval lengths are
+$O(N^{-1})$, and the upper bound follows from the uniform approximation. For
+the lower bound, any schedule has at least one interval with monitor mass at
+least $\Omega_{\mathcal R}/N$. If $h_{\max}\le C_h/N$, the approximation error
+on that interval is $O(N^{-(q+1)})$. Appendix~\ref{app:minimax-proof} gives the
+full proof.
+\end{proof}
+
+The implementation uses the regularized monitor
+$\omega_\epsilon(u)=(\bar a_{\mathcal R}(u)+\epsilon_a)^{1/q}$ to avoid zero
+monitor regions. The same statements apply to the regularized coefficient, and
+the unregularized target is recovered as $\epsilon_a\rightarrow0$ on regions
+where $\bar a_{\mathcal R}(u)>0$. These results support teacher-oracle local
+risk only; perceptual quality and universal FID gains require separate
+empirical evidence.

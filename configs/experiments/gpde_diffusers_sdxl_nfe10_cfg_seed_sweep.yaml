@@ -1,0 +1,46 @@
+name: gpde_diffusers_sdxl_nfe10_cfg_seed_sweep
+backend: diffusers
+models:
+  - sdxl
+solvers:
+  - euler
+schedules:
+  - base
+  - GPDE
+  - AYS
+nfes:
+  - 10
+seeds:
+  - 0
+  - 1
+  - 2
+prompt_asset: diffusers_ablation_prompts
+guidance_scales:
+  - 5.0
+  - 7.5
+metrics:
+  - clipscore
+  - imagereward
+execution:
+  num_gpus: 4
+  gpu_ids:
+    - 0
+    - 1
+    - 2
+    - 3
+  materialize_schedules: true
+  prepare_schedules_first: true
+  skip_existing: true
+  continue_on_error: false
+gpde:
+  batch_size: 1
+  num_batches: 4
+  microbatch_size: 1
+  ref_nfe: 64
+  ref_grid_size: 65
+  probe_grid_size: 128
+  physical_grid_mode: scheduler_sigmas
+  metric: channel_whitened
+  rho: 0.1
+  aggregation: cvar
+  trim_ratio: 0.10

@@ -1,0 +1,9 @@
+evidence_level,backend,dataset,model,solver,method,nfe,seed_count,seeds,num_samples,metric,metric_direction,fid_mean,fid_std,fid_sem
+offline_proxy_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,base,10,3,"0,1,2",50000,FID,lower_is_better,20.565771,0.129941,0.075021
+offline_proxy_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,Karras,10,3,"0,1,2",50000,FID,lower_is_better,25.841488,0.179639,0.103715
+offline_proxy_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,D-GPDE,10,3,"0,1,2",50000,FID,lower_is_better,17.539309,0.130738,0.075482
+offline_proxy_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,offline-proxy,10,3,"0,1,2",50000,FID,lower_is_better,41.373434,0.220139,0.127097
+offline_proxy_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,base,20,3,"0,1,2",50000,FID,lower_is_better,11.173382,0.128824,0.074377
+offline_proxy_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,Karras,20,3,"0,1,2",50000,FID,lower_is_better,10.637144,0.151381,0.087400
+offline_proxy_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,D-GPDE,20,3,"0,1,2",50000,FID,lower_is_better,10.709165,0.122778,0.070886
+offline_proxy_50k_fid,pndm,cifar10,pndm_model_ddim_cifar10,euler,offline-proxy,20,3,"0,1,2",50000,FID,lower_is_better,22.364144,0.092886,0.053628

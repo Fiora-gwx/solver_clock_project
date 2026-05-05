@@ -1,0 +1,15 @@
+\section{Conclusion}
+
+Our method frames low-NFE schedule selection as inference-time distributional
+defect equalization. It offers a bounded way to adapt schedules to the
+model, solver, NFE, and condition without updating model weights. The theory
+supports asymptotic local minimax calibration for deterministic ODE samplers
+under a power-law oracle-start defect model. The main positive evidence is the
+controlled three-seed CIFAR-10 result against base, native-coordinate linear,
+and authorized project-owned offline-proxy schedules, with mixed evidence
+against a fixed Karras/EDM-style grid. The matched SD1.5 and SDXL CFG sweeps
+identify condition-dependent text-to-image behavior under automated metrics.
+A narrow CIFAR reuse check shows no FID penalty when the seed-0 schedule is
+reused for seeds 1 and 2 in the same rounded PNDM Euler execution grid. Broader
+positive reuse validation, release packaging, and asset-license completion
+remain open before submission readiness.

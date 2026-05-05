@@ -111,6 +111,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "root": "./outputs/goes",
         "save_probe_profile": True,
         "save_schedule": True,
+        "save_edge_table": True,
         "save_images": False,
         "save_plots": True,
     },
@@ -173,8 +174,9 @@ def validate_config(config: dict[str, Any]) -> None:
     if eps <= 0.0:
         raise ValueError("mixed_defect.eps must be positive.")
     target_nfe = int(config["solver"]["target_nfe"])
-    probe_grid = config.get("probe_grid") or config.get("candidate_grid", {})
-    probe_size = int(probe_grid.get("size", config.get("candidate_grid", {}).get("size", 64)))
+    candidate_grid = config.get("candidate_grid", {})
+    probe_grid = config.get("probe_grid") or candidate_grid
+    probe_size = int(probe_grid.get("size", candidate_grid.get("size", 64)))
     if target_nfe < 1:
         raise ValueError("solver.target_nfe must be positive.")
     solver_name = str(config["solver"].get("name", "euler"))
@@ -185,8 +187,12 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("solver.mode must be one_step or blackbox_multistep.")
     if probe_size < target_nfe + 1:
         raise ValueError("probe_grid.size must be at least solver.target_nfe + 1.")
+    if int(candidate_grid.get("size", probe_size)) < target_nfe + 1:
+        raise ValueError("candidate_grid.size must be at least solver.target_nfe + 1.")
     if str(probe_grid.get("type", "uniform_in_u")) != "uniform_in_u":
         raise ValueError("probe_grid.type must be 'uniform_in_u' for the CPU GPDE runner.")
+    if str(candidate_grid.get("type", "uniform_in_u")) != "uniform_in_u":
+        raise ValueError("candidate_grid.type must be 'uniform_in_u' for the CPU GPDE runner.")
     u_min = float(config["coordinate"]["u_min"])
     u_max = float(config["coordinate"]["u_max"])
     coordinate_name = str(config["coordinate"].get("name", "t"))
@@ -234,6 +240,8 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError("aggregation.alpha must satisfy 0 <= alpha < 1 for cvar.")
     if str(config["optimizer"].get("name", "monitor_inverse_cdf")) != "monitor_inverse_cdf":
         raise ValueError("optimizer.name must be 'monitor_inverse_cdf'.")
+    if float(config["optimizer"].get("tie_tolerance", 1.0e-12)) < 0.0:
+        raise ValueError("optimizer.tie_tolerance must be nonnegative.")
     q_config = config.get("q_estimation", {})
     q_mode = str(q_config.get("mode", "global_fit"))
     if q_mode not in {"global_fit", "fixed"}:
@@ -270,6 +278,8 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("output.save_schedule must remain true because GPDE schedule files are required outputs.")
     if not bool(output.get("save_probe_profile", True)):
         raise ValueError("output.save_probe_profile must remain true because GPDE probe profiles are required outputs.")
+    if not bool(output.get("save_edge_table", True)):
+        raise ValueError("output.save_edge_table must remain true because GPDE edge tables are required outputs.")
 
 
 def write_config(config: dict[str, Any], path: str | Path) -> Path:

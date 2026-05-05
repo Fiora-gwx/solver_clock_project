@@ -1,0 +1,24 @@
+\begin{table}[t]
+  \centering
+  \caption{PNDM/CIFAR-10 50k FID for the Euler solver. Rows report
+  mean $\pm$ standard error over three seeds (0, 1, 2), base, linear
+  native-coordinate, fixed Karras/EDM-style, authorized project-owned
+  offline, and our schedules. FID is lower-is-better and each
+  seed uses 50k generated images. The final two columns are paired
+  ours-minus-baseline FID gaps; negative values favor ours.}
+  \label{tab:cifar10-pndm-euler-50k-fid-seeds0-1-2}
+  {\scriptsize
+  \setlength{\tabcolsep}{2pt}
+  \resizebox{\linewidth}{!}{%
+  \begin{tabular}{rrrrrrrr}
+    \toprule
+    NFE & base & linear & Karras & offline & ours &
+    ours $-$ offline & ours $-$ Karras \\
+    \midrule
+    10 & 20.57 $\pm$ 0.08 & 20.57 $\pm$ 0.08 & 25.84 $\pm$ 0.10 & 19.20 $\pm$ 0.09 & 17.54 $\pm$ 0.08 & -1.659 $\pm$ 0.017 & -8.302 $\pm$ 0.031 \\
+    20 & 11.17 $\pm$ 0.07 & 11.20 $\pm$ 0.07 & 10.64 $\pm$ 0.09 & 10.88 $\pm$ 0.06 & 10.71 $\pm$ 0.07 & -0.175 $\pm$ 0.059 & 0.072 $\pm$ 0.024 \\
+    \bottomrule
+  \end{tabular}
+  }
+  }
+\end{table}

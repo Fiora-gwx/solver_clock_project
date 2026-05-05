@@ -1,0 +1,3 @@
+backend,dataset,model,model_asset,solver,schedule,clock_label,clock_family,estimator,nfe,seed,guidance_scale,num_samples,metric_name,metric_value,fid,kid,clip_score,image_reward,status,error,schedule_dir,output_dir
+pndm,cifar10,pndm_model_ddim_cifar10,pndm_model_ddim_cifar10,euler,base,,base,,4,0,,32,fid,295.7675265058472,295.7675265058472,,,,OK,,,outputs/goes_pndm_smoke/samples/pndm/cifar10/pndm_model_ddim_cifar10/euler/base/nfe_004
+pndm,cifar10,pndm_model_ddim_cifar10,pndm_model_ddim_cifar10,euler,GOES,,GPDE,,4,0,,32,fid,258.8214760475054,258.8214760475054,,,,OK,,outputs/goes_pndm_smoke/schedules/GOES/pndm/cifar10/pndm_model_ddim_cifar10/euler/nfe_004,outputs/goes_pndm_smoke/samples/pndm/cifar10/pndm_model_ddim_cifar10/euler/GOES/nfe_004

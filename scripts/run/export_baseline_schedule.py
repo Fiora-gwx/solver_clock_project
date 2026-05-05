@@ -12,6 +12,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.adapters.pndm import (
+    _base_sigmas_from_scheduler,
     _interp_timesteps_for_sigmas,
     build_scheduler,
     load_native_config,
@@ -25,16 +26,17 @@ from src.utils.schedule_bundle import ScheduleBundle
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export base or linear schedules into the unified schedule bundle format.")
+    parser = argparse.ArgumentParser(description="Export fixed baseline schedules into the unified schedule bundle format.")
     parser.add_argument("--backend", choices=["pndm", "diffusers"], required=True)
     parser.add_argument("--manifest", default="configs/assets_manifest.yaml")
-    parser.add_argument("--mode", choices=["base", "linear"], required=True)
+    parser.add_argument("--mode", choices=["base", "linear", "karras"], required=True)
     parser.add_argument("--nfe", type=int, required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--solver", default="euler")
     parser.add_argument("--dataset-config")
     parser.add_argument("--model-asset")
     parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument("--karras-rho", type=float, default=7.0)
     return parser.parse_args()
 
 
@@ -49,6 +51,27 @@ def collapse_repeated_values(values: np.ndarray, expected_length: int) -> np.nda
             f"Expected {expected_length} unique schedule values after collapsing repeats, got {len(result)}."
         )
     return result
+
+
+def karras_sigmas_from_bounds(
+    *,
+    sigma_max: float,
+    sigma_min: float,
+    num_steps: int,
+    rho: float,
+) -> np.ndarray:
+    if num_steps <= 0:
+        raise ValueError("num_steps must be positive.")
+    if sigma_max <= sigma_min:
+        raise ValueError(f"sigma_max must exceed sigma_min, got {sigma_max} <= {sigma_min}.")
+    if sigma_min <= 0.0:
+        raise ValueError(f"sigma_min must be positive for a Karras grid, got {sigma_min}.")
+    if rho <= 0.0:
+        raise ValueError(f"rho must be positive, got {rho}.")
+    ramp = np.linspace(0.0, 1.0, num_steps, dtype=np.float64)
+    min_inv_rho = sigma_min ** (1.0 / rho)
+    max_inv_rho = sigma_max ** (1.0 / rho)
+    return (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
 
 
 def export_pndm(args: argparse.Namespace) -> None:
@@ -73,10 +96,18 @@ def export_pndm(args: argparse.Namespace) -> None:
         base_sigmas = collapse_repeated_values(np.asarray(sigma_values[:-1], dtype=np.float64), expected_length=plan.solver_steps)
         if args.mode == "base":
             sigmas = base_sigmas
-        else:
+        elif args.mode == "linear":
             sigmas = np.linspace(base_sigmas[0], base_sigmas[-1], plan.solver_steps, dtype=np.float64)
+        else:
+            sigmas = karras_sigmas_from_bounds(
+                sigma_max=float(base_sigmas[0]),
+                sigma_min=float(base_sigmas[-1]),
+                num_steps=plan.solver_steps,
+                rho=float(args.karras_rho),
+            )
         sigma_grid = np.concatenate([sigmas, np.asarray([0.0], dtype=np.float64)])
         time_grid = _interp_timesteps_for_sigmas(scheduler, sigma_grid)
+        extra_meta = {"karras_rho": float(args.karras_rho)} if args.mode == "karras" else {}
         bundle = ScheduleBundle(
             sigmas=sigmas,
             sigma_grid=sigma_grid,
@@ -91,6 +122,7 @@ def export_pndm(args: argparse.Namespace) -> None:
                 "representation": "sigmas",
                 "terminal_sigma": float(sigma_grid[-1]),
                 "schedule_implementation_version": BASELINE_SCHEDULE_IMPLEMENTATION_VERSION,
+                **extra_meta,
                 **plan.to_meta(),
             },
         )
@@ -101,20 +133,44 @@ def export_pndm(args: argparse.Namespace) -> None:
         )
         if args.mode == "base":
             timesteps = base_timesteps
-        else:
+            sigmas = None
+            sigma_grid = None
+            coordinate_domain = "timesteps"
+            representation_name = "timesteps"
+        elif args.mode == "linear":
             timesteps = np.linspace(base_timesteps[0], base_timesteps[-1], plan.solver_steps, dtype=np.float64)
+            sigmas = None
+            sigma_grid = None
+            coordinate_domain = "timesteps"
+            representation_name = "timesteps"
+        else:
+            base_sigmas = _base_sigmas_from_scheduler(scheduler)
+            sigmas = karras_sigmas_from_bounds(
+                sigma_max=float(base_sigmas[-1]),
+                sigma_min=float(base_sigmas[0]),
+                num_steps=plan.solver_steps,
+                rho=float(args.karras_rho),
+            )
+            sigma_grid = np.concatenate([sigmas, np.asarray([0.0], dtype=np.float64)])
+            timesteps = _interp_timesteps_for_sigmas(scheduler, sigmas)
+            coordinate_domain = "sigmas"
+            representation_name = "timesteps_from_karras_sigmas"
+        extra_meta = {"karras_rho": float(args.karras_rho)} if args.mode == "karras" else {}
         bundle = ScheduleBundle(
             timesteps=timesteps,
             time_grid=np.concatenate([timesteps, np.asarray([0.0], dtype=np.float64)]),
+            sigmas=sigmas,
+            sigma_grid=sigma_grid,
             meta={
                 "schedule_family": args.mode,
                 "backend": "pndm",
                 "dataset": dataset_config["name"],
                 "solver": args.solver,
-                "coordinate_domain": "timesteps",
-                "representation": "timesteps",
+                "coordinate_domain": coordinate_domain,
+                "representation": representation_name,
                 "terminal_timestep": 0.0,
                 "schedule_implementation_version": BASELINE_SCHEDULE_IMPLEMENTATION_VERSION,
+                **extra_meta,
                 **plan.to_meta(),
             },
         )
@@ -141,8 +197,16 @@ def export_diffusers(args: argparse.Namespace) -> None:
     base_sigmas = collapse_repeated_values(np.asarray(sigma_values[:-1], dtype=np.float64), expected_length=plan.solver_steps)
     if args.mode == "base":
         sigma_values = base_sigmas
-    else:
+    elif args.mode == "linear":
         sigma_values = np.linspace(base_sigmas[0], base_sigmas[-1], plan.solver_steps, dtype=np.float64)
+    else:
+        sigma_values = karras_sigmas_from_bounds(
+            sigma_max=float(base_sigmas[0]),
+            sigma_min=float(base_sigmas[-1]),
+            num_steps=plan.solver_steps,
+            rho=float(args.karras_rho),
+        )
+    extra_meta = {"karras_rho": float(args.karras_rho)} if args.mode == "karras" else {}
     bundle = ScheduleBundle(
         sigmas=sigma_values,
         sigma_grid=np.concatenate([sigma_values, np.asarray([0.0], dtype=np.float64)]),
@@ -152,6 +216,7 @@ def export_diffusers(args: argparse.Namespace) -> None:
             "solver": args.solver,
             "model_asset": args.model_asset,
             "schedule_implementation_version": BASELINE_SCHEDULE_IMPLEMENTATION_VERSION,
+            **extra_meta,
             **plan.to_meta(),
         },
     )

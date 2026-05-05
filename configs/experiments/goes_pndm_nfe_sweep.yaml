@@ -1,0 +1,44 @@
+name: goes_pndm_nfe_sweep
+backend: pndm
+dataset: cifar10
+solvers:
+  - euler
+schedules:
+  - base
+  - GOES
+nfes:
+  - 4
+  - 5
+  - 6
+  - 8
+  - 10
+  - 12
+  - 15
+  - 20
+  - 30
+  - 50
+seeds:
+  - 0
+  - 1
+  - 2
+num_samples: 5000
+batch_size: 64
+save_samples: false
+preview_samples: 64
+metrics:
+  - fid
+execution:
+  num_gpus: 4
+  materialize_schedules: false
+  prepare_schedules_first: true
+goes:
+  batch_size: 8
+  num_batches: 4
+  microbatch_size: 2
+  ref_nfe: 256
+  ref_grid_size: 257
+  probe_grid_size: 512
+  metric: channel_whitened
+  rho: 0.1
+  aggregation: cvar
+  trim_ratio: 0.10
